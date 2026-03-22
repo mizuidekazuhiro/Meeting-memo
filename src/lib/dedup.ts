@@ -24,6 +24,16 @@ export function buildDedupCandidates(request: IntakeRequest, metadata: DropboxFi
   return candidates.filter((value): value is string => Boolean(value));
 }
 
+export function buildIntakeRequestFromMetadata(metadata: DropboxFileMetadata): IntakeRequest {
+  return {
+    dropboxFileId: metadata.id,
+    dropboxPathLower: metadata.path_lower,
+    fileName: metadata.name,
+    recordedAt: metadata.server_modified ?? metadata.client_modified,
+    fileSizeBytes: metadata.size,
+  };
+}
+
 export function primaryDedupKey(request: IntakeRequest, metadata: DropboxFileMetadata): string {
   const [first] = buildDedupCandidates(request, metadata);
   return first ?? `fallback:${metadata.name}`;

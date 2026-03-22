@@ -3,6 +3,7 @@ import { HttpError } from './http';
 
 const DROPBOX_API = 'https://api.dropboxapi.com/2';
 const DROPBOX_CONTENT_API = 'https://content.dropboxapi.com/2';
+const AUDIO_FILE_EXTENSIONS = new Set(['.m4a', '.mp3', '.wav', '.aac', '.mp4', '.mpeg', '.mpga', '.webm']);
 
 async function resolveAccessToken(env: Env): Promise<string> {
   if (env.DROPBOX_ACCESS_TOKEN) {
@@ -67,6 +68,39 @@ export async function fetchDropboxMetadata(env: Env, intake: IntakeRequest): Pro
     });
   }
   throw new HttpError('Either dropboxFileId or dropboxPathLower is required.', 400);
+}
+
+export async function listDropboxFolder(env: Env, folderPath: string, recursive: boolean): Promise<{
+  entries: DropboxFileMetadata[];
+  cursor?: string;
+  has_more: boolean;
+}> {
+  return dropboxRpc(env, '/files/list_folder', {
+    path: folderPath,
+    recursive,
+    include_deleted: false,
+    include_has_explicit_shared_members: false,
+    include_mounted_folders: true,
+  });
+}
+
+export async function listAllDropboxEntries(env: Env, folderPath: string, recursive: boolean): Promise<DropboxFileMetadata[]> {
+  const allEntries: DropboxFileMetadata[] = [];
+  let response = await listDropboxFolder(env, folderPath, recursive);
+
+  allEntries.push(...response.entries.filter((entry) => entry['.tag'] === 'file'));
+
+  while (response.has_more && response.cursor) {
+    response = await dropboxRpc(env, '/files/list_folder/continue', { cursor: response.cursor });
+    allEntries.push(...response.entries.filter((entry) => entry['.tag'] === 'file'));
+  }
+
+  return allEntries;
+}
+
+export function isAudioDropboxFile(metadata: DropboxFileMetadata): boolean {
+  const extension = metadata.name.includes('.') ? `.${metadata.name.split('.').pop()?.toLowerCase()}` : '';
+  return AUDIO_FILE_EXTENSIONS.has(extension);
 }
 
 export async function downloadDropboxFile(env: Env, metadata: DropboxFileMetadata): Promise<Blob> {
