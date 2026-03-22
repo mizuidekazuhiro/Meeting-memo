@@ -5,11 +5,12 @@ import {
   getDropboxCredentialStatus,
   isAudioDropboxFile,
   listAllDropboxEntries,
+  uploadAudioToDropbox,
 } from './lib/dropbox';
 import { HttpError, jsonResponse, parseJson } from './lib/http';
 import { processInterviewFromMetadata } from './lib/interviews';
 import { requireWebhookSecret } from './lib/security';
-import type { Env, IntakeRequest, ScanRequest } from './types';
+import type { Env, IntakeRequest, ScanRequest, UploadRequestMetadata } from './types';
 
 function parseBooleanEnv(value: string | undefined, fallback: boolean): boolean {
   if (value === undefined) return fallback;
@@ -43,6 +44,42 @@ function sortEntriesByServerModifiedDesc<T extends { server_modified?: string; p
   });
 }
 
+function sanitizeFileName(value: string): string {
+  const trimmed = value.trim();
+  const sanitized = trimmed.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/-{2,}/g, '-').replace(/^-+|-+$/g, '');
+  return sanitized || `interview-${new Date().toISOString().replace(/[.:]/g, '-')}.m4a`;
+}
+
+function parseJsonField<T>(value: FormDataEntryValue | null, fieldName: string): T | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  try {
+    return JSON.parse(value) as T;
+  } catch (error) {
+    throw new HttpError(`${fieldName} must be valid JSON.`, 400, error);
+  }
+}
+
+function asString(value: FormDataEntryValue | null): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function buildUploadRequest(form: FormData, file: File): IntakeRequest {
+  const metadata = parseJsonField<UploadRequestMetadata>(form.get('metadata'), 'metadata') ?? {};
+  const participants = parseJsonField<string[]>(form.get('participants'), 'participants') ?? metadata.participants;
+  return {
+    fileName: sanitizeFileName((asString(form.get('fileName')) ?? file.name) || ''),
+    mimeType: file.type || asString(form.get('mimeType')) || 'application/octet-stream',
+    recordedAt: asString(form.get('recordedAt')) ?? metadata.recordedAt,
+    fileSizeBytes: file.size,
+    idempotencyKey: asString(form.get('idempotencyKey')) ?? metadata.idempotencyKey,
+    source: asString(form.get('source')) ?? metadata.source ?? 'Interview',
+    initiatedBy: asString(form.get('initiatedBy')) ?? metadata.initiatedBy ?? 'iPhone Shortcut',
+    participants,
+    languageHint: asString(form.get('languageHint')) ?? metadata.languageHint,
+    notes: asString(form.get('notes')) ?? metadata.notes,
+  };
+}
+
 async function handleIntake(request: Request, env: Env): Promise<Response> {
   requireWebhookSecret(request, env.INTERVIEW_WEBHOOK_SECRET);
   const intake = await parseJson<IntakeRequest>(request);
@@ -62,15 +99,9 @@ async function handleIntake(request: Request, env: Env): Promise<Response> {
 
 async function parseOptionalScanRequest(request: Request): Promise<{ bodyText: string; scan: ScanRequest }> {
   const bodyText = await request.text();
-  if (!bodyText.trim()) {
-    return { bodyText, scan: {} };
-  }
-
+  if (!bodyText.trim()) return { bodyText, scan: {} };
   try {
-    return {
-      bodyText,
-      scan: JSON.parse(bodyText) as ScanRequest,
-    };
+    return { bodyText, scan: JSON.parse(bodyText) as ScanRequest };
   } catch (error) {
     throw new HttpError('Request body must be valid JSON.', 400, error);
   }
@@ -106,14 +137,7 @@ async function handleScan(request: Request, env: Env): Promise<Response> {
   const audioEntries = sortEntriesByServerModifiedDesc(scannedEntries.filter(isAudioDropboxFile));
   const selectedEntries = audioEntries.slice(0, limit);
 
-  const results = [] as Array<{
-    pathLower?: string;
-    dropboxFileId?: string;
-    action: 'processed' | 'skipped' | 'error';
-    reason: string;
-    details?: unknown;
-  }>;
-
+  const results = [] as Array<{ pathLower?: string; dropboxFileId?: string; action: 'processed' | 'skipped' | 'error'; reason: string; details?: unknown }>;
   let processedCount = 0;
   let skippedCount = 0;
   let errorCount = 0;
@@ -122,13 +146,7 @@ async function handleScan(request: Request, env: Env): Promise<Response> {
     try {
       const intake = buildIntakeRequestFromMetadata(metadata);
       const result = await processInterviewFromMetadata(env, intake, metadata, { dryRun, skipIfExisting: true });
-      results.push({
-        pathLower: metadata.path_lower,
-        dropboxFileId: metadata.id,
-        action: result.action,
-        reason: result.reason,
-      });
-
+      results.push({ pathLower: metadata.path_lower, dropboxFileId: metadata.id, action: result.action, reason: result.reason });
       if (result.action === 'processed') processedCount += 1;
       if (result.action === 'skipped') skippedCount += 1;
       if (result.action === 'error') errorCount += 1;
@@ -164,23 +182,98 @@ async function handleScan(request: Request, env: Env): Promise<Response> {
   });
 }
 
-async function handleDebugDropbox(request: Request, env: Env): Promise<Response> {
+async function handleUpload(request: Request, env: Env): Promise<Response> {
   requireWebhookSecret(request, env.INTERVIEW_WEBHOOK_SECRET);
 
+  const contentType = request.headers.get('content-type') ?? '';
+  if (!contentType.toLowerCase().includes('multipart/form-data')) {
+    throw new HttpError('Upload endpoint requires multipart/form-data.', 415);
+  }
+
+  const form = await request.formData();
+  const audioField = form.get('file') ?? form.get('audio');
+  if (!(audioField instanceof File)) {
+    throw new HttpError('Upload failed: multipart field "file" (or "audio") is required.', 400);
+  }
+  if (!audioField.type.startsWith('audio/')) {
+    throw new HttpError('Upload failed: only audio/* files are accepted.', 400, { mimeType: audioField.type || null });
+  }
+
+  const intake = buildUploadRequest(form, audioField);
+  const dryRun = asString(form.get('dryRun')) === 'true' || parseJsonField<boolean>(form.get('dryRunJson'), 'dryRunJson') === true;
+
+  console.log('interviews.upload.received', {
+    fileName: intake.fileName,
+    mimeType: intake.mimeType,
+    bytes: audioField.size,
+    recordedAt: intake.recordedAt,
+    initiatedBy: intake.initiatedBy,
+    dryRun,
+  });
+
+  let metadata;
+  try {
+    metadata = await uploadAudioToDropbox(env, audioField, intake.fileName ?? sanitizeFileName(audioField.name || ''));
+  } catch (error) {
+    console.error('interviews.upload.persist_failed', {
+      fileName: intake.fileName,
+      mimeType: intake.mimeType,
+      bytes: audioField.size,
+      message: error instanceof Error ? error.message : 'Unknown storage error',
+      details: error instanceof HttpError ? error.details : undefined,
+    });
+    throw new HttpError('Storage failed for uploaded audio.', 502, error instanceof HttpError ? error.details : error);
+  }
+
+  try {
+    const result = await processInterviewFromMetadata(
+      env,
+      {
+        ...intake,
+        dropboxFileId: metadata.id,
+        dropboxPathLower: metadata.path_lower,
+        fileName: metadata.name,
+        mimeType: intake.mimeType,
+        fileSizeBytes: metadata.size ?? intake.fileSizeBytes,
+        recordedAt: intake.recordedAt ?? metadata.client_modified ?? metadata.server_modified,
+      },
+      metadata,
+      { dryRun, skipIfExisting: true },
+    );
+
+    return jsonResponse({
+      ok: result.action === 'processed',
+      action: result.action,
+      reason: result.reason,
+      pageId: result.pageId,
+      created: result.created,
+      dropboxFileId: metadata.id,
+      dropboxPathLower: metadata.path_lower,
+      storedFileName: metadata.name,
+      fileSizeBytes: metadata.size,
+      dedupCandidates: result.dedupCandidates,
+      errorMessage: result.record?.errorMessage,
+    });
+  } catch (error) {
+    console.error('interviews.upload.processing_failed', {
+      fileName: metadata.name,
+      dropboxFileId: metadata.id,
+      pathLower: metadata.path_lower,
+      message: error instanceof Error ? error.message : 'Unknown processing error',
+      details: error instanceof HttpError ? error.details : undefined,
+    });
+    throw error;
+  }
+}
+
+async function handleDebugDropbox(request: Request, env: Env): Promise<Response> {
+  requireWebhookSecret(request, env.INTERVIEW_WEBHOOK_SECRET);
   try {
     const response = await debugDropboxAppFolderRoot(env);
     return jsonResponse({ ok: true, path: '', ...response });
   } catch (error) {
     if (error instanceof HttpError) {
-      return jsonResponse(
-        {
-          ok: false,
-          message: error.message,
-          status: error.status,
-          details: error.details,
-        },
-        { status: error.status },
-      );
+      return jsonResponse({ ok: false, message: error.message, status: error.status, details: error.details }, { status: error.status });
     }
     throw error;
   }
@@ -190,21 +283,12 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
       const url = new URL(request.url);
-      if (request.method === 'GET' && url.pathname === '/') {
-        return jsonResponse({ ok: true, service: 'meeting-memo' });
-      }
-      if (request.method === 'POST' && url.pathname === '/api/interviews/intake') {
-        return await handleIntake(request, env);
-      }
-      if (request.method === 'POST' && url.pathname === '/api/interviews/scan') {
-        return await handleScan(request, env);
-      }
-      if (request.method === 'GET' && url.pathname === '/api/interviews/debug-dropbox') {
-        return await handleDebugDropbox(request, env);
-      }
-      if (request.method === 'GET' && url.pathname === '/health') {
-        return jsonResponse({ ok: true, env: env.APP_ENV ?? 'unknown' });
-      }
+      if (request.method === 'GET' && url.pathname === '/') return jsonResponse({ ok: true, service: 'meeting-memo' });
+      if (request.method === 'POST' && url.pathname === '/api/interviews/intake') return await handleIntake(request, env);
+      if (request.method === 'POST' && url.pathname === '/api/interviews/scan') return await handleScan(request, env);
+      if (request.method === 'POST' && url.pathname === '/api/interviews/upload') return await handleUpload(request, env);
+      if (request.method === 'GET' && url.pathname === '/api/interviews/debug-dropbox') return await handleDebugDropbox(request, env);
+      if (request.method === 'GET' && url.pathname === '/health') return jsonResponse({ ok: true, env: env.APP_ENV ?? 'unknown' });
       return jsonResponse({ ok: false, message: 'Not Found' }, { status: 404 });
     } catch (error) {
       if (error instanceof HttpError) {
@@ -218,10 +302,7 @@ export default {
       }
 
       const message = error instanceof Error ? error.message : 'Unknown error';
-      console.error('worker.unhandled_error', {
-        message,
-        stack: error instanceof Error ? error.stack : undefined,
-      });
+      console.error('worker.unhandled_error', { message, stack: error instanceof Error ? error.stack : undefined });
       return Response.json({ ok: false, message }, { status: 500 });
     }
   },

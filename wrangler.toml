@@ -10,3 +10,4 @@ enabled = true
 DROPBOX_INTERVIEW_SCAN_FOLDER = "/Apps/MeetingMemo/inbox"
 DROPBOX_INTERVIEW_SCAN_RECURSIVE = "false"
 INTERVIEW_SCAN_MAX_FILES = "20"
+DROPBOX_UPLOAD_FOLDER = "/Apps/MeetingMemo/inbox"

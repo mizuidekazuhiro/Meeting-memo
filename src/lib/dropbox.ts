@@ -4,6 +4,8 @@ import { HttpError } from './http';
 const DROPBOX_API = 'https://api.dropboxapi.com/2';
 const DROPBOX_CONTENT_API = 'https://content.dropboxapi.com/2';
 const AUDIO_FILE_EXTENSIONS = new Set(['.m4a', '.mp3', '.wav', '.aac', '.mp4', '.mpeg', '.mpga', '.webm']);
+const DEFAULT_UPLOAD_FOLDER = '/interviews';
+const DROPBOX_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
 
 export function getDropboxCredentialStatus(env: Env): {
   hasDropboxAccessToken: boolean;
@@ -35,14 +37,8 @@ function getMissingDropboxCredentialKeys(env: Env): string[] {
 }
 
 export function getDropboxAuthMode(env: Env): DropboxAuthMode | null {
-  if (env.DROPBOX_ACCESS_TOKEN) {
-    return 'access_token';
-  }
-
-  if (env.DROPBOX_APP_KEY && env.DROPBOX_APP_SECRET && env.DROPBOX_REFRESH_TOKEN) {
-    return 'refresh_token';
-  }
-
+  if (env.DROPBOX_ACCESS_TOKEN) return 'access_token';
+  if (env.DROPBOX_APP_KEY && env.DROPBOX_APP_SECRET && env.DROPBOX_REFRESH_TOKEN) return 'refresh_token';
   return null;
 }
 
@@ -99,18 +95,12 @@ async function resolveAccessToken(env: Env): Promise<string> {
   return accessToken;
 }
 
-async function dropboxRpc<T>(
-  env: Env,
-  path: string,
-  body: unknown,
-  auth?: DropboxAuthResolution,
-): Promise<T> {
+async function dropboxRpc<T>(env: Env, path: string, body: unknown, auth?: DropboxAuthResolution): Promise<T> {
   const resolvedAuth = auth ?? (await resolveDropboxAuth(env));
-  const token = resolvedAuth.accessToken;
   const response = await fetch(`${DROPBOX_API}${path}`, {
     method: 'POST',
     headers: {
-      authorization: `Bearer ${token}`,
+      authorization: `Bearer ${resolvedAuth.accessToken}`,
       'content-type': 'application/json',
     },
     body: JSON.stringify(body),
@@ -125,13 +115,55 @@ async function dropboxRpc<T>(
   return (await response.json()) as T;
 }
 
+async function dropboxContentUpload<T>(
+  env: Env,
+  path: string,
+  args: unknown,
+  body: Blob,
+  auth?: DropboxAuthResolution,
+): Promise<T> {
+  const resolvedAuth = auth ?? (await resolveDropboxAuth(env));
+  const response = await fetch(`${DROPBOX_CONTENT_API}${path}`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${resolvedAuth.accessToken}`,
+      'Content-Type': 'application/octet-stream',
+      'Dropbox-API-Arg': JSON.stringify(args),
+    },
+    body,
+  });
+
+  if (!response.ok) {
+    throw new HttpError(`Dropbox content API call failed for ${path}.`, response.status, {
+      attemptedAuthMode: resolvedAuth.authMode,
+      responseBody: await response.text(),
+    });
+  }
+
+  if (response.status === 204) {
+    return undefined as T;
+  }
+
+  return (await response.json()) as T;
+}
+
+function normalizeDropboxFolderPath(folderPath?: string): string {
+  const raw = (folderPath ?? '').trim();
+  if (!raw) return DEFAULT_UPLOAD_FOLDER;
+  const withLeadingSlash = raw.startsWith('/') ? raw : `/${raw}`;
+  return withLeadingSlash.replace(/\/+$/, '') || DEFAULT_UPLOAD_FOLDER;
+}
+
+export function resolveDropboxUploadFolder(env: Env): string {
+  return normalizeDropboxFolderPath(env.DROPBOX_UPLOAD_FOLDER ?? env.DROPBOX_INTERVIEW_SCAN_FOLDER);
+}
+
 export async function fetchDropboxMetadata(env: Env, intake: IntakeRequest): Promise<DropboxFileMetadata> {
   if (intake.dropboxFileId) {
-    const metadata = await dropboxRpc<DropboxFileMetadata>(env, '/files/get_metadata', {
+    return dropboxRpc<DropboxFileMetadata>(env, '/files/get_metadata', {
       path: intake.dropboxFileId,
       include_media_info: true,
     });
-    return metadata;
   }
   if (intake.dropboxPathLower) {
     return dropboxRpc<DropboxFileMetadata>(env, '/files/get_metadata', {
@@ -160,7 +192,6 @@ export async function listDropboxFolder(env: Env, folderPath: string, recursive:
 export async function listAllDropboxEntries(env: Env, folderPath: string, recursive: boolean): Promise<DropboxFileMetadata[]> {
   const allEntries: DropboxFileMetadata[] = [];
   let response = await listDropboxFolder(env, folderPath, recursive);
-
   allEntries.push(...response.entries.filter((entry) => entry['.tag'] === 'file'));
 
   while (response.has_more && response.cursor) {
@@ -178,22 +209,20 @@ export async function debugDropboxAppFolderRoot(env: Env): Promise<{
   has_more: boolean;
 }> {
   const auth = await resolveDropboxAuth(env);
-  const response = await dropboxRpc<{
-    entries: DropboxFileMetadata[];
-    cursor?: string;
-    has_more: boolean;
-  }>(env, '/files/list_folder', {
-    path: '',
-    recursive: false,
-    limit: 20,
-    include_deleted: false,
-    include_has_explicit_shared_members: false,
-    include_mounted_folders: true,
-  }, auth);
-  return {
-    authMode: auth.authMode,
-    ...response,
-  };
+  const response = await dropboxRpc<{ entries: DropboxFileMetadata[]; cursor?: string; has_more: boolean }>(
+    env,
+    '/files/list_folder',
+    {
+      path: '',
+      recursive: false,
+      limit: 20,
+      include_deleted: false,
+      include_has_explicit_shared_members: false,
+      include_mounted_folders: true,
+    },
+    auth,
+  );
+  return { authMode: auth.authMode, ...response };
 }
 
 export function isAudioDropboxFile(metadata: DropboxFileMetadata): boolean {
@@ -220,4 +249,77 @@ export async function downloadDropboxFile(env: Env, metadata: DropboxFileMetadat
     throw new HttpError('Failed to download Dropbox audio file.', 502, await response.text());
   }
   return await response.blob();
+}
+
+export async function uploadAudioToDropbox(env: Env, file: Blob, fileName: string): Promise<DropboxFileMetadata> {
+  const auth = await resolveDropboxAuth(env);
+  const folder = resolveDropboxUploadFolder(env);
+  const path = `${folder}/${fileName}`;
+
+  try {
+    if (file.size <= DROPBOX_UPLOAD_CHUNK_BYTES) {
+      return await dropboxContentUpload<DropboxFileMetadata>(
+        env,
+        '/files/upload',
+        {
+          path,
+          mode: 'add',
+          autorename: true,
+          mute: false,
+          strict_conflict: false,
+        },
+        file,
+        auth,
+      );
+    }
+
+    const firstChunk = file.slice(0, DROPBOX_UPLOAD_CHUNK_BYTES);
+    const start = await dropboxContentUpload<{ session_id: string }>(
+      env,
+      '/files/upload_session/start',
+      { close: false },
+      firstChunk,
+      auth,
+    );
+
+    let offset = firstChunk.size;
+    while (offset + DROPBOX_UPLOAD_CHUNK_BYTES < file.size) {
+      const chunk = file.slice(offset, offset + DROPBOX_UPLOAD_CHUNK_BYTES);
+      await dropboxContentUpload<void>(
+        env,
+        '/files/upload_session/append_v2',
+        {
+          cursor: { session_id: start.session_id, offset },
+          close: false,
+        },
+        chunk,
+        auth,
+      );
+      offset += chunk.size;
+    }
+
+    const finalChunk = file.slice(offset, file.size);
+    return await dropboxContentUpload<DropboxFileMetadata>(
+      env,
+      '/files/upload_session/finish',
+      {
+        cursor: { session_id: start.session_id, offset },
+        commit: {
+          path,
+          mode: 'add',
+          autorename: true,
+          mute: false,
+          strict_conflict: false,
+        },
+      },
+      finalChunk,
+      auth,
+    );
+  } catch (error) {
+    throw new HttpError('Failed to persist uploaded audio into Dropbox.', 502, {
+      fileName,
+      folder,
+      cause: error instanceof HttpError ? error.details : error instanceof Error ? error.message : error,
+    });
+  }
 }
