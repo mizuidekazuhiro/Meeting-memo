@@ -10,6 +10,7 @@ export interface Env {
   DROPBOX_INTERVIEW_SCAN_FOLDER?: string;
   DROPBOX_INTERVIEW_SCAN_RECURSIVE?: string;
   INTERVIEW_SCAN_MAX_FILES?: string;
+  DROPBOX_UPLOAD_FOLDER?: string;
   OPENAI_API_KEY: string;
   OPENAI_MODEL_TRANSCRIBE?: string;
   OPENAI_MODEL_SUMMARIZE?: string;
@@ -31,6 +32,17 @@ export interface IntakeRequest {
   notes?: string;
 }
 
+export interface UploadRequestMetadata {
+  recordedAt?: string;
+  idempotencyKey?: string;
+  source?: string;
+  initiatedBy?: string;
+  participants?: string[];
+  languageHint?: string;
+  notes?: string;
+  dryRun?: boolean;
+}
+
 export interface ScanRequest {
   folderPath?: string;
   limit?: number;
@@ -42,6 +54,7 @@ export interface DropboxFileMetadata {
   '.tag'?: string;
   id?: string;
   name: string;
+  path_display?: string;
   path_lower?: string;
   content_hash?: string;
   size?: number;
