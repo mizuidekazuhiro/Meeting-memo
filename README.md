@@ -347,23 +347,34 @@ curl "https://<your-worker-domain>/api/interviews/debug-dropbox" \
 
 GitHub の `Settings → Secrets and variables → Actions` に以下を追加してください。
 
+### Cloudflare 認証用
 - `CLOUDFLARE_API_TOKEN`
 - `CLOUDFLARE_ACCOUNT_ID`
+
+### アプリ用 secrets
 - `INTERVIEW_WEBHOOK_SECRET`
 - `NOTION_TOKEN`
 - `INBOX_DB_ID`
 - `OPENAI_API_KEY`
+
+Dropbox 認証は次の **どちらか一方** を設定します。
+
+#### A. access token 方式
 - `DROPBOX_ACCESS_TOKEN`
 
-refresh token 方式なら代わりに以下も使えます。
+#### B. refresh token 方式
 - `DROPBOX_APP_KEY`
 - `DROPBOX_APP_SECRET`
 - `DROPBOX_REFRESH_TOKEN`
 
-さらに scan 用の通常環境変数として以下を設定します。
+### 通常変数 (`wrangler.toml` 管理)
+以下は GitHub Secrets ではなく `wrangler.toml` の `[vars]` で管理しています。
+
 - `DROPBOX_INTERVIEW_SCAN_FOLDER`
 - `DROPBOX_INTERVIEW_SCAN_RECURSIVE`
 - `INTERVIEW_SCAN_MAX_FILES`
+
+> Cloudflare Dashboard で Worker secret を手動登録・手動更新する必要はありません。GitHub Secrets と GitHub Actions のみで `meeting-memo` に反映する前提です。
 
 ---
 
@@ -374,122 +385,139 @@ refresh token 方式なら代わりに以下も使えます。
 - 共有リンク生成は scan 方式では不要です。
 - Notion Inbox DB の既存運用は維持します。
 
-
 ---
 
-## 14. GitHub Actions で Worker Secret を自動同期して deploy する
+## 14. GitHub Actions で Worker deploy と secrets 反映を完結させる
 
-### なぜ GitHub に Secret を入れただけでは Worker に反映されないのか
+### 変更後の workflow 構成
 
-GitHub Secrets は **GitHub Actions の実行時にだけ参照できる CI 用の保管場所** です。Cloudflare Workers の実行環境は GitHub とは別管理なので、GitHub に secret を保存しただけでは `meeting-memo` Worker の runtime secret には自動反映されません。
+このリポジトリでは Cloudflare Dashboard 手動操作を前提にせず、以下 2 本の workflow で完結させます。
 
-そのため、このリポジトリでは `.github/workflows/deploy-worker.yml` で毎回以下を行うようにします。
-
-1. GitHub Secrets を読み込む
-2. `wrangler secret bulk` で Cloudflare Worker `meeting-memo` に同期する
-3. `wrangler deploy` で Worker を deploy する
-
-この構成により、**main への push だけで secret 同期と deploy が idempotent に再実行** されます。
-
-### 追加される workflow
-
-- ファイル: `.github/workflows/deploy-worker.yml`
-- トリガー:
+- `.github/workflows/deploy-worker.yml`
   - `push` to `main`
   - `workflow_dispatch`
-- 実行内容:
-  1. GitHub Secrets を検証
-  2. Cloudflare Workers Secrets を同期
-  3. `meeting-memo` Worker を deploy
+  - 役割: `meeting-memo` の Worker コードを `wrangler deploy` で deploy し、その後 secrets 同期 workflow を呼び出す
+- `.github/workflows/sync-worker-secrets.yml`
+  - `workflow_dispatch`
+  - `workflow_call`
+  - 役割: GitHub Secrets から Cloudflare Workers secrets 用の新しい **version** を作成し、その version を本番 deployment として有効化する
 
-### GitHub Secrets と Cloudflare Workers Secrets の役割の違い
+### なぜ `wrangler secret bulk` をやめたのか
 
-- **GitHub Secrets**
-  - GitHub Actions が workflow 実行中に参照するための秘密情報です。
-  - リポジトリに push しても、Cloudflare 側の Worker runtime には自動では入りません。
-- **Cloudflare Workers Secrets**
-  - 実際に Worker 実行時に `env` から参照される秘密情報です。
-  - `INTERVIEW_WEBHOOK_SECRET` や `NOTION_TOKEN` など、Worker 本体が使う値はこちらに存在している必要があります。
+Cloudflare Workers の Versions / Deployments モデルでは、`wrangler secret bulk` は secret 更新を伴う即時反映を行います。一方で、Worker 側が versioned deploy 状態にあり、**最新 version がまだ active deployment ではない** タイミングだと、Cloudflare API が script settings の変更とみなして `code: 10214` を返すことがあります。
 
-### GitHub 側で設定する Secrets
+失敗例:
+
+- `Script edit failed. You attempted to deploy the latest version with modified settings, but the latest version isn't currently deployed. [code: 10214]`
+
+そのため、このリポジトリでは secret 反映を次の version-aware 手順へ変更しました。
+
+### 新しい secrets 反映手順
+
+1. `wrangler deployments status --name meeting-memo --json`
+   - 現在の active deployment を確認
+2. `wrangler versions list --name meeting-memo --json`
+   - secret 同期前の version 一覧を保存
+3. `wrangler versions secret bulk --name meeting-memo <payload>`
+   - GitHub Secrets から secret を使った **新しい Worker version** を作成
+   - ここではまだ deployment を直接いじりません
+4. `wrangler versions list --name meeting-memo --json`
+   - 新しく作られた version ID を特定
+5. `wrangler versions deploy <version-id>@100% --name meeting-memo --yes`
+   - secret を含む最新 version を active deployment に切り替え
+6. `wrangler deployments status --name meeting-memo --json`
+   - 反映後の deployment を確認
+
+この方式では、`latest version isn't currently deployed` の状態で古い deployment に対して設定差分を当てにいかないため、`code 10214` を回避しやすくなります。
+
+### deploy と secrets の実行順序
+
+`Deploy meeting-memo worker` workflow 実行時の順序は次のとおりです。
+
+1. `wrangler deploy --name meeting-memo`
+   - Worker コードを deploy
+2. `wrangler deployments status --name meeting-memo --json`
+   - 最新 deployment を確認
+3. `Sync meeting-memo worker secrets` workflow を呼び出し
+4. `wrangler versions secret bulk --name meeting-memo ...`
+   - secrets を含む新 version を作成
+5. `wrangler versions deploy <new-version-id>@100% --name meeting-memo --yes`
+   - secrets を含む最新 version を有効化
+
+つまり最終的な本番反映順は **deploy → version 作成 → version 有効化** です。Cloudflare の versioned deploy 制約に合わせて、secret 更新も version として扱うのがポイントです。
+
+### GitHub Secrets の検証ルール
 
 必須:
 
-- `CLOUDFLARE_API_TOKEN`
-- `CLOUDFLARE_ACCOUNT_ID`
 - `INTERVIEW_WEBHOOK_SECRET`
 - `NOTION_TOKEN`
 - `INBOX_DB_ID`
 - `OPENAI_API_KEY`
 
-Dropbox 認証は次の **どちらか** を設定してください。
-
-#### A. access token 方式（優先）
+Dropbox 認証は以下のどちらかが必要です。
 
 - `DROPBOX_ACCESS_TOKEN`
+- または `DROPBOX_APP_KEY` / `DROPBOX_APP_SECRET` / `DROPBOX_REFRESH_TOKEN` の 3 点セット
 
-この値が存在する場合、workflow は **access token 方式を優先** して Cloudflare Worker に投入します。
+`DROPBOX_ACCESS_TOKEN` が存在する場合は access token 方式を優先し、なければ refresh token 方式を使います。どちらも満たさない場合、workflow は Cloudflare API 呼び出し前に失敗します。
 
-#### B. refresh token 方式
-
-- `DROPBOX_APP_KEY`
-- `DROPBOX_APP_SECRET`
-- `DROPBOX_REFRESH_TOKEN`
-
-`DROPBOX_ACCESS_TOKEN` が空で、上の 3 つがすべて揃っている場合は refresh token 方式で Cloudflare Worker に投入します。
-
-#### 失敗条件
-
-次の場合、workflow は明示的に失敗します。
-
-- `DROPBOX_ACCESS_TOKEN` がない
-- かつ `DROPBOX_APP_KEY` / `DROPBOX_APP_SECRET` / `DROPBOX_REFRESH_TOKEN` が揃っていない
-
-ログには **どの認証方式を使うか** だけを安全に出し、secret 値そのものは出しません。
-
-### 既存 vars はそのまま維持される
-
-`wrangler.toml` にある次の通常変数は deploy 時にそのまま使われます。
-
-- `DROPBOX_INTERVIEW_SCAN_FOLDER="/Apps/MeetingMemo/inbox"`
-- `DROPBOX_INTERVIEW_SCAN_RECURSIVE="false"`
-- `INTERVIEW_SCAN_MAX_FILES="20"`
-
-`wrangler secret bulk` は secret の同期にのみ使い、`wrangler.toml` の `[vars]` は壊しません。
-
-### 初回設定手順
+### 初回セットアップ手順
 
 1. GitHub リポジトリの `Settings → Secrets and variables → Actions` を開く。
 2. 上記の GitHub Secrets を登録する。
-3. Cloudflare API Token には、対象 account の Workers を更新できる権限を付与する。
-4. `main` に push するか、Actions 画面から `Deploy Cloudflare Worker` を手動実行する。
-5. workflow が成功すると、GitHub Secrets が Cloudflare Workers Secrets に同期され、その直後に `meeting-memo` が deploy される。
+3. `CLOUDFLARE_API_TOKEN` に `meeting-memo` を更新できる権限を付与する。
+4. `Actions` タブから **Deploy meeting-memo worker** を実行する。
+5. workflow 成功後、Worker コード deploy と Worker secrets 反映の両方が GitHub 上だけで完了する。
+
+> 初回セットアップから更新まで、Cloudflare Dashboard で secret を手動登録する必要はありません。
+
+### secret だけ再反映したい場合
+
+GitHub Secrets の値だけを更新した場合は、`Actions` タブから **Sync meeting-memo worker secrets** を実行してください。
+
+この workflow は以下を行います。
+
+1. 現在の deployment 状態を表示
+2. secret 同期前後の versions を比較
+3. secret を含む新 version を作成
+4. その version を 100% traffic に deploy
+5. 反映後の deployment 状態を表示
+
+### ログ改善について
+
+失敗時にどの API 呼び出しで落ちたか分かるよう、workflow ログに Cloudflare API 操作の区切りを明示しています。
+
+- `[Cloudflare API] DEPLOY worker code with wrangler deploy`
+- `[Cloudflare API] GET deployment status after code deploy`
+- `[Cloudflare API] LIST versions before uploading secrets`
+- `[Cloudflare API] CREATE version with secrets via wrangler versions secret bulk`
+- `[Cloudflare API] DEPLOY secret version to 100% traffic`
+- `[Cloudflare API] GET deployment status after secret activation`
+
+そのため、`deploy`・`versions secret bulk`・`versions deploy` のどこで失敗したかを GitHub Actions 上で追いやすくなります。
 
 ### 手動再実行方法 (`workflow_dispatch`)
 
+#### コード + secrets をまとめて反映する場合
+
 1. GitHub の `Actions` タブを開く。
-2. `Deploy Cloudflare Worker` workflow を選ぶ。
+2. `Deploy meeting-memo worker` を選ぶ。
 3. `Run workflow` を押す。
-4. 同じブランチの最新コミットに対して、secret 同期と deploy を再実行できる。
 
-secret を更新した直後に反映したい場合も、この手順で再実行できます。
+#### secrets のみ再反映する場合
 
-### push to main で何が自動反映されるか
-
-`main` への push ごとに以下が自動で反映されます。
-
-1. GitHub Secrets から Cloudflare Workers Secrets へ値を再同期
-2. `meeting-memo` Worker を deploy
-3. deploy 済みコードが、同期済み secret と `wrangler.toml` の既存 vars を組み合わせて起動
-
-これにより、`/api/interviews/scan` が Dropbox 認証エラーなく動くために必要な runtime secret を毎回揃えやすくなります。
+1. GitHub の `Actions` タブを開く。
+2. `Sync meeting-memo worker secrets` を選ぶ。
+3. `Run workflow` を押す。
 
 ### 反映確認手順
 
 #### 1. Actions の成功確認
 
-- GitHub Actions の `Deploy Cloudflare Worker` が成功していることを確認する。
+- `Deploy meeting-memo worker` または `Sync meeting-memo worker secrets` が成功していることを確認する。
 - ログでは Dropbox 認証方式として `access_token` または `refresh_token` のどちらで進んだかだけを確認する。
+- `versions deploy` 完了後の `deployments status` で、secret 反映後 version が active になっていることを確認する。
 
 #### 2. Worker URL の確認方法
 
@@ -497,7 +525,7 @@ secret を更新した直後に反映したい場合も、この手順で再実�
 
 - `https://meeting-memo.<your-subdomain>.workers.dev`
 
-Cloudflare ダッシュボードの **Workers & Pages → meeting-memo** でも最終的な公開 URL を確認できます。`wrangler deploy` の完了ログにも deploy 先 URL が表示されます。
+`wrangler deploy` の完了ログにも deploy 先 URL が表示されます。
 
 #### 3. health check
 
@@ -516,27 +544,25 @@ body を省略する場合は、Worker 側に `DROPBOX_INTERVIEW_SCAN_FOLDER` �
 
 ### よくある失敗例
 
-#### 1. `INTERVIEW_WEBHOOK_SECRET` 未反映
+#### 1. `Dropbox credentials are not fully configured`
 
 症状:
-- `/api/interviews/intake` または `/api/interviews/scan` で認証エラーになる
-
-確認ポイント:
-- GitHub Secret `INTERVIEW_WEBHOOK_SECRET` を登録したか
-- `Deploy Cloudflare Worker` workflow が成功したか
-- secret 更新後に `main` へ push したか、または `workflow_dispatch` で再実行したか
-
-#### 2. `Dropbox credentials are not fully configured`
-
-症状:
-- workflow が secret 同期前に失敗する
+- workflow が secret version 作成前に失敗する
 - Worker 実行時に Dropbox 認証エラーになる
 
 確認ポイント:
 - `DROPBOX_ACCESS_TOKEN` を設定したか
 - もしくは `DROPBOX_APP_KEY` / `DROPBOX_APP_SECRET` / `DROPBOX_REFRESH_TOKEN` を **3 つとも** 設定したか
-- refresh token 方式を使うつもりで 1 つでも欠けていないか
 - Worker が読む env 名と Cloudflare Secret 名が完全一致しているか（本リポジトリでは `DROPBOX_APP_KEY` / `DROPBOX_APP_SECRET` を使用し、`DROPBOX_CLIENT_ID` / `DROPBOX_CLIENT_SECRET` は使用しません）
+
+#### 2. `code: 10214`
+
+症状:
+- 旧 workflow の `wrangler secret bulk --name meeting-memo ...` で失敗する
+
+対応:
+- このリポジトリでは `wrangler secret bulk` をやめ、`wrangler versions secret bulk` → `wrangler versions deploy` へ切り替えています。
+- もし古い run が残っている場合は、**Sync meeting-memo worker secrets** または **Deploy meeting-memo worker** を再実行してください。
 
 #### 3. body 省略時に `DROPBOX_INTERVIEW_SCAN_FOLDER` が必要
 
@@ -552,6 +578,6 @@ body を省略する場合は、Worker 側に `DROPBOX_INTERVIEW_SCAN_FOLDER` �
 
 - workflow では secret 値を `echo` しません。
 - `set -x` は使いません。
-- 一時 JSON は workflow 内で生成し、`wrangler secret bulk` 実行後に削除します。
+- 一時ファイルは workflow 実行中のみ使用します。
 - 空文字の secret は Cloudflare に送られません。
 - 使わない Dropbox credential は secret payload に入れません。
