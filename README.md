@@ -324,3 +324,184 @@ refresh token 方式なら代わりに以下も使えます。
 - 新しい `/api/interviews/scan` は 1 件失敗しても全体継続します。
 - 共有リンク生成は scan 方式では不要です。
 - Notion Inbox DB の既存運用は維持します。
+
+
+---
+
+## 13. GitHub Actions で Worker Secret を自動同期して deploy する
+
+### なぜ GitHub に Secret を入れただけでは Worker に反映されないのか
+
+GitHub Secrets は **GitHub Actions の実行時にだけ参照できる CI 用の保管場所** です。Cloudflare Workers の実行環境は GitHub とは別管理なので、GitHub に secret を保存しただけでは `meeting-memo` Worker の runtime secret には自動反映されません。
+
+そのため、このリポジトリでは `.github/workflows/deploy-worker.yml` で毎回以下を行うようにします。
+
+1. GitHub Secrets を読み込む
+2. `wrangler secret bulk` で Cloudflare Worker `meeting-memo` に同期する
+3. `wrangler deploy` で Worker を deploy する
+
+この構成により、**main への push だけで secret 同期と deploy が idempotent に再実行** されます。
+
+### 追加される workflow
+
+- ファイル: `.github/workflows/deploy-worker.yml`
+- トリガー:
+  - `push` to `main`
+  - `workflow_dispatch`
+- 実行内容:
+  1. GitHub Secrets を検証
+  2. Cloudflare Workers Secrets を同期
+  3. `meeting-memo` Worker を deploy
+
+### GitHub Secrets と Cloudflare Workers Secrets の役割の違い
+
+- **GitHub Secrets**
+  - GitHub Actions が workflow 実行中に参照するための秘密情報です。
+  - リポジトリに push しても、Cloudflare 側の Worker runtime には自動では入りません。
+- **Cloudflare Workers Secrets**
+  - 実際に Worker 実行時に `env` から参照される秘密情報です。
+  - `INTERVIEW_WEBHOOK_SECRET` や `NOTION_TOKEN` など、Worker 本体が使う値はこちらに存在している必要があります。
+
+### GitHub 側で設定する Secrets
+
+必須:
+
+- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_ACCOUNT_ID`
+- `INTERVIEW_WEBHOOK_SECRET`
+- `NOTION_TOKEN`
+- `INBOX_DB_ID`
+- `OPENAI_API_KEY`
+
+Dropbox 認証は次の **どちらか** を設定してください。
+
+#### A. access token 方式（優先）
+
+- `DROPBOX_ACCESS_TOKEN`
+
+この値が存在する場合、workflow は **access token 方式を優先** して Cloudflare Worker に投入します。
+
+#### B. refresh token 方式
+
+- `DROPBOX_APP_KEY`
+- `DROPBOX_APP_SECRET`
+- `DROPBOX_REFRESH_TOKEN`
+
+`DROPBOX_ACCESS_TOKEN` が空で、上の 3 つがすべて揃っている場合は refresh token 方式で Cloudflare Worker に投入します。
+
+#### 失敗条件
+
+次の場合、workflow は明示的に失敗します。
+
+- `DROPBOX_ACCESS_TOKEN` がない
+- かつ `DROPBOX_APP_KEY` / `DROPBOX_APP_SECRET` / `DROPBOX_REFRESH_TOKEN` が揃っていない
+
+ログには **どの認証方式を使うか** だけを安全に出し、secret 値そのものは出しません。
+
+### 既存 vars はそのまま維持される
+
+`wrangler.toml` にある次の通常変数は deploy 時にそのまま使われます。
+
+- `DROPBOX_INTERVIEW_SCAN_FOLDER="/Apps/MeetingMemo/inbox"`
+- `DROPBOX_INTERVIEW_SCAN_RECURSIVE="false"`
+- `INTERVIEW_SCAN_MAX_FILES="20"`
+
+`wrangler secret bulk` は secret の同期にのみ使い、`wrangler.toml` の `[vars]` は壊しません。
+
+### 初回設定手順
+
+1. GitHub リポジトリの `Settings → Secrets and variables → Actions` を開く。
+2. 上記の GitHub Secrets を登録する。
+3. Cloudflare API Token には、対象 account の Workers を更新できる権限を付与する。
+4. `main` に push するか、Actions 画面から `Deploy Cloudflare Worker` を手動実行する。
+5. workflow が成功すると、GitHub Secrets が Cloudflare Workers Secrets に同期され、その直後に `meeting-memo` が deploy される。
+
+### 手動再実行方法 (`workflow_dispatch`)
+
+1. GitHub の `Actions` タブを開く。
+2. `Deploy Cloudflare Worker` workflow を選ぶ。
+3. `Run workflow` を押す。
+4. 同じブランチの最新コミットに対して、secret 同期と deploy を再実行できる。
+
+secret を更新した直後に反映したい場合も、この手順で再実行できます。
+
+### push to main で何が自動反映されるか
+
+`main` への push ごとに以下が自動で反映されます。
+
+1. GitHub Secrets から Cloudflare Workers Secrets へ値を再同期
+2. `meeting-memo` Worker を deploy
+3. deploy 済みコードが、同期済み secret と `wrangler.toml` の既存 vars を組み合わせて起動
+
+これにより、`/api/interviews/scan` が Dropbox 認証エラーなく動くために必要な runtime secret を毎回揃えやすくなります。
+
+### 反映確認手順
+
+#### 1. Actions の成功確認
+
+- GitHub Actions の `Deploy Cloudflare Worker` が成功していることを確認する。
+- ログでは Dropbox 認証方式として `access_token` または `refresh_token` のどちらで進んだかだけを確認する。
+
+#### 2. Worker URL の確認方法
+
+この repo は `workers_dev = true` なので、通常は以下の URL で確認できます。
+
+- `https://meeting-memo.<your-subdomain>.workers.dev`
+
+Cloudflare ダッシュボードの **Workers & Pages → meeting-memo** でも最終的な公開 URL を確認できます。`wrangler deploy` の完了ログにも deploy 先 URL が表示されます。
+
+#### 3. health check
+
+```bash
+curl https://meeting-memo.<your-subdomain>.workers.dev/health
+```
+
+#### 4. scan 実行確認
+
+```bash
+curl -X POST "https://meeting-memo.<your-subdomain>.workers.dev/api/interviews/scan" \
+  -H "X-Webhook-Secret: <INTERVIEW_WEBHOOK_SECRET>"
+```
+
+body を省略する場合は、Worker 側に `DROPBOX_INTERVIEW_SCAN_FOLDER` が設定されている必要があります。
+
+### よくある失敗例
+
+#### 1. `INTERVIEW_WEBHOOK_SECRET` 未反映
+
+症状:
+- `/api/interviews/intake` または `/api/interviews/scan` で認証エラーになる
+
+確認ポイント:
+- GitHub Secret `INTERVIEW_WEBHOOK_SECRET` を登録したか
+- `Deploy Cloudflare Worker` workflow が成功したか
+- secret 更新後に `main` へ push したか、または `workflow_dispatch` で再実行したか
+
+#### 2. `Dropbox credentials are not fully configured`
+
+症状:
+- workflow が secret 同期前に失敗する
+- Worker 実行時に Dropbox 認証エラーになる
+
+確認ポイント:
+- `DROPBOX_ACCESS_TOKEN` を設定したか
+- もしくは `DROPBOX_APP_KEY` / `DROPBOX_APP_SECRET` / `DROPBOX_REFRESH_TOKEN` を **3 つとも** 設定したか
+- refresh token 方式を使うつもりで 1 つでも欠けていないか
+
+#### 3. body 省略時に `DROPBOX_INTERVIEW_SCAN_FOLDER` が必要
+
+症状:
+- `POST /api/interviews/scan` を body なしで呼ぶと `folderPath is required when DROPBOX_INTERVIEW_SCAN_FOLDER is not configured.` が返る
+
+確認ポイント:
+- `wrangler.toml` の `DROPBOX_INTERVIEW_SCAN_FOLDER` を維持しているか
+- 別環境の設定変更で folder を空にしていないか
+- body 省略で使いたい既定フォルダが `/Apps/MeetingMemo/inbox` のままでよいか
+
+### セキュリティ上の注意
+
+- workflow では secret 値を `echo` しません。
+- `set -x` は使いません。
+- 一時 JSON は workflow 内で生成し、`wrangler secret bulk` 実行後に削除します。
+- 空文字の secret は Cloudflare に送られません。
+- 使わない Dropbox credential は secret payload に入れません。
