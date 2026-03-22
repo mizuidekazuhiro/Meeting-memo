@@ -22,9 +22,19 @@ jobs:
       - name: Install Wrangler
         run: npm install --no-save wrangler@4.76.0
 
-      - name: Validate required secrets and prepare payload
+      - name: Deploy worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npx wrangler@4.76.0 deploy --name meeting-memo
+
+      - name: Prepare and sync secrets
         shell: bash
         env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           INTERVIEW_WEBHOOK_SECRET: ${{ secrets.INTERVIEW_WEBHOOK_SECRET }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           INBOX_DB_ID: ${{ secrets.INBOX_DB_ID }}
@@ -105,23 +115,6 @@ jobs:
           fs.writeFileSync(process.env.MODE_FILE, mode);
           '
 
-          echo "PAYLOAD_FILE=$payload_file" >> "$GITHUB_ENV"
-          echo "MODE_FILE=$mode_file" >> "$GITHUB_ENV"
-
-      - name: Deploy worker first
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          set -euo pipefail
-          npx wrangler@4.76.0 deploy
-
-      - name: Sync worker secrets
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          set -euo pipefail
           echo "Prepared Cloudflare Worker secret payload for meeting-memo."
-          echo "Dropbox auth mode: $(cat "$MODE_FILE")"
-          npx wrangler@4.76.0 secret bulk --name meeting-memo "$PAYLOAD_FILE"
+          echo "Dropbox auth mode: $(cat "$mode_file")"
+          npx wrangler@4.76.0 secret bulk --name meeting-memo "$payload_file"
