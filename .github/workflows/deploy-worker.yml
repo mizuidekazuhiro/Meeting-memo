@@ -1,0 +1,79 @@
+name: Deploy Cloudflare Worker
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      INTERVIEW_WEBHOOK_SECRET: ${{ secrets.INTERVIEW_WEBHOOK_SECRET }}
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      INBOX_DB_ID: ${{ secrets.INBOX_DB_ID }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DROPBOX_ACCESS_TOKEN: ${{ secrets.DROPBOX_ACCESS_TOKEN }}
+      DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+      DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+      DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Validate required GitHub Secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          require_secret() {
+            local name="$1"
+            if [ -z "${!name:-}" ]; then
+              echo "Missing required GitHub Secret: ${name}" >&2
+              exit 1
+            fi
+          }
+
+          require_secret CLOUDFLARE_API_TOKEN
+          require_secret CLOUDFLARE_ACCOUNT_ID
+          require_secret INTERVIEW_WEBHOOK_SECRET
+          require_secret NOTION_TOKEN
+          require_secret INBOX_DB_ID
+          require_secret OPENAI_API_KEY
+
+      - name: Sync GitHub Secrets to Cloudflare Worker secrets
+        id: sync_secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          payload_file="$(mktemp)"
+          mode_file="$(mktemp)"
+          cleanup() {
+            rm -f "$payload_file" "$mode_file"
+          }
+          trap cleanup EXIT
+
+          export PAYLOAD_FILE="$payload_file"
+          export MODE_FILE="$mode_file"
+          node -e 'const fs = require("fs"); const required = ["INTERVIEW_WEBHOOK_SECRET", "NOTION_TOKEN", "INBOX_DB_ID", "OPENAI_API_KEY"]; const values = {}; for (const key of required) { const value = process.env[key] || ""; if (!value) { process.stderr.write(`Missing required GitHub Secret: ${key}\n`); process.exit(1); } values[key] = value; } const dropboxAccessToken = process.env.DROPBOX_ACCESS_TOKEN || ""; const refreshFields = { DROPBOX_APP_KEY: process.env.DROPBOX_APP_KEY || "", DROPBOX_APP_SECRET: process.env.DROPBOX_APP_SECRET || "", DROPBOX_REFRESH_TOKEN: process.env.DROPBOX_REFRESH_TOKEN || "" }; const refreshValues = Object.values(refreshFields); const refreshComplete = refreshValues.every(Boolean); const refreshPartial = refreshValues.some(Boolean) && !refreshComplete; let mode; if (dropboxAccessToken) { values.DROPBOX_ACCESS_TOKEN = dropboxAccessToken; mode = "access_token"; } else if (refreshComplete) { Object.assign(values, refreshFields); mode = "refresh_token"; } else { if (refreshPartial) { const missing = Object.entries(refreshFields).filter(([, value]) => !value).map(([key]) => key); process.stderr.write(`Dropbox credentials are not fully configured. Missing: ${missing.join(", ")}\n`); } else { process.stderr.write("Dropbox credentials are not fully configured. Provide DROPBOX_ACCESS_TOKEN or all of DROPBOX_APP_KEY, DROPBOX_APP_SECRET, and DROPBOX_REFRESH_TOKEN.\n"); } process.exit(1); } fs.writeFileSync(process.env.PAYLOAD_FILE, JSON.stringify(values)); fs.writeFileSync(process.env.MODE_FILE, mode);'
+
+          echo "Prepared Cloudflare Worker secret payload for meeting-memo."
+          echo "Dropbox auth mode: $(cat "$mode_file")"
+          npx wrangler@4 secret bulk --name meeting-memo "$payload_file"
+
+      - name: Deploy Cloudflare Worker
+        run: npx wrangler@4 deploy --name meeting-memo
