@@ -1,98 +1,145 @@
 # Meeting-memo
 
-Apple Watch で録音した面談音声を Dropbox 経由で Cloudflare Workers に送り、話者分離付き文字起こし・要約・タスク抽出を行い、Notion Inbox DB に 1 レコードとして保存するためのリポジトリです。
+Apple Watch / iPhone で録音した面談音声を Dropbox に保存し、Cloudflare Workers から Notion Inbox DB へ取り込むためのリポジトリです。
 
-このリポジトリは、既存の `notion-inbox-triage` を置き換えるものではありません。保存先の Notion DB は既存の Inbox DB を利用します。
-
----
-
-## 1. この仕組みでできること
-
-- iPhone ショートカットから webhook を送る
-- Dropbox 上の音声ファイルを取得する
-- 話者分離付きで文字起こしする
-- 要約を作る
-- 自分のタスク / 相手のタスクを抽出する
-- Notion Inbox DB に重複なく保存する
+既存の `POST /api/interviews/intake` による「1件指定取り込み」は維持しつつ、新たに `POST /api/interviews/scan` による「Dropbox の固定フォルダ探索取り込み」を追加しました。以後はショートカット側で毎回 Dropbox file id / path / shared link を渡さなくても、固定フォルダへ保存して scan を叩くだけで未処理ファイルを順次処理できます。
 
 ---
 
-## 2. 先に必要なもの
+## 変更方針の要約
 
-- GitHub アカウント
-- Cloudflare アカウント
-- Notion API トークン
-- Notion Inbox DB
-- Dropbox App
-- OpenAI API Key
-- iPhone ショートカット
+- 既存の `POST /api/interviews/intake` はそのまま残します。
+- 新たに `POST /api/interviews/scan` を追加し、Worker が Dropbox フォルダを列挙して未処理ファイルだけを処理します。
+- dedup は従来どおり Notion Inbox DB の `Dedup Key` を使います。
+- 話者分離文字起こし、要約、`My Tasks` / `Other Tasks` / `ambiguities` 抽出の流れは維持します。
+- 共有リンク生成は scan 方式では不要です。
 
 ---
 
-## 3. この repo の設定はターミナル不要です
+## 1. intake 方式と scan 方式
 
-この repo は、ターミナルを使わずに GitHub と Cloudflare の画面操作だけで設定する想定です。
+### intake 方式（従来どおり利用可）
 
-やることは次の 3 つです。
+`POST /api/interviews/intake` に対して、ショートカットや外部クライアントが Dropbox file id または path を指定して 1 件だけ処理する方式です。
 
-1. GitHub に secret を登録する
-2. GitHub Actions で Cloudflare Worker をデプロイする
-3. iPhone ショートカットから webhook を送る
+用途:
+- 単発ファイルを明示的に取り込みたい場合
+- 既存ショートカットをすぐには変えたくない場合
 
----
+### scan 方式（新方式・推奨）
 
-## 4. GitHub で設定する項目
+`POST /api/interviews/scan` が Dropbox 上の固定フォルダを Worker 側で探索し、音声ファイルだけを対象に dedup 判定して、未処理のみ順次処理する方式です。
 
-GitHub のリポジトリを開き、  
-**Settings → Secrets and variables → Actions** に進みます。
+用途:
+- Apple Watch / iPhone で録音後、ショートカットは固定フォルダへ保存するだけにしたい場合
+- Dropbox shared link の生成をやめたい場合
+- Dropbox file id / path を毎回 webhook に含めたくない場合
 
-### Secrets に追加する値
+### どちらを使うべきか
 
-- `CLOUDFLARE_API_TOKEN`
-- `CLOUDFLARE_ACCOUNT_ID`
-- `INTERVIEW_WEBHOOK_SECRET`
-- `NOTION_TOKEN`
-- `INBOX_DB_ID`
-- `DROPBOX_ACCESS_TOKEN`
-
-Dropbox を refresh token 方式で使う場合は、代わりに以下を追加します。
-
-- `DROPBOX_APP_KEY`
-- `DROPBOX_APP_SECRET`
-- `DROPBOX_REFRESH_TOKEN`
-
-さらに以下も追加します。
-
-- `OPENAI_API_KEY`
-
-### 補足
-
-- 機密情報はすべて GitHub Secrets に入れてください
-- API キーやトークンを `wrangler.toml` やソースコードに直接書かないでください
+- 通常運用は **scan 方式を推奨** します。
+- 既存連携の互換維持やピンポイント再処理には **intake 方式** を使えます。
 
 ---
 
-## 5. Cloudflare Worker への反映方法
+## 2. 推奨運用
 
-この repo では、GitHub Actions の deploy 時に、GitHub Secrets の内容を Cloudflare Worker の secrets に毎回同期します。
+1. Apple Watch / iPhone で録音する。
+2. iPhone ショートカットは録音ファイルを Dropbox の固定フォルダに保存する。
+3. 保存後に `POST /api/interviews/scan` を叩く。
+4. Worker が対象フォルダを列挙し、未処理の音声ファイルだけを順次処理する。
+5. Notion Inbox DB に重複なく保存する。
 
-そのため、Cloudflare Dashboard 上で手動登録した secret に依存しません。
-
-これにより、再デプロイ時に secret がずれたり、環境ごとの差分で動かなくなる事故を減らせます。
-
----
-
-## 6. なぜ「デプロイすると環境変数が消える」ように見えるのか
-
-Cloudflare Worker の secret は environment ごとに別管理です。
-
-たとえば production 環境にデプロイしているのに、default 側にしか secret が入っていないと、デプロイ後に読み取れない状態になります。
-
-この repo では、GitHub Actions から production 環境へ毎回 secret を入れ直すことで、この問題を防ぎます。
+この構成では Dropbox shared link は不要です。
 
 ---
 
-## 7. Notion 側で必要なプロパティ
+## 3. エンドポイント一覧
+
+### `GET /health`
+既存どおりのヘルスチェックです。
+
+### `POST /api/interviews/intake`
+既存の 1 件指定取り込みです。`X-Webhook-Secret` が必須です。
+
+### `POST /api/interviews/scan`
+新しいフォルダ探索取り込みです。`X-Webhook-Secret` が必須です。
+
+- body は省略可能です。
+- body 省略時は `DROPBOX_INTERVIEW_SCAN_FOLDER` を使います。
+- body 指定時は以下を受け付けます。
+
+```json
+{
+  "folderPath": "/Apps/MeetingMemo/inbox",
+  "limit": 10,
+  "recursive": false,
+  "dryRun": false
+}
+```
+
+---
+
+## 4. scan の処理フロー
+
+`POST /api/interviews/scan` では以下の順序で処理します。
+
+1. `X-Webhook-Secret` を検証する。
+2. 対象フォルダを決定する。
+   - body の `folderPath`
+   - なければ `DROPBOX_INTERVIEW_SCAN_FOLDER`
+3. Dropbox API の `/files/list_folder` と `/files/list_folder/continue` でフォルダ内を列挙する。
+4. フォルダは除外し、ファイルのみ対象にする。
+5. 音声拡張子だけを抽出する。
+   - `.m4a`, `.mp3`, `.wav`, `.aac`, `.mp4`, `.mpeg`, `.mpga`, `.webm`
+   - 大文字小文字は区別しない
+6. `server_modified` の **新しい順（降順）** に安定ソートする。
+   - 同一時刻の場合は `path_lower`、なければ `name` で昇順比較します。
+7. `limit` 件まで処理する。
+8. 各ファイルごとに dedup 判定を行う。
+9. 未処理ならダウンロード → 話者分離付き文字起こし → 要約 → Notion upsert を行う。
+10. 既処理なら skip する。
+11. 1 件失敗しても scan 全体は継続する。
+
+---
+
+## 5. dedup の考え方
+
+dedup は既存の `Dedup Key` 方針を維持します。優先順位は以下です。
+
+1. `dropbox:id:<id>`
+2. `dropbox:path:<path_lower>`
+3. `dropbox:hash:<content_hash>`
+4. `dropbox:recorded:<recordedAt>:size:<size>`
+5. `client:idempotency:<key>`
+
+注意点:
+- `Dropbox File Id` を最優先キーにします。
+- `path_lower` は補助キーであり主キーではありません。
+- `content_hash` が得られる場合は候補に含めます。
+- scan では Dropbox metadata から dedup 候補を作ります。
+
+---
+
+## 6. dryRun
+
+`dryRun: true` の場合、以下のみ実行します。
+
+- Dropbox フォルダ列挙
+- 音声ファイル抽出
+- dedup 判定
+
+以下は行いません。
+
+- Dropbox ダウンロード
+- OpenAI 呼び出し
+- Notion create / update
+
+そのため、本番投入前に「どのファイルが処理対象になるか」をレスポンスで確認できます。
+
+---
+
+## 7. 必要な Notion プロパティ
 
 ### 必須
 - `Name` (title)
@@ -113,33 +160,156 @@ Cloudflare Worker の secret は environment ごとに別管理です。
 - `Imported At` (date)
 - `Dedup Key` (rich_text)
 
+`ambiguities` の保存先プロパティは既存コード上では **不明** です。現状コードの扱いを維持し、要約 JSON の一部としてのみ保持しています。
+
 ---
 
-## 8. iPhone ショートカットから送るデータ
+## 8. 環境変数
 
-Webhook URL:
-- `https://<your-worker-domain>/api/interviews/intake`
+### Secrets
+- `INTERVIEW_WEBHOOK_SECRET`
+- `NOTION_TOKEN`
+- `INBOX_DB_ID`
+- `OPENAI_API_KEY`
+- `DROPBOX_ACCESS_TOKEN`
 
-Header:
-- `Content-Type: application/json`
-- `X-Webhook-Secret: <INTERVIEW_WEBHOOK_SECRET>`
+refresh token 方式を使う場合は以下を利用します。
+- `DROPBOX_APP_KEY`
+- `DROPBOX_APP_SECRET`
+- `DROPBOX_REFRESH_TOKEN`
 
-Body 例:
+### 新しい scan 用環境変数
+- `DROPBOX_INTERVIEW_SCAN_FOLDER`
+  - 例: `/Apps/MeetingMemo/inbox`
+- `DROPBOX_INTERVIEW_SCAN_RECURSIVE`
+  - `true` / `false`
+- `INTERVIEW_SCAN_MAX_FILES`
+  - 1 回の scan で処理する最大件数
+
+---
+
+## 9. curl 例
+
+### intake 方式
+
+```bash
+curl -X POST "https://<your-worker-domain>/api/interviews/intake" \
+  -H "Content-Type: application/json" \
+  -H "X-Webhook-Secret: <INTERVIEW_WEBHOOK_SECRET>" \
+  -d '{
+    "dropboxFileId": "id:abc123def456",
+    "dropboxPathLower": "/apps/meeting-recorder/2026-03-22/interview-001.m4a",
+    "dropboxSharedLink": "https://www.dropbox.com/scl/fi/...",
+    "fileName": "interview-001.m4a",
+    "mimeType": "audio/mp4",
+    "recordedAt": "2026-03-22T09:30:00+09:00",
+    "fileSizeBytes": 18374652,
+    "idempotencyKey": "shortcut-2026-03-22T09:30:00+09:00-18374652",
+    "source": "Interview",
+    "initiatedBy": "iPhone Shortcut",
+    "participants": ["me", "customer"],
+    "languageHint": "ja",
+    "notes": "Weekly follow-up"
+  }'
+```
+
+### scan 方式（body 省略）
+
+```bash
+curl -X POST "https://<your-worker-domain>/api/interviews/scan" \
+  -H "X-Webhook-Secret: <INTERVIEW_WEBHOOK_SECRET>"
+```
+
+### scan 方式（dryRun）
+
+```bash
+curl -X POST "https://<your-worker-domain>/api/interviews/scan" \
+  -H "Content-Type: application/json" \
+  -H "X-Webhook-Secret: <INTERVIEW_WEBHOOK_SECRET>" \
+  -d '{
+    "dryRun": true,
+    "limit": 5
+  }'
+```
+
+### scan 方式（folderPath 指定）
+
+```bash
+curl -X POST "https://<your-worker-domain>/api/interviews/scan" \
+  -H "Content-Type: application/json" \
+  -H "X-Webhook-Secret: <INTERVIEW_WEBHOOK_SECRET>" \
+  -d '{
+    "folderPath": "/Apps/MeetingMemo/inbox",
+    "recursive": true,
+    "limit": 20
+  }'
+```
+
+---
+
+## 10. scan レスポンス例
 
 ```json
 {
-  "dropboxFileId": "id:abc123def456",
-  "dropboxPathLower": "/apps/meeting-recorder/2026-03-22/interview-001.m4a",
-  "dropboxSharedLink": "https://www.dropbox.com/scl/fi/...",
-  "fileName": "interview-001.m4a",
-  "mimeType": "audio/mp4",
-  "recordedAt": "2026-03-22T09:30:00+09:00",
-  "fileSizeBytes": 18374652,
-  "idempotencyKey": "shortcut-2026-03-22T09:30:00+09:00-18374652",
-  "source": "Interview",
-  "initiatedBy": "iPhone Shortcut",
-  "participants": ["me", "customer"],
-  "languageHint": "ja",
-  "notes": "Weekly follow-up"
+  "folderPath": "/Apps/MeetingMemo/inbox",
+  "scannedCount": 14,
+  "audioCandidateCount": 11,
+  "processedCount": 3,
+  "skippedCount": 7,
+  "errorCount": 1,
+  "dryRun": false,
+  "results": [
+    {
+      "pathLower": "/apps/meetingmemo/inbox/interview-003.m4a",
+      "dropboxFileId": "id:a1",
+      "action": "processed",
+      "reason": "Processed and upserted into Notion."
+    },
+    {
+      "pathLower": "/apps/meetingmemo/inbox/interview-002.m4a",
+      "dropboxFileId": "id:a2",
+      "action": "skipped",
+      "reason": "Existing Notion page matched by dedup key."
+    },
+    {
+      "pathLower": "/apps/meetingmemo/inbox/interview-001.m4a",
+      "dropboxFileId": "id:a3",
+      "action": "error",
+      "reason": "Transcription request failed."
+    }
+  ]
 }
 ```
+
+---
+
+## 11. GitHub / Cloudflare 設定
+
+GitHub の `Settings → Secrets and variables → Actions` に以下を追加してください。
+
+- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_ACCOUNT_ID`
+- `INTERVIEW_WEBHOOK_SECRET`
+- `NOTION_TOKEN`
+- `INBOX_DB_ID`
+- `OPENAI_API_KEY`
+- `DROPBOX_ACCESS_TOKEN`
+
+refresh token 方式なら代わりに以下も使えます。
+- `DROPBOX_APP_KEY`
+- `DROPBOX_APP_SECRET`
+- `DROPBOX_REFRESH_TOKEN`
+
+さらに scan 用の通常環境変数として以下を設定します。
+- `DROPBOX_INTERVIEW_SCAN_FOLDER`
+- `DROPBOX_INTERVIEW_SCAN_RECURSIVE`
+- `INTERVIEW_SCAN_MAX_FILES`
+
+---
+
+## 12. 補足
+
+- 既存の `/api/interviews/intake` は残っています。
+- 新しい `/api/interviews/scan` は 1 件失敗しても全体継続します。
+- 共有リンク生成は scan 方式では不要です。
+- Notion Inbox DB の既存運用は維持します。

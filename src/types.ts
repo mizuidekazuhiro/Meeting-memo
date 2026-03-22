@@ -7,6 +7,9 @@ export interface Env {
   DROPBOX_APP_KEY?: string;
   DROPBOX_APP_SECRET?: string;
   DROPBOX_REFRESH_TOKEN?: string;
+  DROPBOX_INTERVIEW_SCAN_FOLDER?: string;
+  DROPBOX_INTERVIEW_SCAN_RECURSIVE?: string;
+  INTERVIEW_SCAN_MAX_FILES?: string;
   OPENAI_API_KEY: string;
   OPENAI_MODEL_TRANSCRIBE?: string;
   OPENAI_MODEL_SUMMARIZE?: string;
@@ -28,7 +31,15 @@ export interface IntakeRequest {
   notes?: string;
 }
 
+export interface ScanRequest {
+  folderPath?: string;
+  limit?: number;
+  recursive?: boolean;
+  dryRun?: boolean;
+}
+
 export interface DropboxFileMetadata {
+  '.tag'?: string;
   id?: string;
   name: string;
   path_lower?: string;
@@ -74,4 +85,13 @@ export interface InterviewRecord {
   request: IntakeRequest;
   processingStatus: 'pending' | 'completed' | 'error';
   errorMessage?: string;
+}
+
+export interface ProcessInterviewResult {
+  action: 'processed' | 'skipped' | 'error';
+  reason: string;
+  pageId?: string;
+  created?: boolean;
+  dedupCandidates: string[];
+  record?: InterviewRecord;
 }

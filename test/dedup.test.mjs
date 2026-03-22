@@ -24,6 +24,16 @@ function buildDedupCandidates(request, metadata) {
   return candidates.filter(Boolean);
 }
 
+function buildIntakeRequestFromMetadata(metadata) {
+  return {
+    dropboxFileId: metadata.id,
+    dropboxPathLower: metadata.path_lower,
+    fileName: metadata.name,
+    recordedAt: metadata.server_modified ?? metadata.client_modified,
+    fileSizeBytes: metadata.size,
+  };
+}
+
 test('buildDedupCandidates respects priority order', () => {
   const candidates = buildDedupCandidates(
     {
@@ -46,4 +56,23 @@ test('buildDedupCandidates respects priority order', () => {
     'dropbox:recorded:2026-03-22T10:00:00.000Z:size:1234',
     'client:idempotency:abc',
   ]);
+});
+
+test('buildIntakeRequestFromMetadata creates scan-compatible request', () => {
+  assert.deepEqual(
+    buildIntakeRequestFromMetadata({
+      id: 'id:scan123',
+      path_lower: '/apps/meetingmemo/inbox/sample.M4A',
+      name: 'sample.M4A',
+      server_modified: '2026-03-20T12:30:00Z',
+      size: 9876,
+    }),
+    {
+      dropboxFileId: 'id:scan123',
+      dropboxPathLower: '/apps/meetingmemo/inbox/sample.M4A',
+      fileName: 'sample.M4A',
+      recordedAt: '2026-03-20T12:30:00Z',
+      fileSizeBytes: 9876,
+    },
+  );
 });
