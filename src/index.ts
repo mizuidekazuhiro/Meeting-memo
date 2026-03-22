@@ -1,5 +1,11 @@
 import { buildIntakeRequestFromMetadata } from './lib/dedup';
-import { fetchDropboxMetadata, getDropboxCredentialStatus, isAudioDropboxFile, listAllDropboxEntries } from './lib/dropbox';
+import {
+  debugDropboxAppFolderRoot,
+  fetchDropboxMetadata,
+  getDropboxCredentialStatus,
+  isAudioDropboxFile,
+  listAllDropboxEntries,
+} from './lib/dropbox';
 import { HttpError, jsonResponse, parseJson } from './lib/http';
 import { processInterviewFromMetadata } from './lib/interviews';
 import { requireWebhookSecret } from './lib/security';
@@ -105,6 +111,7 @@ async function handleScan(request: Request, env: Env): Promise<Response> {
     dropboxFileId?: string;
     action: 'processed' | 'skipped' | 'error';
     reason: string;
+    details?: unknown;
   }>;
 
   let processedCount = 0;
@@ -131,6 +138,7 @@ async function handleScan(request: Request, env: Env): Promise<Response> {
         stack: error instanceof Error ? error.stack : undefined,
         pathLower: metadata.path_lower,
         dropboxFileId: metadata.id,
+        details: error instanceof HttpError ? error.details : undefined,
       });
       errorCount += 1;
       results.push({
@@ -138,6 +146,7 @@ async function handleScan(request: Request, env: Env): Promise<Response> {
         dropboxFileId: metadata.id,
         action: 'error',
         reason: error instanceof Error ? error.message : 'Unknown scan error',
+        details: error instanceof HttpError ? error.details : undefined,
       });
     }
   }
@@ -155,6 +164,28 @@ async function handleScan(request: Request, env: Env): Promise<Response> {
   });
 }
 
+async function handleDebugDropbox(request: Request, env: Env): Promise<Response> {
+  requireWebhookSecret(request, env.INTERVIEW_WEBHOOK_SECRET);
+
+  try {
+    const response = await debugDropboxAppFolderRoot(env);
+    return jsonResponse({ ok: true, path: '', ...response });
+  } catch (error) {
+    if (error instanceof HttpError) {
+      return jsonResponse(
+        {
+          ok: false,
+          message: error.message,
+          status: error.status,
+          details: error.details,
+        },
+        { status: error.status },
+      );
+    }
+    throw error;
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
@@ -168,6 +199,9 @@ export default {
       if (request.method === 'POST' && url.pathname === '/api/interviews/scan') {
         return await handleScan(request, env);
       }
+      if (request.method === 'GET' && url.pathname === '/api/interviews/debug-dropbox') {
+        return await handleDebugDropbox(request, env);
+      }
       if (request.method === 'GET' && url.pathname === '/health') {
         return jsonResponse({ ok: true, env: env.APP_ENV ?? 'unknown' });
       }
@@ -180,7 +214,7 @@ export default {
           status: error.status,
           details: error.details,
         });
-        return Response.json({ ok: false, message: error.message }, { status: error.status });
+        return Response.json({ ok: false, message: error.message, details: error.details }, { status: error.status });
       }
 
       const message = error instanceof Error ? error.message : 'Unknown error';

@@ -75,7 +75,7 @@ async function dropboxRpc<T>(env: Env, path: string, body: unknown): Promise<T> 
   });
 
   if (!response.ok) {
-    throw new HttpError(`Dropbox API call failed for ${path}.`, 502, await response.text());
+    throw new HttpError(`Dropbox API call failed for ${path}.`, response.status, await response.text());
   }
   return (await response.json()) as T;
 }
@@ -97,7 +97,7 @@ export async function fetchDropboxMetadata(env: Env, intake: IntakeRequest): Pro
   throw new HttpError('Either dropboxFileId or dropboxPathLower is required.', 400);
 }
 
-export async function listDropboxFolder(env: Env, folderPath: string, recursive: boolean): Promise<{
+export async function listDropboxFolder(env: Env, folderPath: string, recursive: boolean, limit?: number): Promise<{
   entries: DropboxFileMetadata[];
   cursor?: string;
   has_more: boolean;
@@ -105,6 +105,7 @@ export async function listDropboxFolder(env: Env, folderPath: string, recursive:
   return dropboxRpc(env, '/files/list_folder', {
     path: folderPath,
     recursive,
+    limit,
     include_deleted: false,
     include_has_explicit_shared_members: false,
     include_mounted_folders: true,
@@ -123,6 +124,18 @@ export async function listAllDropboxEntries(env: Env, folderPath: string, recurs
   }
 
   return allEntries;
+}
+
+export async function debugDropboxAppFolderRoot(env: Env): Promise<{
+  entries: DropboxFileMetadata[];
+  cursor?: string;
+  has_more: boolean;
+}> {
+  if (!env.DROPBOX_ACCESS_TOKEN) {
+    throw new HttpError('DROPBOX_ACCESS_TOKEN is not configured.', 500);
+  }
+
+  return listDropboxFolder(env, '', false, 20);
 }
 
 export function isAudioDropboxFile(metadata: DropboxFileMetadata): boolean {
