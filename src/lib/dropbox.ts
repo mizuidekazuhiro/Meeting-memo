@@ -19,6 +19,13 @@ export function getDropboxCredentialStatus(env: Env): {
   };
 }
 
+export type DropboxAuthMode = 'access_token' | 'refresh_token';
+
+export type DropboxAuthResolution = {
+  accessToken: string;
+  authMode: DropboxAuthMode;
+};
+
 function getMissingDropboxCredentialKeys(env: Env): string[] {
   const missing: string[] = [];
   if (!env.DROPBOX_APP_KEY) missing.push('DROPBOX_APP_KEY');
@@ -27,16 +34,34 @@ function getMissingDropboxCredentialKeys(env: Env): string[] {
   return missing;
 }
 
-async function resolveAccessToken(env: Env): Promise<string> {
+export function getDropboxAuthMode(env: Env): DropboxAuthMode | null {
   if (env.DROPBOX_ACCESS_TOKEN) {
-    return env.DROPBOX_ACCESS_TOKEN;
+    return 'access_token';
+  }
+
+  if (env.DROPBOX_APP_KEY && env.DROPBOX_APP_SECRET && env.DROPBOX_REFRESH_TOKEN) {
+    return 'refresh_token';
+  }
+
+  return null;
+}
+
+export async function resolveDropboxAuth(env: Env): Promise<DropboxAuthResolution> {
+  const authMode = getDropboxAuthMode(env);
+  if (authMode === 'access_token') {
+    return { accessToken: env.DROPBOX_ACCESS_TOKEN!, authMode };
   }
 
   const missingRefreshKeys = getMissingDropboxCredentialKeys(env);
-  if (missingRefreshKeys.length > 0) {
+  if (authMode !== 'refresh_token') {
     throw new HttpError(
       `Dropbox credentials are not fully configured. Missing: ${missingRefreshKeys.join(', ')}. Expected either DROPBOX_ACCESS_TOKEN or the refresh-token set DROPBOX_APP_KEY, DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN.`,
       500,
+      {
+        attemptedAuthMode: 'refresh_token',
+        missingCredentials: missingRefreshKeys,
+        availableAuthMode: getDropboxAuthMode(env),
+      },
     );
   }
 
@@ -53,18 +78,35 @@ async function resolveAccessToken(env: Env): Promise<string> {
   });
 
   if (!response.ok) {
-    throw new HttpError('Failed to refresh Dropbox access token.', 502, await response.text());
+    throw new HttpError('Failed to refresh Dropbox access token.', 502, {
+      attemptedAuthMode: authMode,
+      responseBody: await response.text(),
+    });
   }
 
   const payload = (await response.json()) as { access_token?: string };
   if (!payload.access_token) {
-    throw new HttpError('Dropbox token response did not include an access token.', 502, payload);
+    throw new HttpError('Dropbox token response did not include an access token.', 502, {
+      attemptedAuthMode: authMode,
+      tokenResponse: payload,
+    });
   }
-  return payload.access_token;
+  return { accessToken: payload.access_token, authMode };
 }
 
-async function dropboxRpc<T>(env: Env, path: string, body: unknown): Promise<T> {
-  const token = await resolveAccessToken(env);
+async function resolveAccessToken(env: Env): Promise<string> {
+  const { accessToken } = await resolveDropboxAuth(env);
+  return accessToken;
+}
+
+async function dropboxRpc<T>(
+  env: Env,
+  path: string,
+  body: unknown,
+  auth?: DropboxAuthResolution,
+): Promise<T> {
+  const resolvedAuth = auth ?? (await resolveDropboxAuth(env));
+  const token = resolvedAuth.accessToken;
   const response = await fetch(`${DROPBOX_API}${path}`, {
     method: 'POST',
     headers: {
@@ -75,7 +117,10 @@ async function dropboxRpc<T>(env: Env, path: string, body: unknown): Promise<T> 
   });
 
   if (!response.ok) {
-    throw new HttpError(`Dropbox API call failed for ${path}.`, response.status, await response.text());
+    throw new HttpError(`Dropbox API call failed for ${path}.`, response.status, {
+      attemptedAuthMode: resolvedAuth.authMode,
+      responseBody: await response.text(),
+    });
   }
   return (await response.json()) as T;
 }
@@ -127,15 +172,28 @@ export async function listAllDropboxEntries(env: Env, folderPath: string, recurs
 }
 
 export async function debugDropboxAppFolderRoot(env: Env): Promise<{
+  authMode: DropboxAuthMode;
   entries: DropboxFileMetadata[];
   cursor?: string;
   has_more: boolean;
 }> {
-  if (!env.DROPBOX_ACCESS_TOKEN) {
-    throw new HttpError('DROPBOX_ACCESS_TOKEN is not configured.', 500);
-  }
-
-  return listDropboxFolder(env, '', false, 20);
+  const auth = await resolveDropboxAuth(env);
+  const response = await dropboxRpc<{
+    entries: DropboxFileMetadata[];
+    cursor?: string;
+    has_more: boolean;
+  }>(env, '/files/list_folder', {
+    path: '',
+    recursive: false,
+    limit: 20,
+    include_deleted: false,
+    include_has_explicit_shared_members: false,
+    include_mounted_folders: true,
+  }, auth);
+  return {
+    authMode: auth.authMode,
+    ...response,
+  };
 }
 
 export function isAudioDropboxFile(metadata: DropboxFileMetadata): boolean {
