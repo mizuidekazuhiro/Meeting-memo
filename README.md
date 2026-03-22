@@ -82,7 +82,7 @@ Apple Watch / iPhone で録音した面談音声を Dropbox に保存し、Cloud
 ```
 
 ### `GET /api/interviews/debug-dropbox`
-Dropbox App Folder の root を `path: ""` で列挙する切り分け用 endpoint です。`X-Webhook-Secret` が必須です。
+Dropbox App Folder の root を `path: ""` で列挙する切り分け用 endpoint です。`X-Webhook-Secret` が必須です。scan 系と同じ Dropbox 認証解決ロジックを使うため、access token 方式・refresh token 方式のどちらでも動作します。
 
 ---
 
@@ -198,6 +198,8 @@ refresh token 方式を使う場合は以下を利用します。
 
 > **重要:** Cloudflare Workers Secrets に入るキー名と、Worker コードが `env` から参照する名前は**完全一致**している必要があります。このリポジトリでは refresh token 方式の env 名を `DROPBOX_APP_KEY` / `DROPBOX_APP_SECRET` / `DROPBOX_REFRESH_TOKEN` に統一しています。
 
+`POST /api/interviews/scan` と `GET /api/interviews/debug-dropbox` はどちらも同じ認証解決ロジックを使います。そのため、refresh token 方式だけを設定した構成でも debug endpoint をそのまま利用できます。
+
 ### 新しい scan 用環境変数
 - `DROPBOX_INTERVIEW_SCAN_FOLDER`
   - 例: `/Apps/MeetingMemo/inbox`
@@ -267,14 +269,14 @@ curl -X POST "https://<your-worker-domain>/api/interviews/scan" \
 
 ### debug-dropbox 方式
 
-`GET /api/interviews/debug-dropbox` は、現在の `DROPBOX_ACCESS_TOKEN` から見えている Dropbox App Folder 直下の一覧をそのまま確認するための切り分け用 endpoint です。`folderPath` の解釈で迷った場合は、まずこの endpoint で `entries[].name` / `entries[].path_lower` を確認してください。不要になれば後で削除して構いません。
+`GET /api/interviews/debug-dropbox` は、scan 系と同じ Dropbox 認証解決ロジックを使って Dropbox App Folder 直下の一覧を確認するための切り分け用 endpoint です。`DROPBOX_ACCESS_TOKEN` があれば `access_token`、なければ `DROPBOX_APP_KEY` / `DROPBOX_APP_SECRET` / `DROPBOX_REFRESH_TOKEN` の 3 点セットから `refresh_token` を解決して実行します。`folderPath` の解釈で迷った場合は、まずこの endpoint で `entries[].name` / `entries[].path_lower` を確認してください。不要になれば後で削除して構いません。
 
 ```bash
 curl "https://<your-worker-domain>/api/interviews/debug-dropbox" \
   -H "X-Webhook-Secret: <INTERVIEW_WEBHOOK_SECRET>"
 ```
 
-成功時は Dropbox の `/2/files/list_folder` (`path: ""`, `recursive: false`, `limit: 20`) の返却 JSON をそのまま返します。失敗時は Dropbox の status code と本文をそのまま返します。
+成功時は Dropbox の `/2/files/list_folder` (`path: ""`, `recursive: false`, `limit: 20`) を呼び、レスポンスに `authMode` (`access_token` または `refresh_token`) を含めて返します。失敗時は、どの認証方式を解決しようとして失敗したか分かるよう `details.attemptedAuthMode` などを返します。
 
 ---
 
@@ -284,6 +286,7 @@ curl "https://<your-worker-domain>/api/interviews/debug-dropbox" \
 {
   "ok": true,
   "path": "",
+  "authMode": "refresh_token",
   "entries": [
     {
       ".tag": "folder",
@@ -303,7 +306,10 @@ curl "https://<your-worker-domain>/api/interviews/debug-dropbox" \
   "ok": false,
   "message": "Dropbox API call failed for /files/list_folder.",
   "status": 409,
-  "details": "Dropbox から返った本文"
+  "details": {
+    "attemptedAuthMode": "refresh_token",
+    "responseBody": "Dropbox から返った本文"
+  }
 }
 ```
 
