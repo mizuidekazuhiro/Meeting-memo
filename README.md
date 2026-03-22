@@ -56,6 +56,9 @@ Apple Watch / iPhone で録音した面談音声を Dropbox に保存し、Cloud
 
 ## 3. エンドポイント一覧
 
+### `GET /`
+簡単なヘルスチェックです。`200 OK` と `{ "ok": true, "service": "meeting-memo" }` を返します。
+
 ### `GET /health`
 既存どおりのヘルスチェックです。
 
@@ -188,6 +191,8 @@ refresh token 方式を使う場合は以下を利用します。
 - `DROPBOX_APP_KEY`
 - `DROPBOX_APP_SECRET`
 - `DROPBOX_REFRESH_TOKEN`
+
+> **重要:** Cloudflare Workers Secrets に入るキー名と、Worker コードが `env` から参照する名前は**完全一致**している必要があります。このリポジトリでは refresh token 方式の env 名を `DROPBOX_APP_KEY` / `DROPBOX_APP_SECRET` / `DROPBOX_REFRESH_TOKEN` に統一しています。
 
 ### 新しい scan 用環境変数
 - `DROPBOX_INTERVIEW_SCAN_FOLDER`
@@ -487,6 +492,7 @@ body を省略する場合は、Worker 側に `DROPBOX_INTERVIEW_SCAN_FOLDER` �
 - `DROPBOX_ACCESS_TOKEN` を設定したか
 - もしくは `DROPBOX_APP_KEY` / `DROPBOX_APP_SECRET` / `DROPBOX_REFRESH_TOKEN` を **3 つとも** 設定したか
 - refresh token 方式を使うつもりで 1 つでも欠けていないか
+- Worker が読む env 名と Cloudflare Secret 名が完全一致しているか（本リポジトリでは `DROPBOX_APP_KEY` / `DROPBOX_APP_SECRET` を使用し、`DROPBOX_CLIENT_ID` / `DROPBOX_CLIENT_SECRET` は使用しません）
 
 #### 3. body 省略時に `DROPBOX_INTERVIEW_SCAN_FOLDER` が必要
 

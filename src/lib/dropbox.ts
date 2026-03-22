@@ -5,12 +5,39 @@ const DROPBOX_API = 'https://api.dropboxapi.com/2';
 const DROPBOX_CONTENT_API = 'https://content.dropboxapi.com/2';
 const AUDIO_FILE_EXTENSIONS = new Set(['.m4a', '.mp3', '.wav', '.aac', '.mp4', '.mpeg', '.mpga', '.webm']);
 
+export function getDropboxCredentialStatus(env: Env): {
+  hasDropboxAccessToken: boolean;
+  hasDropboxAppKey: boolean;
+  hasDropboxAppSecret: boolean;
+  hasDropboxRefreshToken: boolean;
+} {
+  return {
+    hasDropboxAccessToken: Boolean(env.DROPBOX_ACCESS_TOKEN),
+    hasDropboxAppKey: Boolean(env.DROPBOX_APP_KEY),
+    hasDropboxAppSecret: Boolean(env.DROPBOX_APP_SECRET),
+    hasDropboxRefreshToken: Boolean(env.DROPBOX_REFRESH_TOKEN),
+  };
+}
+
+function getMissingDropboxCredentialKeys(env: Env): string[] {
+  const missing: string[] = [];
+  if (!env.DROPBOX_APP_KEY) missing.push('DROPBOX_APP_KEY');
+  if (!env.DROPBOX_APP_SECRET) missing.push('DROPBOX_APP_SECRET');
+  if (!env.DROPBOX_REFRESH_TOKEN) missing.push('DROPBOX_REFRESH_TOKEN');
+  return missing;
+}
+
 async function resolveAccessToken(env: Env): Promise<string> {
   if (env.DROPBOX_ACCESS_TOKEN) {
     return env.DROPBOX_ACCESS_TOKEN;
   }
-  if (!env.DROPBOX_REFRESH_TOKEN || !env.DROPBOX_APP_KEY || !env.DROPBOX_APP_SECRET) {
-    throw new HttpError('Dropbox credentials are not fully configured.', 500);
+
+  const missingRefreshKeys = getMissingDropboxCredentialKeys(env);
+  if (missingRefreshKeys.length > 0) {
+    throw new HttpError(
+      `Dropbox credentials are not fully configured. Missing: ${missingRefreshKeys.join(', ')}. Expected either DROPBOX_ACCESS_TOKEN or the refresh-token set DROPBOX_APP_KEY, DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN.`,
+      500,
+    );
   }
 
   const response = await fetch('https://api.dropbox.com/oauth2/token', {
@@ -21,7 +48,7 @@ async function resolveAccessToken(env: Env): Promise<string> {
     },
     body: new URLSearchParams({
       grant_type: 'refresh_token',
-      refresh_token: env.DROPBOX_REFRESH_TOKEN,
+      refresh_token: env.DROPBOX_REFRESH_TOKEN!,
     }),
   });
 
