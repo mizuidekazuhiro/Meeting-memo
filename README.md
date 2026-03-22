@@ -148,9 +148,10 @@ dedup は既存の `Dedup Key` 方針を維持します。優先順位は以下�
 - `Summary` (rich_text)
 - `My Tasks` (rich_text)
 - `Other Tasks` (rich_text)
-- `Transcript` (rich_text または本文 block)
+- `Transcript` プロパティは **不要** です。transcript 本文は Notion ページ本文の block children に保存されます。既存 DB に `Transcript` プロパティが残っていても動作に影響しません。
 
 ### 推奨
+- `Transcript` プロパティを DB に残す場合は任意です。アプリはこのプロパティを更新せず、本文 block を使います。
 - `Dropbox File Id` (rich_text)
 - `Dropbox Link` (url)
 - `Processing Status` (select)
@@ -161,6 +162,16 @@ dedup は既存の `Dedup Key` 方針を維持します。優先順位は以下�
 - `Dedup Key` (rich_text)
 
 `ambiguities` の保存先プロパティは既存コード上では **不明** です。現状コードの扱いを維持し、要約 JSON の一部としてのみ保持しています。
+
+### Transcript の保存方式
+- transcript は Notion DB の `Transcript` rich_text プロパティには保存しません。
+- 代わりにページ本文の先頭へ次の順で block children を保存します。
+  1. `heading_2: Transcript`
+  2. transcript 本文の `paragraph` blocks
+- 話者分離 segment がある場合は各 paragraph block に `[speaker_x] 発話` 形式で格納します。
+- segment がない場合のみ `fullText` を段落分割して本文に保存します。
+- 長文でも Notion API で失敗しにくいよう、本文は小さめの文字数で複数 block に分割して保存します。
+- 既存ページ更新時は、アプリが管理する `Transcript` セクションを一度削除してから再作成するため、同じ transcript が重複追記されません。
 
 ---
 
