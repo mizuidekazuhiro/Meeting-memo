@@ -1,5 +1,5 @@
 import { buildIntakeRequestFromMetadata } from './lib/dedup';
-import { fetchDropboxMetadata, isAudioDropboxFile, listAllDropboxEntries } from './lib/dropbox';
+import { fetchDropboxMetadata, getDropboxCredentialStatus, isAudioDropboxFile, listAllDropboxEntries } from './lib/dropbox';
 import { HttpError, jsonResponse, parseJson } from './lib/http';
 import { processInterviewFromMetadata } from './lib/interviews';
 import { requireWebhookSecret } from './lib/security';
@@ -54,22 +54,39 @@ async function handleIntake(request: Request, env: Env): Promise<Response> {
   });
 }
 
-async function parseOptionalScanRequest(request: Request): Promise<ScanRequest> {
+async function parseOptionalScanRequest(request: Request): Promise<{ bodyText: string; scan: ScanRequest }> {
   const bodyText = await request.text();
   if (!bodyText.trim()) {
-    return {};
+    return { bodyText, scan: {} };
   }
 
   try {
-    return JSON.parse(bodyText) as ScanRequest;
+    return {
+      bodyText,
+      scan: JSON.parse(bodyText) as ScanRequest,
+    };
   } catch (error) {
     throw new HttpError('Request body must be valid JSON.', 400, error);
   }
 }
 
 async function handleScan(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const { bodyText, scan } = await parseOptionalScanRequest(request);
+  const dropboxCredentialStatus = getDropboxCredentialStatus(env);
+
+  console.log('interviews.scan.request', {
+    path: url.pathname,
+    method: request.method,
+    requestBody: bodyText || null,
+    hasWebhookSecret: Boolean(env.INTERVIEW_WEBHOOK_SECRET),
+    hasDropboxAccessToken: dropboxCredentialStatus.hasDropboxAccessToken,
+    hasDropboxAppKey: dropboxCredentialStatus.hasDropboxAppKey,
+    hasDropboxAppSecret: dropboxCredentialStatus.hasDropboxAppSecret,
+    hasDropboxRefreshToken: dropboxCredentialStatus.hasDropboxRefreshToken,
+  });
+
   requireWebhookSecret(request, env.INTERVIEW_WEBHOOK_SECRET);
-  const scan = await parseOptionalScanRequest(request);
   const folderPath = scan.folderPath ?? env.DROPBOX_INTERVIEW_SCAN_FOLDER;
   if (!folderPath) {
     throw new HttpError('folderPath is required when DROPBOX_INTERVIEW_SCAN_FOLDER is not configured.', 400);
@@ -109,6 +126,12 @@ async function handleScan(request: Request, env: Env): Promise<Response> {
       if (result.action === 'skipped') skippedCount += 1;
       if (result.action === 'error') errorCount += 1;
     } catch (error) {
+      console.error('interviews.scan.entry_error', {
+        message: error instanceof Error ? error.message : 'Unknown scan error',
+        stack: error instanceof Error ? error.stack : undefined,
+        pathLower: metadata.path_lower,
+        dropboxFileId: metadata.id,
+      });
       errorCount += 1;
       results.push({
         pathLower: metadata.path_lower,
@@ -120,6 +143,7 @@ async function handleScan(request: Request, env: Env): Promise<Response> {
   }
 
   return jsonResponse({
+    ok: true,
     folderPath,
     scannedCount: scannedEntries.length,
     audioCandidateCount: audioEntries.length,
@@ -135,6 +159,9 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
       const url = new URL(request.url);
+      if (request.method === 'GET' && url.pathname === '/') {
+        return jsonResponse({ ok: true, service: 'meeting-memo' });
+      }
       if (request.method === 'POST' && url.pathname === '/api/interviews/intake') {
         return await handleIntake(request, env);
       }
@@ -147,9 +174,21 @@ export default {
       return jsonResponse({ ok: false, message: 'Not Found' }, { status: 404 });
     } catch (error) {
       if (error instanceof HttpError) {
-        return jsonResponse({ ok: false, message: error.message, details: error.details }, { status: error.status });
+        console.error('worker.http_error', {
+          message: error.message,
+          stack: error.stack,
+          status: error.status,
+          details: error.details,
+        });
+        return Response.json({ ok: false, message: error.message }, { status: error.status });
       }
-      return jsonResponse({ ok: false, message: error instanceof Error ? error.message : 'Unknown error' }, { status: 500 });
+
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      console.error('worker.unhandled_error', {
+        message,
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+      return Response.json({ ok: false, message }, { status: 500 });
     }
   },
 };
