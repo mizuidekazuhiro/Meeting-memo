@@ -81,6 +81,9 @@ Apple Watch / iPhone で録音した面談音声を Dropbox に保存し、Cloud
 }
 ```
 
+### `GET /api/interviews/debug-dropbox`
+Dropbox App Folder の root を `path: ""` で列挙する切り分け用 endpoint です。`X-Webhook-Secret` が必須です。
+
 ---
 
 ## 4. scan の処理フロー
@@ -92,6 +95,7 @@ Apple Watch / iPhone で録音した面談音声を Dropbox に保存し、Cloud
    - body の `folderPath`
    - なければ `DROPBOX_INTERVIEW_SCAN_FOLDER`
 3. Dropbox API の `/files/list_folder` と `/files/list_folder/continue` でフォルダ内を列挙する。
+   - `folderPath` に迷ったら、先に `GET /api/interviews/debug-dropbox` で App Folder 直下の実フォルダ名を確認できます。
 4. フォルダは除外し、ファイルのみ対象にする。
 5. 音声拡張子だけを抽出する。
    - `.m4a`, `.mp3`, `.wav`, `.aac`, `.mp4`, `.mpeg`, `.mpga`, `.webm`
@@ -261,9 +265,49 @@ curl -X POST "https://<your-worker-domain>/api/interviews/scan" \
   }'
 ```
 
+### debug-dropbox 方式
+
+`GET /api/interviews/debug-dropbox` は、現在の `DROPBOX_ACCESS_TOKEN` から見えている Dropbox App Folder 直下の一覧をそのまま確認するための切り分け用 endpoint です。`folderPath` の解釈で迷った場合は、まずこの endpoint で `entries[].name` / `entries[].path_lower` を確認してください。不要になれば後で削除して構いません。
+
+```bash
+curl "https://<your-worker-domain>/api/interviews/debug-dropbox" \
+  -H "X-Webhook-Secret: <INTERVIEW_WEBHOOK_SECRET>"
+```
+
+成功時は Dropbox の `/2/files/list_folder` (`path: ""`, `recursive: false`, `limit: 20`) の返却 JSON をそのまま返します。失敗時は Dropbox の status code と本文をそのまま返します。
+
 ---
 
-## 10. scan レスポンス例
+## 10. debug-dropbox レスポンス例
+
+```json
+{
+  "ok": true,
+  "path": "",
+  "entries": [
+    {
+      ".tag": "folder",
+      "name": "inbox",
+      "path_lower": "/inbox"
+    }
+  ],
+  "cursor": "...",
+  "has_more": false
+}
+```
+
+エラー時の例:
+
+```json
+{
+  "ok": false,
+  "message": "Dropbox API call failed for /files/list_folder.",
+  "status": 409,
+  "details": "Dropbox から返った本文"
+}
+```
+
+## 11. scan レスポンス例
 
 ```json
 {
@@ -299,7 +343,7 @@ curl -X POST "https://<your-worker-domain>/api/interviews/scan" \
 
 ---
 
-## 11. GitHub / Cloudflare 設定
+## 12. GitHub / Cloudflare 設定
 
 GitHub の `Settings → Secrets and variables → Actions` に以下を追加してください。
 
@@ -323,7 +367,7 @@ refresh token 方式なら代わりに以下も使えます。
 
 ---
 
-## 12. 補足
+## 13. 補足
 
 - 既存の `/api/interviews/intake` は残っています。
 - 新しい `/api/interviews/scan` は 1 件失敗しても全体継続します。
@@ -333,7 +377,7 @@ refresh token 方式なら代わりに以下も使えます。
 
 ---
 
-## 13. GitHub Actions で Worker Secret を自動同期して deploy する
+## 14. GitHub Actions で Worker Secret を自動同期して deploy する
 
 ### なぜ GitHub に Secret を入れただけでは Worker に反映されないのか
 
