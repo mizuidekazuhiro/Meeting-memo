@@ -159,10 +159,10 @@ function buildProperties(record: InterviewRecord) {
     'Dropbox Link': record.metadata.shared_link ?? record.request.dropboxSharedLink ? { url: record.metadata.shared_link ?? record.request.dropboxSharedLink ?? null } : undefined,
     'Processing Status': { select: { name: record.processingStatus } },
     'Speaker Separation': {
-  select: {
-    name: record.transcript?.segments.length ? 'Yes' : 'No'
-  }
-},
+      select: {
+        name: record.transcript?.segments.length ? 'Yes' : 'No',
+      },
+    },
     'Error Message': record.errorMessage ? { rich_text: richText(record.errorMessage) } : undefined,
     'Raw JSON': { rich_text: richText(JSON.stringify({ transcript: record.transcript?.raw, insights: record.insights?.raw })) },
     'Imported At': { date: { start: new Date().toISOString() } },
