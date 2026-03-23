@@ -1,5 +1,6 @@
 import type { Env, InterviewInsights, TranscriptResult, TranscriptSegment } from '../types';
 import { HttpError } from './http';
+import { logEvent } from './logger';
 
 const OPENAI_API = 'https://api.openai.com/v1';
 const DEFAULT_TRANSCRIBE_MODEL = 'gpt-4o-transcribe-diarize';
@@ -14,7 +15,6 @@ export const ENABLE_AUDIO_FALLBACK = true;
 const MP4_BOX_HEADER_BYTES = 8;
 const WAV_HEADER_BYTES = 44;
 
-type LogLevel = 'info' | 'warn' | 'error';
 type AudioFormat = 'm4a' | 'wav';
 type AudioContainer = 'm4a' | 'wav' | 'unknown';
 type AudioCodec = 'aac-lc' | 'pcm_s16le' | 'unknown';
@@ -99,13 +99,6 @@ type GenerateChunkOptions = { preferredFormat: AudioFormat };
 type AudioChunkGenerator = (source: Blob, sourceMeta: SourceAudioMetadata, plan: ChunkPlanEntry, options: GenerateChunkOptions) => Promise<PreparedTranscriptionChunk>;
 
 type UploadChunkFn = (env: Env, chunk: PreparedTranscriptionChunk, languageHint?: string) => Promise<TranscriptResult>;
-
-function structuredLog(level: LogLevel, message: string, meta: Record<string, unknown>): void {
-  const payload = { level, message, ...meta };
-  if (level === 'error') console.error(message, payload);
-  else if (level === 'warn') console.warn(message, payload);
-  else console.log(message, payload);
-}
 
 function asSpeakerLabel(segment: DiarizedSegmentLike): string {
   const rawSpeaker = segment.speaker ?? segment.speaker_label ?? segment.speaker_id;
@@ -253,7 +246,7 @@ function inspectWav(bytes: Uint8Array): Pick<SourceAudioMetadata, 'durationSec' 
   return { durationSec, sampleRate, channels, codec: 'pcm_s16le', container: 'wav' };
 }
 
-async function inspectSourceAudio(audio: Blob, fileName: string): Promise<SourceAudioMetadata> {
+export async function inspectAudioSource(audio: Blob, fileName: string): Promise<SourceAudioMetadata> {
   const bytes = new Uint8Array(await audio.arrayBuffer());
   const extension = extensionForFileName(fileName);
   const wav = inspectWav(bytes);
@@ -404,30 +397,30 @@ async function uploadPreparedChunk(env: Env, chunk: PreparedTranscriptionChunk, 
   if (!response.ok) {
     const responseText = await readResponseTextSafely(response);
     const parsed = parseOpenAiFailure(responseText);
-    structuredLog('error', 'upload request failed', { fileName: chunk.fileName, chunkIndex: chunk.chunkIndex + 1, chunkCount: chunk.chunkCount, strategy: chunk.strategy, format: chunk.extension, responseStatus: response.status, responseText });
+    logEvent('error', 'upload request failed', { fileName: chunk.fileName, chunkIndex: chunk.chunkIndex + 1, chunkCount: chunk.chunkCount, strategy: chunk.strategy, format: chunk.extension, responseStatus: response.status, responseText });
     throw new HttpError('OpenAI transcription request failed.', 502, { ...parsed, responseStatus: response.status, fileName: chunk.fileName, chunkIndex: chunk.chunkIndex + 1, chunkCount: chunk.chunkCount, strategy: chunk.strategy, format: chunk.extension });
   }
   return mapTranscriptPayload((await response.json()) as OpenAiDiarizedTranscript);
 }
 
-async function transcribeChunkWithFallback(env: Env, source: Blob, sourceMeta: SourceAudioMetadata, plan: ChunkPlanEntry, languageHint: string | undefined, chunkGenerator: AudioChunkGenerator, uploadChunk: UploadChunkFn): Promise<TranscriptResult> {
+async function transcribeChunkWithFallback(env: Env, source: Blob, sourceMeta: SourceAudioMetadata, plan: ChunkPlanEntry, languageHint: string | undefined, chunkGenerator: AudioChunkGenerator, uploadChunk: UploadChunkFn, context: Record<string, unknown>): Promise<TranscriptResult> {
   let chunk = validateChunk(await chunkGenerator(source, sourceMeta, plan, { preferredFormat: PRIMARY_AUDIO_FORMAT }));
   if (!chunk.validationPassed) throw new HttpError('chunk validation failed', 500, { fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, strategy: chunk.strategy, format: chunk.extension, validationErrors: chunk.validationErrors });
-  structuredLog('info', 'openai.transcription.chunk', buildChunkLogMeta(sourceMeta, chunk));
+  logEvent('info', 'openai.transcription.chunk', { ...context, ...buildChunkLogMeta(sourceMeta, chunk) });
   try {
     return await uploadChunk(env, chunk, languageHint);
   } catch (error) {
     if (!shouldFallbackToWav(error) || chunk.extension === '.wav') throw error;
-    structuredLog('warn', 'chunk upload failed with m4a, fallback to wav', { fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, details: error instanceof HttpError ? error.details : error });
+    logEvent('warn', 'chunk upload failed with m4a, fallback to wav', { ...context, fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, details: error instanceof HttpError ? error.details : error });
     const fallbackChunk = validateChunk(await chunkGenerator(source, sourceMeta, plan, { preferredFormat: FALLBACK_AUDIO_FORMAT }));
     if (!fallbackChunk.validationPassed) throw new HttpError('chunk validation failed', 500, { fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, strategy: fallbackChunk.strategy, format: fallbackChunk.extension, validationErrors: fallbackChunk.validationErrors });
-    structuredLog('info', 'fallback wav upload started', buildChunkLogMeta(sourceMeta, fallbackChunk));
+    logEvent('info', 'fallback wav upload started', { ...context, ...buildChunkLogMeta(sourceMeta, fallbackChunk) });
     try {
       const result = await uploadChunk(env, fallbackChunk, languageHint);
-      structuredLog('info', 'fallback wav upload succeeded', { fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount });
+      logEvent('info', 'fallback wav upload succeeded', { ...context, fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount });
       return result;
     } catch (fallbackError) {
-      structuredLog('error', 'fallback wav upload failed', { fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, details: fallbackError instanceof HttpError ? fallbackError.details : fallbackError });
+      logEvent('error', 'fallback wav upload failed', { ...context, fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, details: fallbackError instanceof HttpError ? fallbackError.details : fallbackError });
       throw fallbackError;
     }
   }
@@ -454,15 +447,15 @@ export function buildChunkLogMeta(sourceMeta: SourceAudioMetadata, chunk: Prepar
   };
 }
 
-export async function transcribeWithDiarization(env: Env, audio: Blob, fileName: string, languageHint?: string, deps: { chunkGenerator?: AudioChunkGenerator; uploadChunk?: UploadChunkFn } = {}): Promise<TranscriptResult> {
+export async function transcribeWithDiarization(env: Env, audio: Blob, fileName: string, languageHint?: string, deps: { chunkGenerator?: AudioChunkGenerator; uploadChunk?: UploadChunkFn; recordingId?: string; dropboxFileId?: string; dropboxPathLower?: string } = {}): Promise<TranscriptResult> {
   const chunkGenerator = deps.chunkGenerator ?? defaultChunkGenerator;
   const uploadChunk = deps.uploadChunk ?? uploadPreparedChunk;
 
   let sourceMeta: SourceAudioMetadata;
   try {
-    sourceMeta = await inspectSourceAudio(audio, fileName);
+    sourceMeta = await inspectAudioSource(audio, fileName);
   } catch (error) {
-    structuredLog('error', 'source file inspection failed', { fileName, details: error instanceof Error ? error.message : error });
+    logEvent('error', 'source inspection failed', { recordingId: deps.recordingId, fileName, dropboxFileId: deps.dropboxFileId, dropboxPathLower: deps.dropboxPathLower, details: error instanceof Error ? error.message : error });
     throw new HttpError('source file inspection failed', 500, { fileName, cause: error instanceof Error ? error.message : error });
   }
 
@@ -470,16 +463,17 @@ export async function transcribeWithDiarization(env: Env, audio: Blob, fileName:
   try {
     plan = createChunkPlan(sourceMeta.durationSec, sourceMeta.bytes);
   } catch (error) {
-    structuredLog('error', 'chunk plan creation failed', { fileName, details: error instanceof Error ? error.message : error });
+    logEvent('error', 'chunk generation failed', { recordingId: deps.recordingId, fileName, dropboxFileId: deps.dropboxFileId, dropboxPathLower: deps.dropboxPathLower, details: error instanceof Error ? error.message : error });
     throw new HttpError('chunk plan creation failed', 500, { fileName, cause: error instanceof Error ? error.message : error });
   }
 
-  structuredLog('info', 'openai.transcription.plan', { fileName, sourceDurationSec: sourceMeta.durationSec, sourceBytes: sourceMeta.bytes, chunkCount: plan.entries.length, targetChunkDurationSec: TARGET_CHUNK_DURATION_SEC, maxModelDurationSec: MAX_TRANSCRIBE_DURATION_SEC, primaryAudioFormat: PRIMARY_AUDIO_FORMAT, fallbackAudioFormat: FALLBACK_AUDIO_FORMAT });
+  const context = { recordingId: deps.recordingId, fileName, dropboxFileId: deps.dropboxFileId, dropboxPathLower: deps.dropboxPathLower };
+  logEvent('info', 'openai.transcription.plan', { ...context, sourceDurationSec: sourceMeta.durationSec, sourceBytes: sourceMeta.bytes, chunkCount: plan.entries.length, targetChunkDurationSec: TARGET_CHUNK_DURATION_SEC, maxModelDurationSec: MAX_TRANSCRIBE_DURATION_SEC, primaryAudioFormat: PRIMARY_AUDIO_FORMAT, fallbackAudioFormat: FALLBACK_AUDIO_FORMAT });
 
   if (!plan.requiresSplit) {
     const chunk = validateChunk({ blob: audio, fileName, extension: sourceMeta.extension || extensionForFileName(fileName), mimeType: sourceMeta.mimeType, bytes: sourceMeta.bytes, codec: sourceMeta.codec, container: sourceMeta.container, sampleRate: sourceMeta.sampleRate, channels: sourceMeta.channels, estimatedDurationSec: sourceMeta.durationSec ?? 0, actualDurationSec: sourceMeta.durationSec, strategy: 'single-original', validationPassed: false, validationErrors: [], chunkIndex: 0, chunkCount: 1, startOffsetMs: 0, endOffsetMs: Math.round((sourceMeta.durationSec ?? 0) * 1000) });
     if (!chunk.validationPassed) throw new HttpError('chunk validation failed', 500, { fileName, chunkIndex: 1, chunkCount: 1, strategy: chunk.strategy, format: chunk.extension, validationErrors: chunk.validationErrors });
-    structuredLog('info', 'openai.transcription.chunk', buildChunkLogMeta(sourceMeta, chunk));
+    logEvent('info', 'openai.transcription.chunk', { ...context, ...buildChunkLogMeta(sourceMeta, chunk) });
     return uploadChunk(env, chunk, languageHint);
   }
 
@@ -487,13 +481,13 @@ export async function transcribeWithDiarization(env: Env, audio: Blob, fileName:
   let accumulatedOffsetMs = 0;
   for (const entry of plan.entries) {
     try {
-      const result = await transcribeChunkWithFallback(env, audio, sourceMeta, entry, languageHint, chunkGenerator, uploadChunk);
+      const result = await transcribeChunkWithFallback(env, audio, sourceMeta, entry, languageHint, chunkGenerator, uploadChunk, context);
       const baseOffset = accumulatedOffsetMs || entry.startOffsetMs;
       results.push(applyOffsetToTranscript(result, baseOffset));
       accumulatedOffsetMs = baseOffset + getChunkDurationMs(result, entry.estimatedDurationSec);
     } catch (error) {
       const details = error instanceof HttpError ? error.details : error instanceof Error ? error.message : error;
-      structuredLog('error', 'OpenAI returned 4xx/5xx', { fileName, chunkIndex: entry.chunkIndex + 1, chunkCount: entry.chunkCount, details });
+      logEvent('error', 'OpenAI 4xx/5xx', { ...context, chunkIndex: entry.chunkIndex + 1, chunkCount: entry.chunkCount, details });
       throw new HttpError('Transcription request failed.', 502, { fileName, chunkIndex: entry.chunkIndex + 1, chunkCount: entry.chunkCount, sourceDurationSec: sourceMeta.durationSec, sourceBytes: sourceMeta.bytes, cause: details });
     }
   }
@@ -501,7 +495,7 @@ export async function transcribeWithDiarization(env: Env, audio: Blob, fileName:
   try {
     return mergeTranscriptResults(results);
   } catch (error) {
-    structuredLog('error', 'transcription merge failed', { fileName, details: error instanceof Error ? error.message : error });
+    logEvent('error', 'transcript merge failed', { ...context, details: error instanceof Error ? error.message : error });
     throw new HttpError('transcription merge failed', 500, { fileName, cause: error instanceof Error ? error.message : error });
   }
 }

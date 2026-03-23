@@ -1,153 +1,140 @@
 # Meeting-memo
 
-Cloudflare Workers ベースの Meeting-memo です。iPhoneショートカットから音声を **`POST /api/interviews/upload`** に直接送り、Dropbox 保存 → Notion 面談メモ upsert → OpenAI 文字起こし（話者分離あり）→ 要約、までを一気通貫で処理します。
+Meeting-memo は、**iPhone ショートカットで選んだ音声ファイルを Cloudflare Workers に送り、Dropbox に保存し、その後に文字起こしと Notion 保存を行う**ためのリポジトリです。
 
-従来の `POST /api/interviews/intake` と `POST /api/interviews/scan` は残していますが、**推奨導線は `/api/interviews/upload`** です。
+今回の修正では、**ユーザー操作フローは変えていません**。変えたのは、Dropbox 保存後の後段処理だけです。
 
----
+## 変わらないユーザー操作フロー
 
-## 推奨導線
+1. iPhone ショートカットで音声ファイルを選ぶ
+2. ショートカットが Workers の既存アップロード API `POST /api/interviews/upload` を呼ぶ
+3. Workers が Dropbox に元ファイルを保存する
 
-1. iPhoneショートカットで録音ファイルを取得する。
-2. ショートカットから `POST /api/interviews/upload` に `multipart/form-data` で音声を直接送る。
-3. Worker が受信した音声を Dropbox App Folder 内の `DROPBOX_UPLOAD_FOLDER` に保存する。
-4. Worker が Dropbox から保存済みファイルを取得する。
-5. OpenAI Audio API へ **話者分離つき transcription** を実行する。
-   - 24MB 以下かつ 1200 秒以下ならそのまま送信
-   - 24MB 超または 1400 秒超なら Worker 側で自動分割して順番に送信
-6. 分割結果を再結合して 1 つの transcript にまとめる。
-7. 要約を生成し、Notion ページを dedup / upsert しつつ本文の Transcript ブロックも更新する。
+この **Shortcut -> Workers -> Dropbox** の流れはそのままです。
 
-> Dropbox scan 方式では「ショートカットが置いた場所」と「Workers が App Folder として見えている場所」がズレると失敗しやすいため、direct upload を推奨します。
+## 今回の変更点の要約
 
----
+長時間の `.m4a` を Workers ランタイム内で安全に分割・再エンコードすることは難しいため、後段を次の形に変更しました。
 
-## エンドポイント一覧
+1. Workers が Dropbox 保存成功レスポンスから **確定済み metadata** をその場で取得する
+2. Workers が `recordingId` を持つ処理ジョブを作る
+3. 短時間ファイルだけ Workers で直接 OpenAI に送る
+4. 長時間ファイル、または Workers 側で安全判定できないファイルは Cloud Run に委譲する
+5. Cloud Run が ffprobe / ffmpeg で安全に分割・再エンコードし、`gpt-4o-transcribe-diarize` に順次送信する
+6. Cloud Run が chunk を時系列順に統合して Workers に callback する
+7. Workers が Notion に保存し、ジョブ状態を更新する
 
-### `GET /`
-ヘルスチェックです。`200 OK` と `{ "ok": true, "service": "meeting-memo" }` を返します。
+## 自動処理フロー
 
-### `GET /health`
-既存どおりのヘルスチェックです。
+現在の主処理は次の順です。
 
-### `POST /api/interviews/upload` ← 推奨
+1. **Shortcut -> Workers -> Dropbox**
+2. Workers records Dropbox file metadata
+3. Workers dispatches long audio to Cloud Run
+4. Cloud Run performs split / transcode / transcribe
+5. Cloud Run returns merged transcript to Workers
+6. Workers persists the result to Notion
 
-iPhoneショートカットからの direct upload 用 endpoint です。`X-Webhook-Secret` が必須です。
+## Dropbox 探索の扱い
 
-- Content-Type: `multipart/form-data`
-- 必須フィールド:
-  - `file` または `audio`: `audio/*` のファイル本体
-- 推奨フィールド:
-  - `recordedAt`
-  - `languageHint`
-  - `participants` (JSON 配列文字列)
-  - `notes`
-  - `idempotencyKey`
-  - `metadata` (JSON オブジェクト文字列)
-- 認証ヘッダ:
-  - `X-Webhook-Secret: <INTERVIEW_WEBHOOK_SECRET>`
+Dropbox の `list_folder` / `list_folder_continue` / scan 系は、**主処理では使いません**。
 
-### `POST /api/interviews/intake`
-既存の 1 件指定取り込み endpoint です。`X-Webhook-Secret` が必須です。
+主処理の起点は、Dropbox upload 成功時に取得できる次の metadata です。
 
-### `POST /api/interviews/scan`
-既存の Dropbox フォルダ探索取り込み endpoint です。`X-Webhook-Secret` が必須です。
+- `dropboxFileId`
+- `dropboxPathLower`
+- `fileName`
+- `size`
+- `client_modified`
+- `server_modified`
 
-### `GET /api/interviews/debug-dropbox`
-Dropbox App Folder の root を `path: ""` で列挙する切り分け用 endpoint です。`X-Webhook-Secret` が必須です。
+scan は次の補助用途だけに限定しています。
 
----
+- webhook 取りこぼし時の再同期
+- 障害復旧
+- 手動再処理
+- 整合性確認
 
-## 話者分離あり文字起こし仕様
+つまり、**Dropbox 探索なしでも処理対象を確定できる**構成です。
 
-この Worker は OpenAI Audio API の diarization モデルを前提にしています。
+## ジョブ状態管理
 
-- デフォルト model: `gpt-4o-transcribe-diarize`
-- 推奨環境変数: `OPENAI_MODEL_TRANSCRIBE=gpt-4o-transcribe-diarize`
-- `response_format`: `diarized_json`
-- `chunking_strategy`: `auto`
-- `languageHint` があれば OpenAI に渡します
+Workers は Dropbox 保存直後にジョブを作成します。最低限の状態は以下です。
 
-返却された diarization payload は Worker 内で次の形に正規化します。
+- `uploaded`
+- `queued`
+- `transcoding`
+- `transcribing`
+- `transcribed`
+- `persisted`
+- `failed`
 
-- `fullText`
-- `segments[]`
-  - `speaker`
-  - `startMs`
-  - `endMs`
-  - `text`
-- `raw`
+ジョブには次のような情報を持たせています。
 
-`fullText` が空のときは `segments` から `[speaker] text` 形式で補完します。
+- `recordingId`
+- `fileName`
+- `dropboxFileId`
+- `dropboxPathLower`
+- `sourceBytes`
+- `sourceDurationSec`
+- `uploadSource=shortcut`
+- `retryCount`
+- `createdAt`
+- `updatedAt`
 
----
+重複防止の優先順位は次のとおりです。
 
-## 長時間音声の分割戦略とフォールバック
+1. `dropboxFileId`
+2. `recordingId`
+3. `dropboxPathLower` は補助のみ
 
-OpenAI の `gpt-4o-transcribe-diarize` は **1400 秒が上限** です。したがって、長時間音声はそのまま送らず、Worker 側で **時間ベースの chunk plan を作成してから順番に送信** します。
+**`path_lower` 単独では一意判定しません。**
 
-### 現在の基本方針
+## 長時間音声の扱い
+
+### Workers 側でやらないこと
+
+長時間 `.m4a` に対して、Workers 側では次を禁止しています。
+
+- `mp4-rewrapped`
+- byte range split
+- container rewrap
+- unsafe chunking
+- runtime 非対応のまま再エンコード継続
+
+### Cloud Run 側でやること
+
+Cloud Run サービスは次の責務を持ちます。
+
+- Dropbox から対象ファイルを直接取得
+- `ffprobe` で duration / codec / sample rate / channels を確認
+- 600〜720 秒程度ごとに `decode -> trim -> re-encode`
+- 各 part を単体再生可能なファイルとして生成
+- `gpt-4o-transcribe-diarize` に順次送信
+- chunk ごとの transcript を `chunkIndex` 順に統合
+- Workers callback endpoint に結果を返す
+
+## chunk 設計
+
+主要な設定値は次のとおりです。
 
 - `MAX_TRANSCRIBE_DURATION_SEC=1400`
 - `TARGET_CHUNK_DURATION_SEC=720`
-  - 1400 秒に直接当てず、10〜12 分程度で十分な安全マージンを取ります
 - `PRIMARY_AUDIO_FORMAT=m4a`
 - `FALLBACK_AUDIO_FORMAT=wav`
 - `ENABLE_AUDIO_FALLBACK=true`
 
-### 旧方式を廃止した理由
-
-以前の `mp4-rewrapped` は、MP4/M4A コンテナを byte range 的に再包装していたため、chunk 単体では再生できても **コンテナ整合性が崩れ、OpenAI から `Audio file might be corrupted or unsupported` が返る** ケースがありました。
-
-そのため、現在は **`decode -> trim -> re-encode` を前提にした chunking 設計** に変更し、`mp4-rewrapped` はデフォルト経路から完全に外しています。
-
-### chunk plan
-
-各 chunk は次のメタデータを持ちます。
+chunk には最低限次の情報を持たせます。
 
 - `chunkIndex`
 - `chunkCount`
 - `startOffsetMs`
 - `endOffsetMs`
 - `estimatedDurationSec`
-
-### chunk 生成と validation
-
-OpenAI に送る前に、各 chunk について以下を検証します。
-
-- `bytes > 0`
-- `duration > 0`
-- 拡張子と MIME type の整合
-- codec / container を取得できていること
-- 単体ファイルとして成立していること
-
-validation に失敗した chunk は送信せず、その場で明示エラーにします。
-
-### フォールバック
-
-デフォルトは `.m4a` です。もし `.m4a` chunk の upload で `invalid_request_error` かつ file 系エラーが返った場合は、**同じ時間範囲を `.wav` で再生成して 1 回だけ再試行** します。
-
-ログには以下が残ります。
-
-- `chunk upload failed with m4a, fallback to wav`
-- `fallback wav upload started`
-- `fallback wav upload succeeded`
-- `fallback wav upload failed`
-
-### 出力ログ
-
-transcription 前後では、最低限以下を structured log で残します。
-
 - `fileName`
-- `sourceDurationSec`
-- `sourceBytes`
-- `chunkIndex`
-- `chunkCount`
-- `startOffsetMs`
-- `estimatedDurationSec`
-- `bytes`
 - `extension`
 - `mimeType`
+- `bytes`
 - `codec`
 - `container`
 - `sampleRate`
@@ -155,251 +142,117 @@ transcription 前後では、最低限以下を structured log で残します�
 - `strategy`
 - `validationPassed`
 
-### トラブルシュート
+使う `strategy` 名は実態がわかるものだけです。
 
-#### duration over limit
-- `sourceDurationSec` が 1400 秒超なら自動分割対象です
-- `openai.transcription.plan` の `chunkCount` と `targetChunkDurationSec` を確認してください
+- `single-original`
+- `reencoded-aac-m4a`
+- `fallback-pcm-wav`
 
-#### corrupted or unsupported
-- 旧 `mp4-rewrapped` は廃止済みです
-- 失敗した chunk の `extension`, `mimeType`, `codec`, `container`, `strategy` を確認してください
-- `.m4a` upload 失敗時は `.wav` フォールバックが 1 回だけ走ります
+**`mp4-rewrapped` は禁止です。**
 
-#### fallback 失敗
-- `fallback wav upload failed` が出ている場合、その chunk は明示的に異常終了します
-- `responseStatus` と `responseText` を確認してください
+## validation
 
-#### mime / codec mismatch
-- chunk validation で検出されます
-- `chunk validation failed` の `validationErrors` を確認してください
+OpenAI に送る前に、chunk を必ず検証します。
 
-## Notion 反映仕様
+- `bytes > 0`
+- `duration > 0`
+- 拡張子と MIME type の整合
+- codec / container 情報の存在
+- 単体ファイルとして成立していること
+- 空 chunk の拒否
 
-Notion には dedup / upsert の既存思想を維持したまま反映します。
+validation 失敗時は OpenAI に送らず、ログに残して止めます。
 
-- `Source` → `rich_text`
-- `Speaker Separation` → `select`
-- `Raw JSON` → `rich_text`
-- `Transcript` → ページ本文ブロックとして追記 / 更新
-- 既存ページ更新時は、管理対象の Transcript ブロック群を置換
+## OpenAI 送信方針
 
-Transcript 本文は、segment がある場合は `[speaker] text` 単位で段落化します。
+文字起こしモデルは **必ず `gpt-4o-transcribe-diarize`** を使います。
 
----
+長時間音声で `.m4a` chunk が OpenAI 側から壊れている・未対応と判断された場合だけ、**同じ時間範囲を `.wav` で 1 回だけ再送**します。
 
-## 必要な Cloudflare Workers 環境変数
+## 障害切り分け
 
-### Secrets
+長時間音声で問題が出たときは、次の順で確認してください。
+
+1. **Dropbox upload failed**
+2. **Cloud Run dispatch failed**
+3. **ffprobe failed**
+4. **ffmpeg chunk failed**
+5. **OpenAI failed**
+6. **callback failed**
+7. **Notion persistence failed**
+
+Workers / Cloud Run ともに structured logging を前提にしており、最低限次をログに含める設計です。
+
+- `level`
+- `message`
+- `recordingId`
+- `fileName`
+- `dropboxFileId`
+- `dropboxPathLower`
+- `details`
+
+## エンドポイント
+
+### `POST /api/interviews/upload`
+ユーザー導線はそのままのアップロード endpoint です。
+
+### `POST /api/interviews/transcription-callback`
+Cloud Run が統合 transcript を返す callback endpoint です。
+
+### `POST /api/interviews/intake`
+既存の直接 intake 用です。
+
+### `POST /api/interviews/scan`
+補助用途専用です。主処理の起点ではありません。
+
+### `GET /api/interviews/debug-dropbox`
+Dropbox 切り分け用です。
+
+## 設定値一覧
+
+### Workers 側
 
 - `INTERVIEW_WEBHOOK_SECRET`
 - `NOTION_TOKEN`
 - `INBOX_DB_ID`
 - `OPENAI_API_KEY`
+- `OPENAI_MODEL_TRANSCRIBE`
+- `OPENAI_MODEL_SUMMARIZE`
 - `DROPBOX_ACCESS_TOKEN`
-
-refresh token 方式を使う場合は、代わりに以下を設定します。
-
 - `DROPBOX_APP_KEY`
 - `DROPBOX_APP_SECRET`
 - `DROPBOX_REFRESH_TOKEN`
-
-### Optional secrets / vars
-
-- `OPENAI_MODEL_TRANSCRIBE`
-  - 推奨値: `gpt-4o-transcribe-diarize`
-- `OPENAI_MODEL_SUMMARIZE`
-  - 既定値: `gpt-4.1-mini`
+- `DROPBOX_UPLOAD_FOLDER`
 - `DROPBOX_INTERVIEW_SCAN_FOLDER`
 - `DROPBOX_INTERVIEW_SCAN_RECURSIVE`
 - `INTERVIEW_SCAN_MAX_FILES`
-- `DROPBOX_UPLOAD_FOLDER`
-  - 例: `/Apps/MeetingMemo/inbox`
-- `APP_ENV`
+- `CLOUD_RUN_TRANSCRIBE_ENDPOINT`
+- `CLOUD_RUN_SHARED_SECRET`
+- `WORKERS_CALLBACK_BASE_URL`
 
-> GitHub push → Cloudflare Workers deploy 前提で動く構成を維持しています。ローカル CLI 常駐は不要です。
+### Cloud Run 側
 
----
+- Dropbox credentials
+- OpenAI credentials
+- callback 用 shared secret
+- ffmpeg / ffprobe 実行環境
+- chunk duration settings
+- retry settings
 
-## Cloudflare Logs で確認できること
+## テストで確認していること
 
-Workers Logs では主に以下のイベント名で追えます。
-
-- `interviews.upload.received`
-- `interviews.upload.persist_failed`
-- `interviews.upload.processing_failed`
-- `interviews.process.processing_failed`
-- `interviews.process.notion_failed`
-- `openai.transcription.plan`
-- `openai.transcription.chunk`
-- `openai.transcription.failed`
-- `openai.summary.failed`
-- `worker.http_error`
-- `worker.unhandled_error`
-
-### ログの見方
-
-Cloudflare Dashboard の Worker から **Logs** を開き、以下を確認してください。
-
-- どの段階で落ちたか
-  - Dropbox 保存
-  - OpenAI transcription
-  - OpenAI summary
-  - Notion upsert
-- `details.responseText` が残っているか
-- transcription chunk ログの `strategy`, `bytes`, `startOffsetMs`, `estimatedDurationSec`
-- duration が 1400 秒を超えていないか、plan ログの `durationSec` と `chunkCount`
-- 失敗した場合の `chunkIndex` / `chunkCount`
-
-OpenAI の失敗時は、レスポンス本文を `responseText` として残す実装にしています。
-
----
-
-## 想定される失敗パターンと確認方法
-
-### 1. Dropbox 保存で失敗する
-
-確認ポイント:
-- `interviews.upload.persist_failed`
-- Dropbox 認証情報が不足していないか
-- App Folder 配下に書き込み権限があるか
-
-### 2. OpenAI transcription で失敗する
-
-確認ポイント:
-- `openai.transcription.failed`
-- `responseText` に model / response_format / chunking_strategy の不整合が出ていないか
-- `OPENAI_MODEL_TRANSCRIBE` が diarization モデルになっているか
-- chunk ログでどの chunk が失敗したか
-
-### 3. 25MB 超ファイル / 1400 秒超音声が途中で失敗する
-
-確認ポイント:
-- `openai.transcription.plan` と `openai.transcription.chunk`
-- `strategy` が `mp4-fragmented`, `mp4-rewrapped`, `blob-slice` のどれになったか
-- 特定 chunk の `bytes` が安全上限を超えていないか
-- `durationSec`, `startOffsetMs`, `estimatedDurationSec` から duration 分割が効いているか
-
-### 4. Notion にはページができるが Transcript が本文に出ない
-
-確認ポイント:
-- `interviews.process.notion_failed`
-- Notion DB の property type が以下と一致しているか
-  - `Source`: rich_text
-  - `Speaker Separation`: select
-  - `Raw JSON`: rich_text
-- 既存ページ更新時に Transcript 見出し配下が置換されているか
-
-### 5. dedup により処理されない
-
-確認ポイント:
-- upload レスポンスの `action=skipped`
-- `dedupCandidates`
-- 同じ Dropbox file id / path / idempotencyKey で既存ページが存在しないか
-
----
-
-## iPhoneショートカット設定例
-
-### 1. 音声ファイルを取得
-
-- 「ファイルを取得」または録音結果を受け取るアクションを使う
-- `.m4a` 出力を推奨
-
-### 2. URL を指定
-
-- 例: `https://<your-worker-domain>/api/interviews/upload`
-
-### 3. `URL の内容を取得`
-
-- 方法: `POST`
-- 本文: `フォーム`
-- ヘッダ:
-  - `X-Webhook-Secret: <INTERVIEW_WEBHOOK_SECRET>`
-
-### 4. フォーム項目
-
-- `file`: 音声ファイル本体
-- `recordedAt`: 例 `2026-03-22T09:30:00+09:00`
-- `languageHint`: `ja`
-- `source`: `iPhone Shortcut`
-- `participants`: `[
-  "me",
-  "customer"
-]`
-- `notes`: 任意
-- `idempotencyKey`: 例 `shortcut-{{現在日時}}-{{ファイルサイズ}}`
-- `metadata`: 必要なら JSON で補足メタデータをまとめる
-
-### curl 相当例
-
-```bash
-curl -X POST "https://<your-worker-domain>/api/interviews/upload" \
-  -H "X-Webhook-Secret: <INTERVIEW_WEBHOOK_SECRET>" \
-  -F "file=@./interview-001.m4a;type=audio/mp4" \
-  -F "recordedAt=2026-03-22T09:30:00+09:00" \
-  -F "languageHint=ja" \
-  -F 'participants=["me","customer"]' \
-  -F "notes=Weekly follow-up" \
-  -F "idempotencyKey=shortcut-2026-03-22T09-30-00-18374652"
-```
-
-### 成功時に確認するレスポンス例
-
-```json
-{
-  "ok": true,
-  "action": "processed",
-  "reason": "Processed and upserted into Notion.",
-  "pageId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-  "created": true,
-  "dropboxFileId": "id:abc123",
-  "dropboxPathLower": "/apps/meetingmemo/inbox/interview-001.m4a",
-  "storedFileName": "interview-001.m4a",
-  "fileSizeBytes": 18374652,
-  "dedupCandidates": [
-    "dropbox:id:id:abc123",
-    "dropbox:path:/apps/meetingmemo/inbox/interview-001.m4a"
-  ]
-}
-```
-
-エラー時は `details` に stage ごとの情報が入り、OpenAI / Dropbox / Notion の切り分けに使えます。
-
----
-
-## scan 方式との違い
-
-| 項目 | direct upload (`/api/interviews/upload`) | scan (`/api/interviews/scan`) |
-| --- | --- | --- |
-| 起点 | iPhoneショートカットが Worker に直接送信 | Worker が Dropbox を後から探索 |
-| Dropbox 可視性問題 | 起こりにくい | 保存先と App Folder 可視範囲がズレると失敗しやすい |
-| メタデータ伝達 | multipart フィールドで一緒に送れる | Dropbox metadata 依存 |
-| 大容量音声 | 保存後に Worker 側で自動分割 transcription | scan 対象でも同じ分割ロジックを利用 |
-| 推奨度 | **推奨** | 互換用途・再処理用途 |
-
----
-
-## 動作確認の基本手順
-
-1. GitHub に push して Cloudflare Workers をデプロイする。
-2. 必要 secrets / vars が反映されていることを確認する。
-3. `/health` で疎通確認する。
-4. 10MB 前後の `.m4a` を `/api/interviews/upload` に送って 1 chunk で成功することを確認する。
-5. 25MB 超の `.m4a` / `.mp4` を送って chunk ログが出ることを確認する。
-6. Notion に以下が反映されることを確認する。
-   - ページ作成または既存ページ更新
-   - `Source` rich_text
-   - `Speaker Separation` select
-   - `Raw JSON` rich_text
-   - 本文の Transcript ブロック更新
-7. Cloudflare Logs で `openai.transcription.chunk` と成功 / 失敗ログを確認する。
-
----
+- upload 後に Dropbox metadata から job が作られること
+- Dropbox 探索なしでも処理対象を確定できること
+- duration 上限以下のファイルは direct path を選べること
+- 長時間ファイルは Cloud Run 委譲判定になること
+- `mp4-rewrapped` を使わないこと
+- chunk plan が正しく生成されること
+- invalid chunk が validation で弾かれること
+- `.m4a` 失敗時に `.wav` fallback が 1 回だけ動くこと
+- transcript が `chunkIndex` 順に結合されること
+- `dropboxFileId` ベースで重複防止できること
+- scan 系が補助用途であること
 
 ## 補足
 
-- `/api/interviews/scan` は残しています。
-- `/api/interviews/intake` も互換維持のため残しています。
-- dedup / upsert の基本思想は維持しています。
-- 大きい音声は、Cloudflare Workers 上で現実的に実装できる範囲で安全側に自動分割して処理します。
+Cloud Run 実装はリポジトリ内の `cloud-run/service.ts` に配置しています。ここで ffprobe / ffmpeg を使った安全な chunking と callback 連携を担います。
