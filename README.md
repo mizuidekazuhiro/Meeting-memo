@@ -82,40 +82,97 @@ Dropbox App Folder の root を `path: ""` で列挙する切り分け用 endpoi
 
 ---
 
-## 25MB 超ファイル時 / 1400 秒超音声時の分割戦略
+## 長時間音声の分割戦略とフォールバック
 
-OpenAI の diarization モデルは長尺音声で duration 制限があるため、Worker では **24MB を安全上限** にしつつ、**1 chunk あたり 1200 秒以下を目安**に自動分割します。25MB 未満でも duration 超過なら分割対象です。
+OpenAI の `gpt-4o-transcribe-diarize` は **1400 秒が上限** です。したがって、長時間音声はそのまま送らず、Worker 側で **時間ベースの chunk plan を作成してから順番に送信** します。
 
-### 基本方針
+### 現在の基本方針
 
-- `24MB 以下` かつ `1200 秒以下`: そのまま 1 回で transcription
-- `24MB 超`: 自動分割して chunk 単位で順番に transcription
-- `1400 秒超`: サイズに関係なく自動分割して chunk 単位で順番に transcription
-- chunk の transcript / segments を再結合して、最終的に **1 つの `TranscriptResult`** にまとめる
+- `MAX_TRANSCRIBE_DURATION_SEC=1400`
+- `TARGET_CHUNK_DURATION_SEC=720`
+  - 1400 秒に直接当てず、10〜12 分程度で十分な安全マージンを取ります
+- `PRIMARY_AUDIO_FORMAT=m4a`
+- `FALLBACK_AUDIO_FORMAT=wav`
+- `ENABLE_AUDIO_FALLBACK=true`
 
-### 分割の優先順位
+### 旧方式を廃止した理由
 
-1. **標準 MP4 / M4A から duration を取得して chunk plan を作成**
-   - `mdhd` / `mvhd` から総 duration を読み取り、size 制限と duration 制限の両方で chunk 数を決める
-   - `gpt-4o-transcribe-diarize` の上限 1400 秒より余裕を持たせ、**1 chunk あたり 1200 秒以下**を目標にする
-2. **fragmented MP4 / M4A を top-level box 単位で分割**
-   - `ftyp` / `moov` を初期化セクションとして保持
-   - `moof` / `mdat` などの media boxes を duration/size plan に合わせてまとめる
-   - 可能な限りコンテナ境界を壊さない方針
-3. **通常 MP4 / M4A の `mdat` 再ラップ分割**
-   - `ftyp` + `moov` を保持し、`mdat` payload を chunk plan に従って再ラップする
-   - Workers 上で ffmpeg 非依存のまま、自動処理を継続できる現実的な実装
-4. **最終フォールバックとして `Blob.slice()`**
-   - MP4/M4A 以外や、コンテナ解析が難しいファイルで使用
+以前の `mp4-rewrapped` は、MP4/M4A コンテナを byte range 的に再包装していたため、chunk 単体では再生できても **コンテナ整合性が崩れ、OpenAI から `Audio file might be corrupted or unsupported` が返る** ケースがありました。
 
-### 注意点
+そのため、現在は **`decode -> trim -> re-encode` を前提にした chunking 設計** に変更し、`mp4-rewrapped` はデフォルト経路から完全に外しています。
 
-- Cloudflare Workers 上では ffmpeg のような本格的なメディア再エンコードを前提にしていません。
-- そのため **「まず壊れにくい方法を試し、難しいケースではサイズ優先のフォールバックに落とす」** 実装です。
-- 各 chunk の処理では `chunkIndex`, `chunkCount`, `bytes`, `strategy`, `fileName`, `startOffsetMs`, `estimatedDurationSec` を Workers Logs に出します。
-- chunk の diarization result は chunk offset を加算して全体の `startMs` / `endMs` に補正したうえで再結合します。
+### chunk plan
 
----
+各 chunk は次のメタデータを持ちます。
+
+- `chunkIndex`
+- `chunkCount`
+- `startOffsetMs`
+- `endOffsetMs`
+- `estimatedDurationSec`
+
+### chunk 生成と validation
+
+OpenAI に送る前に、各 chunk について以下を検証します。
+
+- `bytes > 0`
+- `duration > 0`
+- 拡張子と MIME type の整合
+- codec / container を取得できていること
+- 単体ファイルとして成立していること
+
+validation に失敗した chunk は送信せず、その場で明示エラーにします。
+
+### フォールバック
+
+デフォルトは `.m4a` です。もし `.m4a` chunk の upload で `invalid_request_error` かつ file 系エラーが返った場合は、**同じ時間範囲を `.wav` で再生成して 1 回だけ再試行** します。
+
+ログには以下が残ります。
+
+- `chunk upload failed with m4a, fallback to wav`
+- `fallback wav upload started`
+- `fallback wav upload succeeded`
+- `fallback wav upload failed`
+
+### 出力ログ
+
+transcription 前後では、最低限以下を structured log で残します。
+
+- `fileName`
+- `sourceDurationSec`
+- `sourceBytes`
+- `chunkIndex`
+- `chunkCount`
+- `startOffsetMs`
+- `estimatedDurationSec`
+- `bytes`
+- `extension`
+- `mimeType`
+- `codec`
+- `container`
+- `sampleRate`
+- `channels`
+- `strategy`
+- `validationPassed`
+
+### トラブルシュート
+
+#### duration over limit
+- `sourceDurationSec` が 1400 秒超なら自動分割対象です
+- `openai.transcription.plan` の `chunkCount` と `targetChunkDurationSec` を確認してください
+
+#### corrupted or unsupported
+- 旧 `mp4-rewrapped` は廃止済みです
+- 失敗した chunk の `extension`, `mimeType`, `codec`, `container`, `strategy` を確認してください
+- `.m4a` upload 失敗時は `.wav` フォールバックが 1 回だけ走ります
+
+#### fallback 失敗
+- `fallback wav upload failed` が出ている場合、その chunk は明示的に異常終了します
+- `responseStatus` と `responseText` を確認してください
+
+#### mime / codec mismatch
+- chunk validation で検出されます
+- `chunk validation failed` の `validationErrors` を確認してください
 
 ## Notion 反映仕様
 

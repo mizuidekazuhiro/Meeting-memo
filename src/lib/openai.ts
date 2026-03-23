@@ -3,12 +3,22 @@ import { HttpError } from './http';
 
 const OPENAI_API = 'https://api.openai.com/v1';
 const DEFAULT_TRANSCRIBE_MODEL = 'gpt-4o-transcribe-diarize';
-const MAX_TRANSCRIPTION_BYTES = 24 * 1024 * 1024;
-const TARGET_CHUNK_DURATION_SEC = 1200;
-const MAX_MODEL_DURATION_SEC = 1400;
+export const MAX_TRANSCRIPTION_BYTES = 24 * 1024 * 1024;
+export const MAX_TRANSCRIBE_DURATION_SEC = 1400;
+// Keep chunks around 10-12 minutes so we stay well under the 1400s model limit
+// and leave headroom for metadata drift / duration estimation error.
+export const TARGET_CHUNK_DURATION_SEC = 720;
+export const PRIMARY_AUDIO_FORMAT = 'm4a';
+export const FALLBACK_AUDIO_FORMAT = 'wav';
+export const ENABLE_AUDIO_FALLBACK = true;
 const MP4_BOX_HEADER_BYTES = 8;
+const WAV_HEADER_BYTES = 44;
 
-const textEncoder = new TextEncoder();
+type LogLevel = 'info' | 'warn' | 'error';
+type AudioFormat = 'm4a' | 'wav';
+type AudioContainer = 'm4a' | 'wav' | 'unknown';
+type AudioCodec = 'aac-lc' | 'pcm_s16le' | 'unknown';
+type ChunkStrategy = 'single-original' | 'reencoded-aac-m4a' | 'fallback-pcm-wav';
 
 type DiarizedSegmentLike = {
   speaker?: string | number;
@@ -30,74 +40,102 @@ type OpenAiDiarizedTranscript = {
   diarized_segments?: DiarizedSegmentLike[];
 };
 
-type Mp4TopLevelBox = { type: string; start: number; end: number };
-
-type TranscriptionChunkStrategy = 'single' | 'blob-slice' | 'mp4-fragmented' | 'mp4-rewrapped';
-
-type TranscriptionChunk = {
-  blob: Blob;
+type SourceAudioMetadata = {
   fileName: string;
-  strategy: TranscriptionChunkStrategy;
+  extension: string;
+  mimeType: string;
+  bytes: number;
+  container: AudioContainer;
+  codec: AudioCodec;
+  durationSec?: number;
+  sampleRate?: number;
+  channels?: number;
+};
+
+export type ChunkPlanEntry = {
   chunkIndex: number;
   chunkCount: number;
   startOffsetMs: number;
+  endOffsetMs: number;
   estimatedDurationSec: number;
 };
 
 type ChunkPlan = {
-  chunkCount: number;
-  targetMaxBytes: number;
-  targetDurationSec: number;
-  durationSec?: number;
+  requiresSplit: boolean;
+  entries: ChunkPlanEntry[];
 };
+
+export type PreparedTranscriptionChunk = {
+  blob: Blob;
+  fileName: string;
+  extension: string;
+  mimeType: string;
+  bytes: number;
+  codec: AudioCodec;
+  container: AudioContainer;
+  sampleRate?: number;
+  channels?: number;
+  estimatedDurationSec: number;
+  actualDurationSec?: number;
+  strategy: ChunkStrategy;
+  validationPassed: boolean;
+  validationErrors: string[];
+  chunkIndex: number;
+  chunkCount: number;
+  startOffsetMs: number;
+  endOffsetMs: number;
+};
+
+type UploadFailure = {
+  responseStatus?: number;
+  responseText?: string;
+  code?: string;
+  type?: string;
+  param?: string;
+};
+
+type GenerateChunkOptions = { preferredFormat: AudioFormat };
+
+type AudioChunkGenerator = (source: Blob, sourceMeta: SourceAudioMetadata, plan: ChunkPlanEntry, options: GenerateChunkOptions) => Promise<PreparedTranscriptionChunk>;
+
+type UploadChunkFn = (env: Env, chunk: PreparedTranscriptionChunk, languageHint?: string) => Promise<TranscriptResult>;
+
+function structuredLog(level: LogLevel, message: string, meta: Record<string, unknown>): void {
+  const payload = { level, message, ...meta };
+  if (level === 'error') console.error(message, payload);
+  else if (level === 'warn') console.warn(message, payload);
+  else console.log(message, payload);
+}
 
 function asSpeakerLabel(segment: DiarizedSegmentLike): string {
   const rawSpeaker = segment.speaker ?? segment.speaker_label ?? segment.speaker_id;
-  if (rawSpeaker === undefined || rawSpeaker === null || rawSpeaker === '') {
-    return 'speaker_unknown';
-  }
-  return String(rawSpeaker);
+  return rawSpeaker === undefined || rawSpeaker === null || rawSpeaker === '' ? 'speaker_unknown' : String(rawSpeaker);
 }
 
 function toMilliseconds(value: number | undefined, alternateValue?: number): number | undefined {
   const candidate = value ?? alternateValue;
-  if (candidate === undefined || Number.isNaN(candidate)) {
-    return undefined;
-  }
+  if (candidate === undefined || Number.isNaN(candidate)) return undefined;
   return candidate >= 1000 ? Math.round(candidate) : Math.round(candidate * 1000);
 }
 
 function normalizeSegments(payload: OpenAiDiarizedTranscript): TranscriptSegment[] {
   const segments = payload.diarized_segments ?? payload.segments ?? [];
-  return segments
-    .map((segment) => ({
-      speaker: asSpeakerLabel(segment),
-      startMs: toMilliseconds(segment.start_ms, segment.start ?? segment.startMs),
-      endMs: toMilliseconds(segment.end_ms, segment.end ?? segment.endMs),
-      text: (segment.text ?? '').trim(),
-    }))
-    .filter((segment) => Boolean(segment.text));
+  return segments.map((segment) => ({
+    speaker: asSpeakerLabel(segment),
+    startMs: toMilliseconds(segment.start_ms, segment.start ?? segment.startMs),
+    endMs: toMilliseconds(segment.end_ms, segment.end ?? segment.endMs),
+    text: (segment.text ?? '').trim(),
+  })).filter((segment) => Boolean(segment.text));
 }
 
 function mapTranscriptPayload(payload: OpenAiDiarizedTranscript): TranscriptResult {
   const segments = normalizeSegments(payload);
-  const fullText =
-    (payload.text ?? payload.transcript ?? '').trim() ||
-    segments.map((segment) => `[${segment.speaker}] ${segment.text}`.trim()).join('\n');
-
-  return {
-    fullText,
-    segments,
-    raw: payload,
-  };
+  const fullText = (payload.text ?? payload.transcript ?? '').trim() || segments.map((segment) => `[${segment.speaker}] ${segment.text}`.trim()).join('\n');
+  return { fullText, segments, raw: payload };
 }
 
 async function readResponseTextSafely(response: Response): Promise<string> {
-  try {
-    return await response.text();
-  } catch (error) {
-    return `<<failed to read response body: ${error instanceof Error ? error.message : String(error)}>>`;
-  }
+  try { return await response.text(); } catch (error) { return `<<failed to read response body: ${error instanceof Error ? error.message : String(error)}>>`; }
 }
 
 function extensionForFileName(fileName: string): string {
@@ -105,93 +143,62 @@ function extensionForFileName(fileName: string): string {
   return index >= 0 ? fileName.slice(index).toLowerCase() : '';
 }
 
-function fileNameForChunk(fileName: string, chunkIndex: number): string {
-  const extension = extensionForFileName(fileName);
-  const stem = extension ? fileName.slice(0, -extension.length) : fileName;
-  return `${stem}.part-${String(chunkIndex + 1).padStart(3, '0')}${extension || '.bin'}`;
+function mimeTypeForFormat(format: AudioFormat): string {
+  return format === 'm4a' ? 'audio/mp4' : 'audio/wav';
 }
 
-function finalizeChunks(chunks: Omit<TranscriptionChunk, 'chunkCount' | 'chunkIndex'>[]): TranscriptionChunk[] {
-  return chunks.map((chunk, index, all) => ({
-    ...chunk,
-    chunkIndex: index,
-    chunkCount: all.length,
-  }));
+function containerForFormat(format: AudioFormat): AudioContainer { return format; }
+function codecForFormat(format: AudioFormat): AudioCodec { return format === 'm4a' ? 'aac-lc' : 'pcm_s16le'; }
+
+function fileNameForChunk(fileName: string, chunkIndex: number, format: AudioFormat): string {
+  const extension = format === 'm4a' ? '.m4a' : '.wav';
+  const sourceExt = extensionForFileName(fileName);
+  const stem = sourceExt ? fileName.slice(0, -sourceExt.length) : fileName;
+  return `${stem}.part-${String(chunkIndex + 1).padStart(3, '0')}${extension}`;
 }
 
-function toOwnedArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-  const copy = new Uint8Array(bytes.byteLength);
-  copy.set(bytes);
-  return copy.buffer;
-}
-
+function readAscii(bytes: Uint8Array, start: number, length: number): string { return String.fromCharCode(...bytes.slice(start, start + length)); }
 function concatUint8Arrays(parts: Uint8Array[]): Uint8Array {
   const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
   const output = new Uint8Array(total);
   let offset = 0;
-  for (const part of parts) {
-    output.set(part, offset);
-    offset += part.byteLength;
-  }
+  for (const part of parts) { output.set(part, offset); offset += part.byteLength; }
   return output;
 }
 
+type Mp4TopLevelBox = { type: string; start: number; end: number };
 function readMp4TopLevelBoxes(bytes: Uint8Array): Mp4TopLevelBox[] {
   const boxes: Mp4TopLevelBox[] = [];
   let offset = 0;
-
   while (offset + MP4_BOX_HEADER_BYTES <= bytes.byteLength) {
     const size32 = new DataView(bytes.buffer, bytes.byteOffset + offset, 4).getUint32(0);
-    const type = String.fromCharCode(...bytes.slice(offset + 4, offset + 8));
+    const type = readAscii(bytes, offset + 4, 4);
     let size = size32;
     let headerSize = MP4_BOX_HEADER_BYTES;
-
     if (size32 === 1) {
-      if (offset + 16 > bytes.byteLength) {
-        break;
-      }
+      if (offset + 16 > bytes.byteLength) break;
       const view = new DataView(bytes.buffer, bytes.byteOffset + offset + 8, 8);
-      const high = view.getUint32(0);
-      const low = view.getUint32(4);
-      size = high * 2 ** 32 + low;
+      size = view.getUint32(0) * 2 ** 32 + view.getUint32(4);
       headerSize = 16;
-    } else if (size32 === 0) {
-      size = bytes.byteLength - offset;
-    }
-
-    if (!size || size < headerSize || offset + size > bytes.byteLength) {
-      break;
-    }
-
+    } else if (size32 === 0) size = bytes.byteLength - offset;
+    if (!size || size < headerSize || offset + size > bytes.byteLength) break;
     boxes.push({ type, start: offset, end: offset + size });
     offset += size;
   }
-
   return boxes;
-}
-
-function readAscii(bytes: Uint8Array, start: number, length: number): string {
-  return String.fromCharCode(...bytes.slice(start, start + length));
 }
 
 function findFirstBox(bytes: Uint8Array, path: string[]): Uint8Array | null {
   let current: Uint8Array | null = bytes;
   for (const target of path) {
-    if (!current) {
-      return null;
-    }
+    if (!current) return null;
     let found: Uint8Array | null = null;
     let offset = 8;
     while (offset + 8 <= current.byteLength) {
       const size = new DataView(current.buffer, current.byteOffset + offset, 4).getUint32(0);
       const type = readAscii(current, offset + 4, 4);
-      if (!size || offset + size > current.byteLength) {
-        break;
-      }
-      if (type === target) {
-        found = current.slice(offset, offset + size);
-        break;
-      }
+      if (!size || offset + size > current.byteLength) break;
+      if (type === target) { found = current.slice(offset, offset + size); break; }
       offset += size;
     }
     current = found;
@@ -199,17 +206,11 @@ function findFirstBox(bytes: Uint8Array, path: string[]): Uint8Array | null {
   return current;
 }
 
-function readMp4DurationSeconds(audio: Blob, fileName: string, bytes: Uint8Array): number | undefined {
+function readMp4DurationSeconds(fileName: string, bytes: Uint8Array): number | undefined {
   const extension = extensionForFileName(fileName);
-  if (extension !== '.m4a' && extension !== '.mp4') {
-    return undefined;
-  }
-
+  if (extension !== '.m4a' && extension !== '.mp4') return undefined;
   const moov = readMp4TopLevelBoxes(bytes).find((box) => box.type === 'moov');
-  if (!moov) {
-    return undefined;
-  }
-
+  if (!moov) return undefined;
   const moovBytes = bytes.slice(moov.start, moov.end);
   const mdhd = findFirstBox(moovBytes, ['trak', 'mdia', 'mdhd']);
   if (mdhd && mdhd.byteLength >= 28) {
@@ -218,23 +219,16 @@ function readMp4DurationSeconds(audio: Blob, fileName: string, bytes: Uint8Array
     if (version === 1 && mdhd.byteLength >= 44) {
       const timescale = view.getUint32(28);
       const duration = view.getUint32(32) * 2 ** 32 + view.getUint32(36);
-      if (timescale > 0 && duration > 0) {
-        return duration / timescale;
-      }
+      if (timescale > 0 && duration > 0) return duration / timescale;
     }
     if (version === 0 && mdhd.byteLength >= 32) {
       const timescale = view.getUint32(20);
       const duration = view.getUint32(24);
-      if (timescale > 0 && duration > 0) {
-        return duration / timescale;
-      }
+      if (timescale > 0 && duration > 0) return duration / timescale;
     }
   }
-
   const mvhd = findFirstBox(moovBytes, ['mvhd']);
-  if (!mvhd || mvhd.byteLength < 28) {
-    return undefined;
-  }
+  if (!mvhd || mvhd.byteLength < 28) return undefined;
   const version = mvhd[8];
   const view = new DataView(mvhd.buffer, mvhd.byteOffset, mvhd.byteLength);
   if (version === 1 && mvhd.byteLength >= 40) {
@@ -247,432 +241,284 @@ function readMp4DurationSeconds(audio: Blob, fileName: string, bytes: Uint8Array
   return timescale > 0 && duration > 0 ? duration / timescale : undefined;
 }
 
-function buildChunkPlan(audio: Blob, durationSec?: number): ChunkPlan {
-  const byteDrivenCount = Math.max(1, Math.ceil(audio.size / MAX_TRANSCRIPTION_BYTES));
-  const durationDrivenCount = durationSec ? Math.max(1, Math.ceil(durationSec / TARGET_CHUNK_DURATION_SEC)) : 1;
-  const chunkCount = Math.max(byteDrivenCount, durationDrivenCount);
-  const targetMaxBytes = Math.min(MAX_TRANSCRIPTION_BYTES, Math.ceil(audio.size / chunkCount));
-  const targetDurationSec = durationSec ? Math.min(TARGET_CHUNK_DURATION_SEC, durationSec / chunkCount) : TARGET_CHUNK_DURATION_SEC;
+function inspectWav(bytes: Uint8Array): Pick<SourceAudioMetadata, 'durationSec' | 'sampleRate' | 'channels' | 'codec' | 'container'> | null {
+  if (bytes.byteLength < WAV_HEADER_BYTES || readAscii(bytes, 0, 4) !== 'RIFF' || readAscii(bytes, 8, 4) !== 'WAVE') return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const channels = view.getUint16(22, true);
+  const sampleRate = view.getUint32(24, true);
+  const bitsPerSample = view.getUint16(34, true);
+  const dataBytes = view.getUint32(40, true);
+  const blockAlign = Math.max(1, (channels * bitsPerSample) / 8);
+  const durationSec = sampleRate > 0 ? dataBytes / blockAlign / sampleRate : undefined;
+  return { durationSec, sampleRate, channels, codec: 'pcm_s16le', container: 'wav' };
+}
 
+async function inspectSourceAudio(audio: Blob, fileName: string): Promise<SourceAudioMetadata> {
+  const bytes = new Uint8Array(await audio.arrayBuffer());
+  const extension = extensionForFileName(fileName);
+  const wav = inspectWav(bytes);
+  if (wav) return { fileName, extension: '.wav', mimeType: audio.type || 'audio/wav', bytes: audio.size, ...wav };
+  const durationSec = readMp4DurationSeconds(fileName, bytes);
   return {
-    chunkCount,
-    targetMaxBytes: Math.max(1, targetMaxBytes),
-    targetDurationSec,
+    fileName,
+    extension,
+    mimeType: audio.type || (extension === '.m4a' || extension === '.mp4' ? 'audio/mp4' : 'application/octet-stream'),
+    bytes: audio.size,
+    container: extension === '.m4a' || extension === '.mp4' ? 'm4a' : 'unknown',
+    codec: extension === '.m4a' || extension === '.mp4' ? 'aac-lc' : 'unknown',
     durationSec,
   };
 }
 
-function estimatedDurationSecForRange(totalDurationSec: number | undefined, partBytes: number, totalBytes: number): number {
-  if (!totalDurationSec || totalBytes <= 0) {
-    return 0;
+export function createChunkPlan(sourceDurationSec: number | undefined, sourceBytes: number): ChunkPlan {
+  const needsDurationSplit = Boolean(sourceDurationSec && sourceDurationSec > TARGET_CHUNK_DURATION_SEC);
+  const needsSizeSplit = sourceBytes > MAX_TRANSCRIPTION_BYTES;
+  if (!needsDurationSplit && !needsSizeSplit) {
+    return { requiresSplit: false, entries: [{ chunkIndex: 0, chunkCount: 1, startOffsetMs: 0, endOffsetMs: Math.round((sourceDurationSec ?? 0) * 1000), estimatedDurationSec: sourceDurationSec ?? 0 }] };
   }
-  return Math.round((partBytes / totalBytes) * totalDurationSec * 1000) / 1000;
+
+  const durationCount = sourceDurationSec ? Math.ceil(sourceDurationSec / TARGET_CHUNK_DURATION_SEC) : 1;
+  const sizeCount = Math.ceil(sourceBytes / MAX_TRANSCRIPTION_BYTES);
+  const chunkCount = Math.max(1, durationCount, sizeCount);
+  const sourceDurationMs = Math.round((sourceDurationSec ?? TARGET_CHUNK_DURATION_SEC * chunkCount) * 1000);
+  const entries: ChunkPlanEntry[] = [];
+  for (let index = 0; index < chunkCount; index += 1) {
+    const startOffsetMs = Math.floor((sourceDurationMs * index) / chunkCount);
+    const endOffsetMs = index === chunkCount - 1 ? sourceDurationMs : Math.floor((sourceDurationMs * (index + 1)) / chunkCount);
+    entries.push({ chunkIndex: index, chunkCount, startOffsetMs, endOffsetMs, estimatedDurationSec: Math.max(0.001, (endOffsetMs - startOffsetMs) / 1000) });
+  }
+  return { requiresSplit: true, entries };
 }
 
-function buildBlobSliceChunks(audio: Blob, fileName: string, plan: ChunkPlan): TranscriptionChunk[] {
-  const chunks: Omit<TranscriptionChunk, 'chunkCount' | 'chunkIndex'>[] = [];
-  let offset = 0;
-  let startOffsetMs = 0;
-
-  while (offset < audio.size) {
-    const blob = audio.slice(offset, Math.min(offset + plan.targetMaxBytes, audio.size), audio.type);
-    const estimatedDurationSec = estimatedDurationSecForRange(plan.durationSec, blob.size, audio.size);
-    chunks.push({
-      blob,
-      fileName: fileNameForChunk(fileName, chunks.length),
-      strategy: chunks.length === 0 && blob.size === audio.size ? 'single' : 'blob-slice',
-      startOffsetMs,
-      estimatedDurationSec,
-    });
-    startOffsetMs += Math.round(estimatedDurationSec * 1000);
-    offset += blob.size;
-  }
-
-  return finalizeChunks(chunks);
+function encodeWavPcm16(samples: Int16Array, sampleRate: number, channels: number): Uint8Array {
+  const dataBytes = samples.byteLength;
+  const buffer = new ArrayBuffer(WAV_HEADER_BYTES + dataBytes);
+  const view = new DataView(buffer);
+  const out = new Uint8Array(buffer);
+  const write = (offset: number, text: string) => { for (let i = 0; i < text.length; i += 1) out[offset + i] = text.charCodeAt(i); };
+  write(0, 'RIFF'); view.setUint32(4, 36 + dataBytes, true); write(8, 'WAVE'); write(12, 'fmt ');
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, channels, true); view.setUint32(24, sampleRate, true);
+  const byteRate = sampleRate * channels * 2; view.setUint32(28, byteRate, true); view.setUint16(32, channels * 2, true); view.setUint16(34, 16, true); write(36, 'data');
+  view.setUint32(40, dataBytes, true); out.set(new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength), WAV_HEADER_BYTES);
+  return out;
 }
 
-async function splitFragmentedMp4Blob(audio: Blob, fileName: string, plan: ChunkPlan, bytes: Uint8Array): Promise<TranscriptionChunk[] | null> {
-  const boxes = readMp4TopLevelBoxes(bytes);
-  const initBoxes = boxes.filter((box) => box.type === 'ftyp' || box.type === 'moov');
-  const mediaBoxes = boxes.filter((box) => box.type !== 'ftyp' && box.type !== 'moov');
-
-  if (!initBoxes.length || !mediaBoxes.some((box) => box.type === 'moof')) {
-    return null;
-  }
-
-  const initBytes = concatUint8Arrays(initBoxes.map((box) => bytes.slice(box.start, box.end)));
-  if (initBytes.byteLength >= MAX_TRANSCRIPTION_BYTES || initBytes.byteLength >= plan.targetMaxBytes) {
-    return null;
-  }
-
-  const chunks: Omit<TranscriptionChunk, 'chunkCount' | 'chunkIndex'>[] = [];
-  let currentParts: Uint8Array[] = [initBytes];
-  let currentBytes = initBytes.byteLength;
-  let currentStartMediaOffset = mediaBoxes[0]?.start ?? 0;
-
-  for (const box of mediaBoxes) {
-    const boxBytes = bytes.slice(box.start, box.end);
-    const wouldExceed = currentBytes + boxBytes.byteLength > plan.targetMaxBytes;
-
-    if (wouldExceed && currentParts.length > 1) {
-      const mediaBytes = currentBytes - initBytes.byteLength;
-      const startRatio = currentStartMediaOffset / Math.max(1, audio.size);
-      chunks.push({
-        blob: new Blob(currentParts.map(toOwnedArrayBuffer), { type: audio.type || 'audio/mp4' }),
-        fileName: fileNameForChunk(fileName, chunks.length),
-        strategy: 'mp4-fragmented',
-        startOffsetMs: Math.round((plan.durationSec ?? 0) * startRatio * 1000),
-        estimatedDurationSec: estimatedDurationSecForRange(plan.durationSec, mediaBytes, audio.size),
-      });
-      currentParts = [initBytes, boxBytes];
-      currentBytes = initBytes.byteLength + boxBytes.byteLength;
-      currentStartMediaOffset = box.start;
-      continue;
-    }
-
-    if (wouldExceed && currentParts.length === 1) {
-      return null;
-    }
-
-    currentParts.push(boxBytes);
-    currentBytes += boxBytes.byteLength;
-  }
-
-  if (currentParts.length > 1) {
-    const mediaBytes = currentBytes - initBytes.byteLength;
-    const startRatio = currentStartMediaOffset / Math.max(1, audio.size);
-    chunks.push({
-      blob: new Blob(currentParts.map(toOwnedArrayBuffer), { type: audio.type || 'audio/mp4' }),
-      fileName: fileNameForChunk(fileName, chunks.length),
-      strategy: 'mp4-fragmented',
-      startOffsetMs: Math.round((plan.durationSec ?? 0) * startRatio * 1000),
-      estimatedDurationSec: estimatedDurationSecForRange(plan.durationSec, mediaBytes, audio.size),
-    });
-  }
-
-  return chunks.length ? finalizeChunks(chunks) : null;
+async function generateChunkFromWav(source: Blob, sourceMeta: SourceAudioMetadata, plan: ChunkPlanEntry, format: AudioFormat): Promise<PreparedTranscriptionChunk> {
+  const bytes = new Uint8Array(await source.arrayBuffer());
+  const wav = inspectWav(bytes);
+  if (!wav?.sampleRate || !wav.channels) throw new Error('WAV metadata is incomplete.');
+  const bytesPerSampleFrame = wav.channels * 2;
+  const frameStart = Math.floor((plan.startOffsetMs / 1000) * wav.sampleRate);
+  const frameEnd = Math.max(frameStart + 1, Math.floor((plan.endOffsetMs / 1000) * wav.sampleRate));
+  const sampleStart = frameStart * wav.channels;
+  const sampleEnd = frameEnd * wav.channels;
+  const pcm = new Int16Array(bytes.buffer.slice(WAV_HEADER_BYTES));
+  const trimmed = pcm.slice(sampleStart, Math.min(sampleEnd, pcm.length));
+  if (trimmed.byteLength === 0) throw new Error('Trimmed WAV chunk is empty.');
+  const encodedBytes = encodeWavPcm16(trimmed, wav.sampleRate, wav.channels);
+  const actualDurationSec = trimmed.length / wav.channels / wav.sampleRate;
+  const chosenFormat: AudioFormat = 'wav';
+  return {
+    blob: new Blob([new Uint8Array(encodedBytes)], { type: mimeTypeForFormat(chosenFormat) }),
+    fileName: fileNameForChunk(sourceMeta.fileName, plan.chunkIndex, chosenFormat),
+    extension: '.wav',
+    mimeType: mimeTypeForFormat(chosenFormat),
+    bytes: encodedBytes.byteLength,
+    codec: codecForFormat(chosenFormat),
+    container: containerForFormat(chosenFormat),
+    sampleRate: wav.sampleRate,
+    channels: wav.channels,
+    estimatedDurationSec: plan.estimatedDurationSec,
+    actualDurationSec,
+    strategy: 'fallback-pcm-wav',
+    validationPassed: false,
+    validationErrors: [],
+    chunkIndex: plan.chunkIndex,
+    chunkCount: plan.chunkCount,
+    startOffsetMs: plan.startOffsetMs,
+    endOffsetMs: plan.endOffsetMs,
+  };
 }
 
-async function splitMp4AudioBlob(audio: Blob, fileName: string, plan: ChunkPlan, bytes: Uint8Array): Promise<TranscriptionChunk[] | null> {
-  const boxes = readMp4TopLevelBoxes(bytes);
-  const ftyp = boxes.find((box) => box.type === 'ftyp');
-  const moov = boxes.find((box) => box.type === 'moov');
-  const mdat = boxes.find((box) => box.type === 'mdat');
+const defaultChunkGenerator: AudioChunkGenerator = async (source, sourceMeta, plan, options) => {
+  if (sourceMeta.container === 'wav') return generateChunkFromWav(source, sourceMeta, plan, options.preferredFormat);
+  throw new Error(`Safe decode -> trim -> re-encode chunk generation is unavailable for ${sourceMeta.container} in this runtime.`);
+};
 
-  if (!ftyp || !moov || !mdat || ftyp.start !== 0) {
-    return null;
-  }
-
-  const header = concatUint8Arrays([bytes.slice(ftyp.start, ftyp.end), bytes.slice(moov.start, moov.end)]);
-  const mdatPayload = bytes.slice(mdat.start + MP4_BOX_HEADER_BYTES, mdat.end);
-  const maxPayloadBytes = Math.min(MAX_TRANSCRIPTION_BYTES, plan.targetMaxBytes) - header.byteLength - MP4_BOX_HEADER_BYTES;
-
-  if (maxPayloadBytes <= 0) {
-    throw new HttpError('Split configuration failed because MP4 headers already exceed the transcription size budget.', 500, {
-      fileName,
-      headerBytes: header.byteLength,
-      targetMaxBytes: plan.targetMaxBytes,
-      maxTranscriptionBytes: MAX_TRANSCRIPTION_BYTES,
-    });
-  }
-
-  const chunks: Omit<TranscriptionChunk, 'chunkCount' | 'chunkIndex'>[] = [];
-  let offset = 0;
-
-  while (offset < mdatPayload.byteLength) {
-    const payloadSlice = mdatPayload.slice(offset, Math.min(offset + maxPayloadBytes, mdatPayload.byteLength));
-    const mdatHeader = new Uint8Array(MP4_BOX_HEADER_BYTES);
-    new DataView(mdatHeader.buffer).setUint32(0, payloadSlice.byteLength + MP4_BOX_HEADER_BYTES);
-    mdatHeader.set(textEncoder.encode('mdat'), 4);
-
-    const chunkBytes = concatUint8Arrays([header, mdatHeader, payloadSlice]);
-    chunks.push({
-      blob: new Blob([toOwnedArrayBuffer(chunkBytes)], { type: audio.type || 'audio/mp4' }),
-      fileName: fileNameForChunk(fileName, chunks.length),
-      strategy: 'mp4-rewrapped',
-      startOffsetMs: Math.round(((plan.durationSec ?? 0) * offset) / Math.max(1, mdatPayload.byteLength) * 1000),
-      estimatedDurationSec: estimatedDurationSecForRange(plan.durationSec, payloadSlice.byteLength, mdatPayload.byteLength),
-    });
-    offset += payloadSlice.byteLength;
-  }
-
-  return finalizeChunks(chunks);
-}
-
-async function buildTranscriptionChunks(audio: Blob, fileName: string): Promise<{ chunks: TranscriptionChunk[]; durationSec?: number; strategyReason: string }> {
-  if (audio.size <= MAX_TRANSCRIPTION_BYTES && extensionForFileName(fileName) !== '.m4a' && extensionForFileName(fileName) !== '.mp4') {
-    return {
-      chunks: [{
-        blob: audio,
-        fileName,
-        strategy: 'single',
-        chunkIndex: 0,
-        chunkCount: 1,
-        startOffsetMs: 0,
-        estimatedDurationSec: 0,
-      }],
-      strategyReason: 'single-no-duration-metadata',
-    };
-  }
-
-  const bytes = new Uint8Array(await audio.arrayBuffer());
-  const durationSec = readMp4DurationSeconds(audio, fileName, bytes);
-  const plan = buildChunkPlan(audio, durationSec);
-  const requiresDurationSplit = Boolean(durationSec && durationSec > TARGET_CHUNK_DURATION_SEC);
-  const requiresSizeSplit = audio.size > MAX_TRANSCRIPTION_BYTES;
-
-  if (!requiresDurationSplit && !requiresSizeSplit) {
-    return {
-      chunks: [{
-        blob: audio,
-        fileName,
-        strategy: 'single',
-        chunkIndex: 0,
-        chunkCount: 1,
-        startOffsetMs: 0,
-        estimatedDurationSec: durationSec ?? 0,
-      }],
-      durationSec,
-      strategyReason: durationSec ? 'single-with-duration-metadata' : 'single-under-budgets',
-    };
-  }
-
-  const extension = extensionForFileName(fileName);
-  if (extension === '.m4a' || extension === '.mp4') {
-    const fragmentedChunks = await splitFragmentedMp4Blob(audio, fileName, plan, bytes);
-    if (fragmentedChunks?.length) {
-      return { chunks: fragmentedChunks, durationSec, strategyReason: 'mp4-fragmented-duration-or-size-split' };
-    }
-
-    const mp4Chunks = await splitMp4AudioBlob(audio, fileName, plan, bytes);
-    if (mp4Chunks?.length) {
-      return { chunks: mp4Chunks, durationSec, strategyReason: 'mp4-rewrapped-duration-or-size-split' };
-    }
-  }
-
-  return { chunks: buildBlobSliceChunks(audio, fileName, plan), durationSec, strategyReason: 'fallback-blob-slice' };
+export function validateChunk(chunk: PreparedTranscriptionChunk): PreparedTranscriptionChunk {
+  const errors: string[] = [];
+  if (chunk.bytes <= 0) errors.push('bytes must be > 0');
+  const duration = chunk.actualDurationSec ?? chunk.estimatedDurationSec;
+  if (!duration || duration <= 0) errors.push('duration must be > 0');
+  if ((chunk.extension === '.wav' && chunk.mimeType !== 'audio/wav') || (chunk.extension === '.m4a' && chunk.mimeType !== 'audio/mp4')) errors.push('extension and mimeType mismatch');
+  if (chunk.codec === 'unknown' || chunk.container === 'unknown') errors.push('codec/container metadata missing');
+  if (chunk.blob.size <= 0) errors.push('chunk blob is empty');
+  return { ...chunk, validationPassed: errors.length === 0, validationErrors: errors };
 }
 
 function getChunkDurationMs(result: TranscriptResult, fallbackDurationSec: number): number {
   const segmentEndMs = result.segments.reduce((max, segment) => Math.max(max, segment.endMs ?? segment.startMs ?? 0), 0);
-  if (segmentEndMs > 0) {
-    return segmentEndMs;
-  }
-  return Math.round(fallbackDurationSec * 1000);
+  return segmentEndMs > 0 ? segmentEndMs : Math.round(fallbackDurationSec * 1000);
 }
 
 function applyOffsetToTranscript(result: TranscriptResult, offsetMs: number): TranscriptResult {
-  if (!offsetMs) {
-    return result;
-  }
-
-  return {
-    ...result,
-    segments: result.segments.map((segment) => ({
-      ...segment,
-      startMs: segment.startMs !== undefined ? segment.startMs + offsetMs : undefined,
-      endMs: segment.endMs !== undefined ? segment.endMs + offsetMs : undefined,
-    })),
-  };
+  if (!offsetMs) return result;
+  return { ...result, segments: result.segments.map((segment) => ({ ...segment, startMs: segment.startMs !== undefined ? segment.startMs + offsetMs : undefined, endMs: segment.endMs !== undefined ? segment.endMs + offsetMs : undefined })) };
 }
 
 function mergeTranscriptResults(results: TranscriptResult[]): TranscriptResult {
-  const segments: TranscriptSegment[] = [];
-  const texts: string[] = [];
-
-  for (const result of results) {
-    if (result.fullText.trim()) {
-      texts.push(result.fullText.trim());
-    }
-    segments.push(...result.segments);
-  }
-
-  const fullText = texts.join('\n\n').trim() || segments.map((segment) => `[${segment.speaker}] ${segment.text}`.trim()).join('\n');
-  return {
-    fullText,
-    segments,
-    raw: results.map((result) => result.raw),
-  };
+  const ordered = [...results].sort((a, b) => (a.segments[0]?.startMs ?? 0) - (b.segments[0]?.startMs ?? 0));
+  const segments = ordered.flatMap((result) => result.segments);
+  const texts = ordered.map((result) => result.fullText.trim()).filter(Boolean);
+  return { fullText: texts.join('\n\n').trim() || segments.map((segment) => `[${segment.speaker}] ${segment.text}`.trim()).join('\n'), segments, raw: ordered.map((result) => result.raw) };
 }
 
-async function transcribeChunk(
-  env: Env,
-  chunk: TranscriptionChunk,
-  languageHint?: string,
-): Promise<TranscriptResult> {
+function parseOpenAiFailure(responseText: string): UploadFailure {
+  try {
+    const parsed = JSON.parse(responseText) as { error?: { type?: string; code?: string; param?: string; message?: string } };
+    return { responseText, type: parsed.error?.type, code: parsed.error?.code, param: parsed.error?.param };
+  } catch {
+    return { responseText };
+  }
+}
+
+function shouldFallbackToWav(error: unknown): boolean {
+  if (!ENABLE_AUDIO_FALLBACK || !(error instanceof HttpError)) return false;
+  const details = (error.details ?? {}) as UploadFailure;
+  const responseText = details.responseText ?? '';
+  return details.responseStatus !== undefined
+    && details.responseStatus >= 400
+    && details.responseStatus < 500
+    && (details.param === 'file' || /corrupted|unsupported|invalid_value|file/i.test(responseText));
+}
+
+async function uploadPreparedChunk(env: Env, chunk: PreparedTranscriptionChunk, languageHint?: string): Promise<TranscriptResult> {
   const model = env.OPENAI_MODEL_TRANSCRIBE ?? DEFAULT_TRANSCRIBE_MODEL;
   const form = new FormData();
   form.append('file', chunk.blob, chunk.fileName);
   form.append('model', model);
   form.append('response_format', 'diarized_json');
   form.append('chunking_strategy', 'auto');
-
-  if (languageHint) {
-    form.append('language', languageHint);
-  }
-
-  const response = await fetch(`${OPENAI_API}/audio/transcriptions`, {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${env.OPENAI_API_KEY}`,
-    },
-    body: form,
-  });
-
+  if (languageHint) form.append('language', languageHint);
+  const response = await fetch(`${OPENAI_API}/audio/transcriptions`, { method: 'POST', headers: { authorization: `Bearer ${env.OPENAI_API_KEY}` }, body: form });
   if (!response.ok) {
     const responseText = await readResponseTextSafely(response);
-    console.error('openai.transcription.failed', {
-      fileName: chunk.fileName,
-      bytes: chunk.blob.size,
-      model,
-      strategy: chunk.strategy,
-      chunkIndex: chunk.chunkIndex + 1,
-      chunkCount: chunk.chunkCount,
-      startOffsetMs: chunk.startOffsetMs,
-      estimatedDurationSec: chunk.estimatedDurationSec,
-      responseStatus: response.status,
-      responseText,
-    });
-    throw new HttpError('OpenAI transcription request failed.', 502, {
-      fileName: chunk.fileName,
-      bytes: chunk.blob.size,
-      model,
-      strategy: chunk.strategy,
-      chunkIndex: chunk.chunkIndex + 1,
-      chunkCount: chunk.chunkCount,
-      startOffsetMs: chunk.startOffsetMs,
-      estimatedDurationSec: chunk.estimatedDurationSec,
-      responseStatus: response.status,
-      responseText,
-    });
+    const parsed = parseOpenAiFailure(responseText);
+    structuredLog('error', 'upload request failed', { fileName: chunk.fileName, chunkIndex: chunk.chunkIndex + 1, chunkCount: chunk.chunkCount, strategy: chunk.strategy, format: chunk.extension, responseStatus: response.status, responseText });
+    throw new HttpError('OpenAI transcription request failed.', 502, { ...parsed, responseStatus: response.status, fileName: chunk.fileName, chunkIndex: chunk.chunkIndex + 1, chunkCount: chunk.chunkCount, strategy: chunk.strategy, format: chunk.extension });
   }
-
   return mapTranscriptPayload((await response.json()) as OpenAiDiarizedTranscript);
 }
 
-export async function transcribeWithDiarization(
-  env: Env,
-  audio: Blob,
-  fileName: string,
-  languageHint?: string,
-): Promise<TranscriptResult> {
-  const { chunks, durationSec, strategyReason } = await buildTranscriptionChunks(audio, fileName);
+async function transcribeChunkWithFallback(env: Env, source: Blob, sourceMeta: SourceAudioMetadata, plan: ChunkPlanEntry, languageHint: string | undefined, chunkGenerator: AudioChunkGenerator, uploadChunk: UploadChunkFn): Promise<TranscriptResult> {
+  let chunk = validateChunk(await chunkGenerator(source, sourceMeta, plan, { preferredFormat: PRIMARY_AUDIO_FORMAT }));
+  if (!chunk.validationPassed) throw new HttpError('chunk validation failed', 500, { fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, strategy: chunk.strategy, format: chunk.extension, validationErrors: chunk.validationErrors });
+  structuredLog('info', 'openai.transcription.chunk', buildChunkLogMeta(sourceMeta, chunk));
+  try {
+    return await uploadChunk(env, chunk, languageHint);
+  } catch (error) {
+    if (!shouldFallbackToWav(error) || chunk.extension === '.wav') throw error;
+    structuredLog('warn', 'chunk upload failed with m4a, fallback to wav', { fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, details: error instanceof HttpError ? error.details : error });
+    const fallbackChunk = validateChunk(await chunkGenerator(source, sourceMeta, plan, { preferredFormat: FALLBACK_AUDIO_FORMAT }));
+    if (!fallbackChunk.validationPassed) throw new HttpError('chunk validation failed', 500, { fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, strategy: fallbackChunk.strategy, format: fallbackChunk.extension, validationErrors: fallbackChunk.validationErrors });
+    structuredLog('info', 'fallback wav upload started', buildChunkLogMeta(sourceMeta, fallbackChunk));
+    try {
+      const result = await uploadChunk(env, fallbackChunk, languageHint);
+      structuredLog('info', 'fallback wav upload succeeded', { fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount });
+      return result;
+    } catch (fallbackError) {
+      structuredLog('error', 'fallback wav upload failed', { fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, details: fallbackError instanceof HttpError ? fallbackError.details : fallbackError });
+      throw fallbackError;
+    }
+  }
+}
+
+export function buildChunkLogMeta(sourceMeta: SourceAudioMetadata, chunk: PreparedTranscriptionChunk): Record<string, unknown> {
+  return {
+    sourceFileName: sourceMeta.fileName,
+    sourceDurationSec: sourceMeta.durationSec,
+    sourceBytes: sourceMeta.bytes,
+    chunkIndex: chunk.chunkIndex + 1,
+    chunkCount: chunk.chunkCount,
+    startOffsetMs: chunk.startOffsetMs,
+    estimatedDurationSec: chunk.estimatedDurationSec,
+    bytes: chunk.bytes,
+    extension: chunk.extension,
+    mimeType: chunk.mimeType,
+    codec: chunk.codec,
+    container: chunk.container,
+    sampleRate: chunk.sampleRate,
+    channels: chunk.channels,
+    strategy: chunk.strategy,
+    validationPassed: chunk.validationPassed,
+  };
+}
+
+export async function transcribeWithDiarization(env: Env, audio: Blob, fileName: string, languageHint?: string, deps: { chunkGenerator?: AudioChunkGenerator; uploadChunk?: UploadChunkFn } = {}): Promise<TranscriptResult> {
+  const chunkGenerator = deps.chunkGenerator ?? defaultChunkGenerator;
+  const uploadChunk = deps.uploadChunk ?? uploadPreparedChunk;
+
+  let sourceMeta: SourceAudioMetadata;
+  try {
+    sourceMeta = await inspectSourceAudio(audio, fileName);
+  } catch (error) {
+    structuredLog('error', 'source file inspection failed', { fileName, details: error instanceof Error ? error.message : error });
+    throw new HttpError('source file inspection failed', 500, { fileName, cause: error instanceof Error ? error.message : error });
+  }
+
+  let plan: ChunkPlan;
+  try {
+    plan = createChunkPlan(sourceMeta.durationSec, sourceMeta.bytes);
+  } catch (error) {
+    structuredLog('error', 'chunk plan creation failed', { fileName, details: error instanceof Error ? error.message : error });
+    throw new HttpError('chunk plan creation failed', 500, { fileName, cause: error instanceof Error ? error.message : error });
+  }
+
+  structuredLog('info', 'openai.transcription.plan', { fileName, sourceDurationSec: sourceMeta.durationSec, sourceBytes: sourceMeta.bytes, chunkCount: plan.entries.length, targetChunkDurationSec: TARGET_CHUNK_DURATION_SEC, maxModelDurationSec: MAX_TRANSCRIBE_DURATION_SEC, primaryAudioFormat: PRIMARY_AUDIO_FORMAT, fallbackAudioFormat: FALLBACK_AUDIO_FORMAT });
+
+  if (!plan.requiresSplit) {
+    const chunk = validateChunk({ blob: audio, fileName, extension: sourceMeta.extension || extensionForFileName(fileName), mimeType: sourceMeta.mimeType, bytes: sourceMeta.bytes, codec: sourceMeta.codec, container: sourceMeta.container, sampleRate: sourceMeta.sampleRate, channels: sourceMeta.channels, estimatedDurationSec: sourceMeta.durationSec ?? 0, actualDurationSec: sourceMeta.durationSec, strategy: 'single-original', validationPassed: false, validationErrors: [], chunkIndex: 0, chunkCount: 1, startOffsetMs: 0, endOffsetMs: Math.round((sourceMeta.durationSec ?? 0) * 1000) });
+    if (!chunk.validationPassed) throw new HttpError('chunk validation failed', 500, { fileName, chunkIndex: 1, chunkCount: 1, strategy: chunk.strategy, format: chunk.extension, validationErrors: chunk.validationErrors });
+    structuredLog('info', 'openai.transcription.chunk', buildChunkLogMeta(sourceMeta, chunk));
+    return uploadChunk(env, chunk, languageHint);
+  }
+
   const results: TranscriptResult[] = [];
   let accumulatedOffsetMs = 0;
-
-  console.log('openai.transcription.plan', {
-    fileName,
-    bytes: audio.size,
-    durationSec,
-    strategyReason,
-    chunkCount: chunks.length,
-    targetChunkDurationSec: TARGET_CHUNK_DURATION_SEC,
-    maxModelDurationSec: MAX_MODEL_DURATION_SEC,
-  });
-
-  for (const chunk of chunks) {
-    console.log('openai.transcription.chunk', {
-      chunkIndex: chunk.chunkIndex + 1,
-      chunkCount: chunk.chunkCount,
-      bytes: chunk.blob.size,
-      strategy: chunk.strategy,
-      fileName: chunk.fileName,
-      startOffsetMs: chunk.startOffsetMs,
-      estimatedDurationSec: chunk.estimatedDurationSec,
-      sourceBytes: audio.size,
-      sourceDurationSec: durationSec,
-    });
-
+  for (const entry of plan.entries) {
     try {
-      const chunkResult = await transcribeChunk(env, chunk, languageHint);
-      const normalizedResult = applyOffsetToTranscript(chunkResult, accumulatedOffsetMs || chunk.startOffsetMs);
-      results.push(normalizedResult);
-      accumulatedOffsetMs = (accumulatedOffsetMs || chunk.startOffsetMs) + getChunkDurationMs(chunkResult, chunk.estimatedDurationSec);
+      const result = await transcribeChunkWithFallback(env, audio, sourceMeta, entry, languageHint, chunkGenerator, uploadChunk);
+      const baseOffset = accumulatedOffsetMs || entry.startOffsetMs;
+      results.push(applyOffsetToTranscript(result, baseOffset));
+      accumulatedOffsetMs = baseOffset + getChunkDurationMs(result, entry.estimatedDurationSec);
     } catch (error) {
-      throw new HttpError('Transcription request failed.', 502, {
-        chunkIndex: chunk.chunkIndex + 1,
-        chunkCount: chunk.chunkCount,
-        fileName: chunk.fileName,
-        bytes: chunk.blob.size,
-        strategy: chunk.strategy,
-        startOffsetMs: chunk.startOffsetMs,
-        estimatedDurationSec: chunk.estimatedDurationSec,
-        sourceDurationSec: durationSec,
-        sourceBytes: audio.size,
-        cause: error instanceof HttpError ? error.details : error instanceof Error ? error.message : error,
-      });
+      const details = error instanceof HttpError ? error.details : error instanceof Error ? error.message : error;
+      structuredLog('error', 'OpenAI returned 4xx/5xx', { fileName, chunkIndex: entry.chunkIndex + 1, chunkCount: entry.chunkCount, details });
+      throw new HttpError('Transcription request failed.', 502, { fileName, chunkIndex: entry.chunkIndex + 1, chunkCount: entry.chunkCount, sourceDurationSec: sourceMeta.durationSec, sourceBytes: sourceMeta.bytes, cause: details });
     }
   }
 
-  return mergeTranscriptResults(results);
+  try {
+    return mergeTranscriptResults(results);
+  } catch (error) {
+    structuredLog('error', 'transcription merge failed', { fileName, details: error instanceof Error ? error.message : error });
+    throw new HttpError('transcription merge failed', 500, { fileName, cause: error instanceof Error ? error.message : error });
+  }
 }
 
 export async function summarizeInterview(env: Env, transcript: TranscriptResult): Promise<InterviewInsights> {
   const response = await fetch(`${OPENAI_API}/responses`, {
     method: 'POST',
-    headers: {
-      authorization: `Bearer ${env.OPENAI_API_KEY}`,
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: env.OPENAI_MODEL_SUMMARIZE ?? 'gpt-4.1-mini',
-      input: [
-        {
-          role: 'system',
-          content: [
-            {
-              type: 'input_text',
-              text: [
-                'You extract structured interview notes.',
-                'Return strict JSON with keys: summary, myTasks, otherTasks, ambiguities.',
-                'myTasks and otherTasks must be string arrays.',
-                'If task ownership is unclear, do not guess and instead explain it in ambiguities.',
-              ].join(' '),
-            },
-          ],
-        },
-        {
-          role: 'user',
-          content: [{ type: 'input_text', text: transcript.fullText }],
-        },
-      ],
-      text: {
-        format: {
-          type: 'json_schema',
-          name: 'interview_insights',
-          schema: {
-            type: 'object',
-            additionalProperties: false,
-            required: ['summary', 'myTasks', 'otherTasks', 'ambiguities'],
-            properties: {
-              summary: { type: 'string' },
-              myTasks: { type: 'array', items: { type: 'string' } },
-              otherTasks: { type: 'array', items: { type: 'string' } },
-              ambiguities: { type: 'array', items: { type: 'string' } },
-            },
-          },
-        },
-      },
-    }),
+    headers: { authorization: `Bearer ${env.OPENAI_API_KEY}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ model: env.OPENAI_MODEL_SUMMARIZE ?? 'gpt-4.1-mini', input: [{ role: 'system', content: [{ type: 'input_text', text: ['You extract structured interview notes.', 'Return strict JSON with keys: summary, myTasks, otherTasks, ambiguities.', 'myTasks and otherTasks must be string arrays.', 'If task ownership is unclear, do not guess and instead explain it in ambiguities.'].join(' ') }] }, { role: 'user', content: [{ type: 'input_text', text: transcript.fullText }] }], text: { format: { type: 'json_schema', name: 'interview_insights', schema: { type: 'object', additionalProperties: false, required: ['summary', 'myTasks', 'otherTasks', 'ambiguities'], properties: { summary: { type: 'string' }, myTasks: { type: 'array', items: { type: 'string' } }, otherTasks: { type: 'array', items: { type: 'string' } }, ambiguities: { type: 'array', items: { type: 'string' } } } } } } }),
   });
-
   if (!response.ok) {
     const responseText = await readResponseTextSafely(response);
-    console.error('openai.summary.failed', {
-      responseStatus: response.status,
-      responseText,
-    });
-    throw new HttpError('Summary generation failed.', 502, {
-      responseStatus: response.status,
-      responseText,
-    });
+    console.error('openai.summary.failed', { responseStatus: response.status, responseText });
+    throw new HttpError('Summary generation failed.', 502, { responseStatus: response.status, responseText });
   }
-
   const payload = (await response.json()) as { output_text?: string };
-  if (!payload.output_text) {
-    throw new HttpError('Summary response did not include output_text.', 502, payload);
-  }
-
+  if (!payload.output_text) throw new HttpError('Summary response did not include output_text.', 502, payload);
   const parsed = JSON.parse(payload.output_text) as Omit<InterviewInsights, 'raw'>;
   return { ...parsed, raw: payload };
 }
