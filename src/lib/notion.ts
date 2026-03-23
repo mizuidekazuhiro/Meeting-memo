@@ -144,7 +144,6 @@ function buildProperties(record: InterviewRecord) {
       title: titleText(record.title),
     },
     Source: { rich_text: richText(record.request.source ?? 'Interview') },
-    },
     'Record Type': {
       select: { name: 'Interview Memo' },
     },
