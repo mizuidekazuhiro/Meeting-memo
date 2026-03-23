@@ -25,7 +25,11 @@ async function processInterviewRecord(
     record.processingStatus = 'completed';
   } catch (error) {
     record.processingStatus = 'error';
-    record.errorMessage = error instanceof Error ? error.message : 'Unknown processing error';
+    const stage = error instanceof HttpError && typeof error.details === 'object' && error.details && 'responseStatus' in (error.details as Record<string, unknown>)
+      ? 'openai'
+      : 'processing';
+    const baseMessage = error instanceof Error ? error.message : 'Unknown processing error';
+    record.errorMessage = `[${stage}] ${baseMessage}`;
     console.error('interviews.process.processing_failed', {
       fileName: request.fileName ?? metadata.name,
       dropboxFileId: metadata.id,
