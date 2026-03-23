@@ -198,6 +198,29 @@ export function buildTranscriptBlocks(record: InterviewRecord): NotionBlockInput
   ];
 }
 
+export async function upsertInterviewFromTranscript(
+  env: Env,
+  request: InterviewRecord['request'],
+  metadata: InterviewRecord['metadata'],
+  transcript: InterviewRecord['transcript'],
+): Promise<{ pageId?: string; created?: boolean; record: InterviewRecord }> {
+  const recordedAt = request.recordedAt ?? metadata.server_modified ?? metadata.client_modified ?? new Date().toISOString();
+  const date = new Date(recordedAt);
+  const safeDate = Number.isNaN(date.valueOf()) ? new Date().toISOString().slice(0, 10) : date.toISOString().slice(0, 10);
+  const record: InterviewRecord = {
+    title: request.fileName ? `Interview Memo ${safeDate} - ${request.fileName}` : `Interview Memo ${safeDate} - ${metadata.name}`,
+    dedupKey: metadata.id ? `dropbox:id:${metadata.id}` : `fallback:${metadata.name}`,
+    metadata: { ...metadata, shared_link: request.dropboxSharedLink },
+    request,
+    transcript,
+    processingStatus: 'transcribed',
+  };
+  const existing = await findExistingInterview(env, [record.dedupKey]);
+  const result = await upsertInterviewPage(env, record, existing);
+  record.processingStatus = 'persisted';
+  return { ...result, record };
+}
+
 async function appendBlockChildren(env: Env, blockId: string, children: NotionBlockInput[]): Promise<void> {
   for (let index = 0; index < children.length; index += 100) {
     await notionFetch(env, `/blocks/${blockId}/children`, {

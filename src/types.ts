@@ -14,6 +14,9 @@ export interface Env {
   OPENAI_API_KEY: string;
   OPENAI_MODEL_TRANSCRIBE?: string;
   OPENAI_MODEL_SUMMARIZE?: string;
+  CLOUD_RUN_TRANSCRIBE_ENDPOINT?: string;
+  CLOUD_RUN_SHARED_SECRET?: string;
+  WORKERS_CALLBACK_BASE_URL?: string;
 }
 
 export interface IntakeRequest {
@@ -96,7 +99,7 @@ export interface InterviewRecord {
   transcript?: TranscriptResult;
   insights?: InterviewInsights;
   request: IntakeRequest;
-  processingStatus: 'pending' | 'completed' | 'error';
+  processingStatus: 'pending' | 'transcribing' | 'transcribed' | 'completed' | 'persisted' | 'error';
   errorMessage?: string;
 }
 
@@ -107,4 +110,41 @@ export interface ProcessInterviewResult {
   created?: boolean;
   dedupCandidates: string[];
   record?: InterviewRecord;
+}
+
+export type RecordingJobStatus =
+  | 'uploaded'
+  | 'queued'
+  | 'transcoding'
+  | 'transcribing'
+  | 'transcribed'
+  | 'persisted'
+  | 'failed';
+
+export interface RecordingJob {
+  recordingId: string;
+  fileName: string;
+  dropboxFileId: string;
+  dropboxPathLower?: string;
+  sourceBytes?: number;
+  sourceDurationSec?: number;
+  uploadSource: 'shortcut';
+  status: RecordingJobStatus;
+  retryCount: number;
+  createdAt: string;
+  updatedAt: string;
+  clientModified?: string;
+  serverModified?: string;
+  request: IntakeRequest;
+  transcript?: TranscriptResult;
+  errorMessage?: string;
+}
+
+export interface RecordingJobCallbackPayload {
+  recordingId: string;
+  dropboxFileId: string;
+  dropboxPathLower?: string;
+  fileName: string;
+  sourceDurationSec?: number;
+  transcript: TranscriptResult;
 }
