@@ -13,8 +13,8 @@ Cloudflare Workers ベースの Meeting-memo です。iPhoneショートカッ�
 3. Worker が受信した音声を Dropbox App Folder 内の `DROPBOX_UPLOAD_FOLDER` に保存する。
 4. Worker が Dropbox から保存済みファイルを取得する。
 5. OpenAI Audio API へ **話者分離つき transcription** を実行する。
-   - 24MB 以下ならそのまま送信
-   - 24MB 超なら Worker 側で自動分割して順番に送信
+   - 24MB 以下かつ 1200 秒以下ならそのまま送信
+   - 24MB 超または 1400 秒超なら Worker 側で自動分割して順番に送信
 6. 分割結果を再結合して 1 つの transcript にまとめる。
 7. 要約を生成し、Notion ページを dedup / upsert しつつ本文の Transcript ブロックも更新する。
 
@@ -82,33 +82,38 @@ Dropbox App Folder の root を `path: ""` で列挙する切り分け用 endpoi
 
 ---
 
-## 25MB 超ファイル時の分割戦略
+## 25MB 超ファイル時 / 1400 秒超音声時の分割戦略
 
-OpenAI 側のサイズ制限を超える音声でも落ちないように、Worker では **24MB を安全上限** として扱います。
+OpenAI の diarization モデルは長尺音声で duration 制限があるため、Worker では **24MB を安全上限** にしつつ、**1 chunk あたり 1200 秒以下を目安**に自動分割します。25MB 未満でも duration 超過なら分割対象です。
 
 ### 基本方針
 
-- `24MB 以下`: そのまま 1 回で transcription
+- `24MB 以下` かつ `1200 秒以下`: そのまま 1 回で transcription
 - `24MB 超`: 自動分割して chunk 単位で順番に transcription
+- `1400 秒超`: サイズに関係なく自動分割して chunk 単位で順番に transcription
 - chunk の transcript / segments を再結合して、最終的に **1 つの `TranscriptResult`** にまとめる
 
 ### 分割の優先順位
 
-1. **fragmented MP4 / M4A を top-level box 単位で分割**
+1. **標準 MP4 / M4A から duration を取得して chunk plan を作成**
+   - `mdhd` / `mvhd` から総 duration を読み取り、size 制限と duration 制限の両方で chunk 数を決める
+   - `gpt-4o-transcribe-diarize` の上限 1400 秒より余裕を持たせ、**1 chunk あたり 1200 秒以下**を目標にする
+2. **fragmented MP4 / M4A を top-level box 単位で分割**
    - `ftyp` / `moov` を初期化セクションとして保持
-   - `moof` / `mdat` などの media boxes を 24MB 以内でまとめる
+   - `moof` / `mdat` などの media boxes を duration/size plan に合わせてまとめる
    - 可能な限りコンテナ境界を壊さない方針
-2. **通常 MP4 / M4A の `mdat` 再ラップ分割**
-   - `ftyp` + `moov` を保持し、`mdat` payload を安全サイズに分割
-   - Cloudflare Workers 上で ffmpeg 非依存で実装できる現実的なフォールバック
-3. **最終フォールバックとして `Blob.slice()`**
+3. **通常 MP4 / M4A の `mdat` 再ラップ分割**
+   - `ftyp` + `moov` を保持し、`mdat` payload を chunk plan に従って再ラップする
+   - Workers 上で ffmpeg 非依存のまま、自動処理を継続できる現実的な実装
+4. **最終フォールバックとして `Blob.slice()`**
    - MP4/M4A 以外や、コンテナ解析が難しいファイルで使用
 
 ### 注意点
 
 - Cloudflare Workers 上では ffmpeg のような本格的なメディア再エンコードを前提にしていません。
 - そのため **「まず壊れにくい方法を試し、難しいケースではサイズ優先のフォールバックに落とす」** 実装です。
-- 各 chunk の処理では `chunkIndex`, `chunkCount`, `bytes`, `strategy`, `fileName` を Workers Logs に出します。
+- 各 chunk の処理では `chunkIndex`, `chunkCount`, `bytes`, `strategy`, `fileName`, `startOffsetMs`, `estimatedDurationSec` を Workers Logs に出します。
+- chunk の diarization result は chunk offset を加算して全体の `startMs` / `endMs` に補正したうえで再結合します。
 
 ---
 
@@ -168,6 +173,7 @@ Workers Logs では主に以下のイベント名で追えます。
 - `interviews.upload.processing_failed`
 - `interviews.process.processing_failed`
 - `interviews.process.notion_failed`
+- `openai.transcription.plan`
 - `openai.transcription.chunk`
 - `openai.transcription.failed`
 - `openai.summary.failed`
@@ -184,7 +190,8 @@ Cloudflare Dashboard の Worker から **Logs** を開き、以下を確認し�
   - OpenAI summary
   - Notion upsert
 - `details.responseText` が残っているか
-- transcription chunk ログの `strategy` と `bytes`
+- transcription chunk ログの `strategy`, `bytes`, `startOffsetMs`, `estimatedDurationSec`
+- duration が 1400 秒を超えていないか、plan ログの `durationSec` と `chunkCount`
 - 失敗した場合の `chunkIndex` / `chunkCount`
 
 OpenAI の失敗時は、レスポンス本文を `responseText` として残す実装にしています。
@@ -208,12 +215,13 @@ OpenAI の失敗時は、レスポンス本文を `responseText` として残す
 - `OPENAI_MODEL_TRANSCRIBE` が diarization モデルになっているか
 - chunk ログでどの chunk が失敗したか
 
-### 3. 25MB 超ファイルが途中で失敗する
+### 3. 25MB 超ファイル / 1400 秒超音声が途中で失敗する
 
 確認ポイント:
-- `openai.transcription.chunk`
+- `openai.transcription.plan` と `openai.transcription.chunk`
 - `strategy` が `mp4-fragmented`, `mp4-rewrapped`, `blob-slice` のどれになったか
 - 特定 chunk の `bytes` が安全上限を超えていないか
+- `durationSec`, `startOffsetMs`, `estimatedDurationSec` から duration 分割が効いているか
 
 ### 4. Notion にはページができるが Transcript が本文に出ない
 
@@ -257,6 +265,7 @@ OpenAI の失敗時は、レスポンス本文を `responseText` として残す
 - `file`: 音声ファイル本体
 - `recordedAt`: 例 `2026-03-22T09:30:00+09:00`
 - `languageHint`: `ja`
+- `source`: `iPhone Shortcut`
 - `participants`: `[
   "me",
   "customer"
