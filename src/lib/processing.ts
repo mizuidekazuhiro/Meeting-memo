@@ -14,17 +14,35 @@ export function shouldAttemptDirectWorkerTranscription(metadata: DropboxFileMeta
   return durationSec !== undefined && durationSec <= MAX_TRANSCRIBE_DURATION_SEC;
 }
 
+function resolvePythonTranscribeDispatchUrl(baseUrl: string | undefined): string {
+  if (!baseUrl) {
+    throw new HttpError(
+      'Python transcribe API URL is not configured. Set PYTHON_TRANSCRIBE_API_URL to the base URL of the Python service, for example https://your-service.example.com',
+      500,
+    );
+  }
+  const normalized = baseUrl.trim().replace(/\/$/, '');
+  if (!normalized) {
+    throw new HttpError(
+      'Python transcribe API URL is not configured. Set PYTHON_TRANSCRIBE_API_URL to the base URL of the Python service, for example https://your-service.example.com',
+      500,
+    );
+  }
+  return `${normalized}/jobs/transcribe`;
+}
+
 export async function dispatchLongAudioJob(env: Env, job: RecordingJob, metadata: DropboxFileMetadata): Promise<void> {
-  if (!env.PYTHON_TRANSCRIBE_API_URL) throw new HttpError('Python transcribe API URL is not configured.', 500);
+  const dispatchUrl = resolvePythonTranscribeDispatchUrl(env.PYTHON_TRANSCRIBE_API_URL);
+
   logEvent('info', 'python service dispatch started', {
     recordingId: job.recordingId,
     fileName: job.fileName,
     dropboxFileId: job.dropboxFileId,
     dropboxPathLower: job.dropboxPathLower,
-    details: { dispatchUrl: env.PYTHON_TRANSCRIBE_API_URL },
+    details: { dispatchUrl },
   });
 
-  const response = await fetch(`${env.PYTHON_TRANSCRIBE_API_URL.replace(/\/$/, '')}/jobs/transcribe`, {
+  const response = await fetch(dispatchUrl, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -36,6 +54,7 @@ export async function dispatchLongAudioJob(env: Env, job: RecordingJob, metadata
       dropboxPathLower: metadata.path_lower,
       fileName: metadata.name,
       sourceBytes: metadata.size,
+      sourceDurationSec: job.sourceDurationSec,
       client_modified: metadata.client_modified,
       server_modified: metadata.server_modified,
       request: job.request,
