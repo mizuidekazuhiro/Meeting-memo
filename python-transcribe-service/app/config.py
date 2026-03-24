@@ -1,0 +1,14 @@
+from __future__ import annotations
+
+import os
+
+MAX_TRANSCRIBE_DURATION_SEC = int(os.getenv('MAX_TRANSCRIBE_DURATION_SEC', '1400'))
+TARGET_CHUNK_DURATION_SEC = int(os.getenv('TARGET_CHUNK_DURATION_SEC', '720'))
+PRIMARY_AUDIO_FORMAT = os.getenv('PRIMARY_AUDIO_FORMAT', 'm4a')
+FALLBACK_AUDIO_FORMAT = os.getenv('FALLBACK_AUDIO_FORMAT', 'wav')
+ENABLE_AUDIO_FALLBACK = os.getenv('ENABLE_AUDIO_FALLBACK', 'true').lower() == 'true'
+FFMPEG_PATH = os.getenv('FFMPEG_PATH', 'ffmpeg')
+FFPROBE_PATH = os.getenv('FFPROBE_PATH', 'ffprobe')
+TMP_DIR = os.getenv('TMP_DIR', '/tmp')
+WORKERS_CALLBACK_URL = os.getenv('WORKERS_CALLBACK_URL')
+WORKERS_CALLBACK_TOKEN = os.getenv('WORKERS_CALLBACK_TOKEN', '')

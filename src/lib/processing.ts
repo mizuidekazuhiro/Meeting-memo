@@ -15,13 +15,20 @@ export function shouldAttemptDirectWorkerTranscription(metadata: DropboxFileMeta
 }
 
 export async function dispatchLongAudioJob(env: Env, job: RecordingJob, metadata: DropboxFileMetadata): Promise<void> {
-  if (!env.CLOUD_RUN_TRANSCRIBE_ENDPOINT) throw new HttpError('Cloud Run endpoint is not configured.', 500);
-  logEvent('info', 'transcoding dispatch started', { recordingId: job.recordingId, fileName: job.fileName, dropboxFileId: job.dropboxFileId, dropboxPathLower: job.dropboxPathLower });
-  const response = await fetch(env.CLOUD_RUN_TRANSCRIBE_ENDPOINT, {
+  if (!env.PYTHON_TRANSCRIBE_API_URL) throw new HttpError('Python transcribe API URL is not configured.', 500);
+  logEvent('info', 'python service dispatch started', {
+    recordingId: job.recordingId,
+    fileName: job.fileName,
+    dropboxFileId: job.dropboxFileId,
+    dropboxPathLower: job.dropboxPathLower,
+    details: { dispatchUrl: env.PYTHON_TRANSCRIBE_API_URL },
+  });
+
+  const response = await fetch(`${env.PYTHON_TRANSCRIBE_API_URL.replace(/\/$/, '')}/jobs/transcribe`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'x-service-auth': env.CLOUD_RUN_SHARED_SECRET ?? '',
+      authorization: `Bearer ${env.PYTHON_TRANSCRIBE_API_TOKEN ?? ''}`,
     },
     body: JSON.stringify({
       recordingId: job.recordingId,
@@ -35,9 +42,17 @@ export async function dispatchLongAudioJob(env: Env, job: RecordingJob, metadata
       callbackUrl: env.WORKERS_CALLBACK_BASE_URL ? `${env.WORKERS_CALLBACK_BASE_URL}/api/interviews/transcription-callback` : undefined,
     }),
   });
+
   if (!response.ok) {
     const responseText = await response.text();
-    throw new HttpError('Cloud Run dispatch failed.', 502, { responseStatus: response.status, responseText });
+    logEvent('error', 'python service dispatch failed', {
+      recordingId: job.recordingId,
+      fileName: job.fileName,
+      dropboxFileId: job.dropboxFileId,
+      dropboxPathLower: job.dropboxPathLower,
+      details: { responseStatus: response.status, responseText },
+    });
+    throw new HttpError('Python API dispatch failed.', 502, { responseStatus: response.status, responseText });
   }
 }
 
@@ -57,26 +72,43 @@ export async function processUploadedInterview(env: Env, request: IntakeRequest,
 
     if (shouldAttemptDirectWorkerTranscription(metadata, durationSec)) {
       await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'transcribing');
-      const transcript = await transcribeWithDiarization(env, audio, metadata.name, request.languageHint, { recordingId: job.recordingId, dropboxFileId: job.dropboxFileId, dropboxPathLower: job.dropboxPathLower });
+      const transcript = await transcribeWithDiarization(env, audio, metadata.name, request.languageHint, {
+        recordingId: job.recordingId,
+        dropboxFileId: job.dropboxFileId,
+        dropboxPathLower: job.dropboxPathLower,
+      });
       await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'transcribed', { transcript });
       const persisted = await upsertInterviewFromTranscript(env, request, metadata, transcript);
       await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'persisted');
-      return { action: 'processed', reason: 'Processed in Workers and persisted to Notion.', pageId: persisted.pageId, created: persisted.created, dedupCandidates, record: persisted.record };
+      return {
+        action: 'processed',
+        reason: 'Processed in Workers and persisted to Notion.',
+        pageId: persisted.pageId,
+        created: persisted.created,
+        dedupCandidates,
+        record: persisted.record,
+      };
     }
 
     await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'transcoding', { sourceDurationSec: durationSec });
     await dispatchLongAudioJob(env, job, metadata);
-    return { action: 'processed', reason: 'Long audio delegated to Cloud Run.', dedupCandidates };
+    return { action: 'processed', reason: 'Long audio delegated to Python transcription API service.', dedupCandidates };
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown processing error';
     await markJobFailed(env, { recordingId: job.recordingId }, message);
-    logEvent('error', 'processing pipeline failed', { recordingId: job.recordingId, fileName: job.fileName, dropboxFileId: job.dropboxFileId, dropboxPathLower: job.dropboxPathLower, details: error instanceof HttpError ? error.details : message });
+    logEvent('error', 'processing pipeline failed', {
+      recordingId: job.recordingId,
+      fileName: job.fileName,
+      dropboxFileId: job.dropboxFileId,
+      dropboxPathLower: job.dropboxPathLower,
+      details: error instanceof HttpError ? error.details : message,
+    });
     if (error instanceof HttpError) throw error;
     throw new HttpError(message, 500, error);
   }
 }
 
-export async function persistCloudRunCallback(env: Env, payload: RecordingJobCallbackPayload): Promise<ProcessInterviewResult> {
+export async function persistTranscriptionCallback(env: Env, payload: RecordingJobCallbackPayload): Promise<ProcessInterviewResult> {
   const job = await getRecordingJob(env, { recordingId: payload.recordingId, dropboxFileId: payload.dropboxFileId });
   if (!job) throw new HttpError('Recording job not found for callback.', 404, payload);
   const metadata: DropboxFileMetadata = {
@@ -88,13 +120,29 @@ export async function persistCloudRunCallback(env: Env, payload: RecordingJobCal
     server_modified: job.serverModified,
   };
   try {
-    await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'transcribed', { transcript: payload.transcript, sourceDurationSec: payload.sourceDurationSec });
+    await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'transcribed', {
+      transcript: payload.transcript,
+      sourceDurationSec: payload.sourceDurationSec,
+    });
     const persisted = await upsertInterviewFromTranscript(env, job.request, metadata, payload.transcript);
     await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'persisted');
-    return { action: 'processed', reason: 'Cloud Run callback persisted to Notion.', pageId: persisted.pageId, created: persisted.created, dedupCandidates: buildDedupCandidates(job.request, metadata), record: persisted.record };
+    return {
+      action: 'processed',
+      reason: 'Python API callback persisted to Notion.',
+      pageId: persisted.pageId,
+      created: persisted.created,
+      dedupCandidates: buildDedupCandidates(job.request, metadata),
+      record: persisted.record,
+    };
   } catch (error) {
     await markJobFailed(env, { recordingId: job.recordingId }, error instanceof Error ? error.message : 'callback failed');
-    logEvent('error', 'callback failed', { recordingId: job.recordingId, fileName: job.fileName, dropboxFileId: job.dropboxFileId, dropboxPathLower: job.dropboxPathLower, details: error instanceof HttpError ? error.details : error });
+    logEvent('error', 'callback failed', {
+      recordingId: job.recordingId,
+      fileName: job.fileName,
+      dropboxFileId: job.dropboxFileId,
+      dropboxPathLower: job.dropboxPathLower,
+      details: error instanceof HttpError ? error.details : error,
+    });
     throw error;
   }
 }

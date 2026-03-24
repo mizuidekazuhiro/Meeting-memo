@@ -11,7 +11,7 @@ import { HttpError, jsonResponse, parseJson } from './lib/http';
 import { processInterviewFromMetadata } from './lib/interviews';
 import { createRecordingJob, getRecordingJob, upsertRecordingJob } from './lib/jobs';
 import { logEvent } from './lib/logger';
-import { persistCloudRunCallback, processUploadedInterview } from './lib/processing';
+import { persistTranscriptionCallback, processUploadedInterview } from './lib/processing';
 import { requireWebhookSecret } from './lib/security';
 import type { Env, IntakeRequest, RecordingJobCallbackPayload, ScanRequest, UploadRequestMetadata } from './types';
 
@@ -182,7 +182,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
 async function handleTranscriptionCallback(request: Request, env: Env): Promise<Response> {
   requireWebhookSecret(request, env.INTERVIEW_WEBHOOK_SECRET);
   const payload = await parseJson<RecordingJobCallbackPayload>(request);
-  const result = await persistCloudRunCallback(env, payload);
+  const result = await persistTranscriptionCallback(env, payload);
   return jsonResponse({ ok: result.action === 'processed', action: result.action, reason: result.reason, pageId: result.pageId, created: result.created });
 }
 
