@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 
 import { createRecordingJob, getRecordingJob, upsertRecordingJob } from '../src/lib/jobs';
-import { mergeTranscriptResultsInOrder } from '../src/lib/cloud-run-plan';
+import { mergeTranscriptResultsInOrder } from '../src/lib/transcript-merge';
 import { shouldAttemptDirectWorkerTranscription } from '../src/lib/processing';
 
 const env = {} as any;
@@ -45,7 +45,7 @@ test('long duration files are delegated away from Workers', () => {
   assert.equal(shouldAttemptDirectWorkerTranscription({ name: 'unknown.m4a' }, undefined), false);
 });
 
-test('cloud run transcript merge preserves chunkIndex order and offsets', () => {
+test('python api transcript merge preserves chunkIndex order and offsets', () => {
   const merged = mergeTranscriptResultsInOrder([
     { chunkIndex: 1, startOffsetMs: 600000, transcript: { fullText: 'second', segments: [{ speaker: 'spk2', startMs: 0, endMs: 1000, text: 'second' }], raw: { idx: 1 } } },
     { chunkIndex: 0, startOffsetMs: 0, transcript: { fullText: 'first', segments: [{ speaker: 'spk1', startMs: 0, endMs: 1000, text: 'first' }], raw: { idx: 0 } } },
