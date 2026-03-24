@@ -1,139 +1,103 @@
 # Meeting-memo
 
-Meeting-memo は、**iPhone ショートカットで選んだ音声ファイルを Cloudflare Workers に送信し、Dropbox に保存し、その後に文字起こし・Notion 保存を行う**リポジトリです。
+Meeting-memo は **同一レポ（monorepo）運用のまま**、
+**Shortcut -> Workers -> Dropbox** を維持して動かす構成です。
 
-## 変わらないユーザー操作フロー（最重要）
+## このリポジトリで維持する設計（重要）
 
-この導線は変更していません。
-
-1. iPhone ショートカットで音声ファイルを選択
-2. ショートカットが Workers の既存 API `POST /api/interviews/upload` を呼ぶ
-3. Workers が Dropbox に元ファイルを保存
-
-つまり **Shortcut -> Workers -> Dropbox** はそのままです。
-
----
-
-## 今回の修正の要点
-
-長時間 `.m4a` の分割・再エンコードは Workers では実行せず、**独立した Python API サービス**に委譲します。
-
-### 新しい後段フロー
-
-1. Shortcut -> Workers -> Dropbox
-2. Workers が Dropbox upload 成功レスポンスから metadata を即時記録
-3. Workers が recording job を作成（探索待ちしない）
-4. 長時間・不明 duration の音声は Python API へ dispatch
-5. Python API が Dropbox から直接取得して `ffprobe` / `ffmpeg` で安全分割
-6. Python API が `gpt-4o-transcribe-diarize` に順次送信
-7. Python API が chunkIndex 順に transcript を結合して Workers callback
-8. Workers が Notion 保存し、状態を `transcribed -> persisted` に更新
+- レポは分離しない（Workers と Python API を同一レポで管理）
+- ユーザー導線は変更しない（Shortcut -> Workers -> Dropbox）
+- 主処理起点は Dropbox 保存成功時 metadata（scan 依存にしない）
+- 長時間 `.m4a` を Workers で unsafe chunking しない
+- mp4-rewrapped を使わない
+- 後段 Python サービスが `ffprobe` / `ffmpeg` / OpenAI diarized transcription を担当
+- Workers は callback を受けて Notion 保存
 
 ---
 
-## Dropbox metadata 起点（探索依存しない）
+## 現在のエラーと原因
 
-Workers は upload 成功直後に次を確定情報として記録します。
+エラー:
 
-- `dropboxFileId`
-- `dropboxPathLower`
-- `fileName`
-- `size`
-- `client_modified`
-- `server_modified`
+`Python transcribe API URL is not configured.`
 
-この metadata を主処理の起点にするため、**Dropbox scan が無くても処理対象を確定**できます。
+原因:
 
-`list_folder` / `list_folder_continue` は補助用途（再同期・復旧・手動再処理・整合確認）のみです。
+- Workers 側 `PYTHON_TRANSCRIBE_API_URL` が未設定
+- または Python API 実体が未起動 / 未デプロイ
 
----
+本リポジトリではエラーメッセージを次に統一しています。
 
-## Workers で禁止していること
+`Python transcribe API URL is not configured. Set PYTHON_TRANSCRIBE_API_URL to the base URL of the Python service, for example https://your-service.example.com`
 
-長時間 `.m4a` に対して以下は禁止です。
-
-- `mp4-rewrapped`
-- byte range split
-- container rewrap
-- unsafe chunking
-- runtime 非対応なのに Workers 内で再エンコード続行
+> `PYTHON_TRANSCRIBE_API_URL` は **ベースURL**（例: `https://your-service.example.com`）を設定します。Workers 側が `/jobs/transcribe` を付与します。
 
 ---
 
-## Python API サービス（`python-transcribe-service/`）
+## 全体フロー
 
-FastAPI ベースの独立 API として実装しています（Cloud Run 前提ではありません）。
-
-### 必須エンドポイント
-
-- `POST /jobs/transcribe` : Workers -> Python 起動
-- `POST /api/interviews/transcription-callback` : Python -> Workers callback（Workers 側）
-
-### 主な責務
-
-- Dropbox API から対象ファイルを直接ダウンロード
-- `ffprobe` で duration / codec / sample rate / channels 取得
-- `decode -> trim -> re-encode` で 600〜720 秒の chunk 生成
-- chunk validation（bytes / duration / codec/container / 拡張子整合）
-- `gpt-4o-transcribe-diarize` へ順次送信
-- m4a 失敗時のみ wav fallback を 1 回だけ実施
-- transcript を chunkIndex 順で統合して callback
-
-### 依存関係
-
-- FastAPI
-- uvicorn
-- pydub
-- ffmpeg / ffprobe
-- openai Python SDK
-- httpx
+1. Shortcut が `POST /api/interviews/upload` を呼ぶ
+2. Workers が Dropbox に保存
+3. Dropbox upload 成功 metadata（`dropboxFileId`, `dropboxPathLower`, `fileName`, `size` など）で recording job を作成
+4. Workers が duration を判定
+   - 短時間: Workers 内で既存処理を継続
+   - 長時間 / 安全判定不能: Python API へ委譲
+5. Python API が Dropbox から直接取得、`ffprobe` / `ffmpeg` で安全分割
+6. Python API が `gpt-4o-transcribe-diarize` へ chunkIndex 順に送信
+7. Python API が transcript を chunkIndex 順で結合して Workers callback
+8. Workers が Notion に保存
 
 ---
 
-## 状態管理
+## Python API（同一レポ内）
 
-Recording job は最低限この状態を持ちます。
+実体は `python-transcribe-service/` 配下です。
 
-- `uploaded`
-- `queued`
-- `transcoding`
-- `transcribed`
-- `persisted`
-- `failed`
+- `GET /health`
+- `POST /jobs/transcribe`（Bearer token 対応）
 
-重複排除は次の優先順です。
+`POST /jobs/transcribe` 必須:
 
-1. `dropboxFileId`
-2. `recordingId`
-3. `dropboxPathLower`（補助）
-
-**`path_lower` 単独の一意判定はしません。**
+- `recordingId`
+- `dropboxFileId` または `dropboxPathLower` の少なくとも片方
 
 ---
 
-## 設定値一覧
+## セットアップ手順（初心者向け）
+
+1. **python-transcribe-service を起動**
+   - `cd python-transcribe-service`
+   - `cp .env.example .env`
+   - 必須 env を埋める（OpenAI / Dropbox / callback / token）
+   - `uvicorn main:app --host 0.0.0.0 --port 8000`
+2. **公開 URL を取得**（Cloud Run / Railway / Fly.io / ngrok など）
+3. **Workers に `PYTHON_TRANSCRIBE_API_URL` を設定**
+   - 例: `https://your-service.example.com`
+4. 必要なら **Workers に `PYTHON_TRANSCRIBE_API_TOKEN` を設定**
+5. Python 側 `API_TOKEN` と Workers 側 `PYTHON_TRANSCRIBE_API_TOKEN` を一致させる
+
+---
+
+## 環境変数
 
 ### Workers 側
 
-- `PYTHON_TRANSCRIBE_API_URL`
+- `PYTHON_TRANSCRIBE_API_URL`（ベースURL）
 - `PYTHON_TRANSCRIBE_API_TOKEN`
-- `WORKERS_CALLBACK_BASE_URL`
-- `DROPBOX_ACCESS_TOKEN` または `DROPBOX_APP_KEY` + `DROPBOX_APP_SECRET` + `DROPBOX_REFRESH_TOKEN`
-- `OPENAI_API_KEY`
-- `NOTION_TOKEN`
-- `INBOX_DB_ID`
-- `MAX_TRANSCRIBE_DURATION_SEC`
-- `TARGET_CHUNK_DURATION_SEC`
+- 既存 Dropbox / OpenAI / Notion 関連 env
 
 ### Python API 側
 
-- `PYTHON_TRANSCRIBE_API_TOKEN`
-- `DROPBOX_ACCESS_TOKEN` または `DROPBOX_APP_KEY` + `DROPBOX_APP_SECRET` + `DROPBOX_REFRESH_TOKEN`
+- `API_TOKEN`
 - `OPENAI_API_KEY`
+- `DROPBOX_ACCESS_TOKEN`
+- `DROPBOX_REFRESH_TOKEN`
+- `DROPBOX_APP_KEY`
+- `DROPBOX_APP_SECRET`
 - `WORKERS_CALLBACK_URL`
 - `WORKERS_CALLBACK_TOKEN`
-- `MAX_TRANSCRIBE_DURATION_SEC`
 - `TARGET_CHUNK_DURATION_SEC`
+- `MAX_TRANSCRIBE_DURATION_SEC`
 - `PRIMARY_AUDIO_FORMAT`
 - `FALLBACK_AUDIO_FORMAT`
 - `ENABLE_AUDIO_FALLBACK`
@@ -143,36 +107,31 @@ Recording job は最低限この状態を持ちます。
 
 ---
 
-## 障害切り分け（長時間音声）
+## ffmpeg / ffprobe について
 
-次の順にログを確認してください。
+Python API 実行環境には `ffmpeg` と `ffprobe` が必要です。
 
-1. Dropbox upload failed
-2. Python API dispatch failed
-3. source inspection / ffprobe failed
-4. ffmpeg chunk generation failed
-5. chunk validation failed
-6. OpenAI 4xx/5xx
-7. callback failed
-8. Notion persistence failed
+- 見つからない場合: `ffmpeg not found` / `ffprobe not found`
+- PATH が異なる場合は `FFMPEG_PATH` / `FFPROBE_PATH` を明示
 
-Workers / Python の双方で structured logging（recordingId, fileName, dropboxFileId, dropboxPathLower, details）を出します。
+---
+
+## よくある失敗
+
+- Python API URL 未設定
+- token 不一致
+- ffmpeg not found
+- Dropbox auth failed
+- OpenAI auth failed
 
 ---
 
 ## テスト観点
 
-Workers 側と Python 側で次を確認します。
-
-- upload 後に Dropbox metadata から job 作成
-- Dropbox 探索なしで処理対象確定
-- duration 上限以下は direct path
-- 長時間は Python API に委譲
-- `mp4-rewrapped` を選ばない
-- chunk plan 生成
-- invalid chunk を validation で拒否
-- m4a 失敗時 wav fallback 1 回
-- transcript の chunkIndex 順結合
-- callback 後 Notion 保存導線
-- dropboxFileId ベース重複防止
-- scan/list_folder は補助用途のみ
+- Workers:
+  - `PYTHON_TRANSCRIBE_API_URL` 未設定時のエラーが明確
+- Python API:
+  - `/health`
+  - auth
+  - chunk plan
+  - merge order
