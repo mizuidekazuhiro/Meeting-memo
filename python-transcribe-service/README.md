@@ -45,6 +45,7 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 - `FFMPEG_PATH`
 - `FFPROBE_PATH`
 - `TMP_DIR`
+- `DIARIZATION_CHUNKING_STRATEGY`（diarization transcription 呼び出し時に必須）
 
 ## 実装ポリシー
 
@@ -52,6 +53,7 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 - mp4 rewrap / byte split / unsafe chunking は禁止
 - `decode -> trim -> re-encode`（m4a = AAC-LC、fallback 1回のみ wav）
 - OpenAI model は `gpt-4o-transcribe-diarize` 固定
+- diarization model 呼び出し時は `chunking_strategy` が必須（`DIARIZATION_CHUNKING_STRATEGY` で指定、未設定なら起動後実行時に明示エラー）
 - chunkIndex 順に transcript を merge
 - callback 失敗はログ化するが、transcription 本体成功は失敗扱いにしない（`callbackSucceeded` で返す）
 

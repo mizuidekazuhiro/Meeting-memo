@@ -22,6 +22,7 @@ class Settings:
     ffmpeg_path: str = os.getenv('FFMPEG_PATH', 'ffmpeg')
     ffprobe_path: str = os.getenv('FFPROBE_PATH', 'ffprobe')
     tmp_dir: str = os.getenv('TMP_DIR', '/tmp')
+    diarization_chunking_strategy: str = os.getenv('DIARIZATION_CHUNKING_STRATEGY', 'auto')
 
 
 SETTINGS = Settings()

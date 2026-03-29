@@ -12,6 +12,25 @@ from logging_utils import get_logger, log_event
 from models import TranscriptResult, TranscriptSegment, TranscriptionJobRequest, WorkersCallbackPayload
 
 logger = get_logger()
+DIARIZATION_MODEL = 'gpt-4o-transcribe-diarize'
+DIARIZED_RESPONSE_FORMAT = 'diarized_json'
+
+
+class TranscriptionProcessingError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        source: str,
+        chunk_index: int | None = None,
+        external_status_code: int | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.source = source
+        self.chunk_index = chunk_index
+        self.external_status_code = external_status_code
+        self.context = context or {}
 
 
 def should_fallback(status_code: int, error_text: str) -> bool:
@@ -64,14 +83,56 @@ class TranscriptionService:
     def __init__(self) -> None:
         self.openai = OpenAI(api_key=SETTINGS.openai_api_key)
 
-    def transcribe_file(self, file_path: Path, language_hint: str | None) -> TranscriptResult:
-        with file_path.open('rb') as handle:
-            response = self.openai.audio.transcriptions.create(
-                model='gpt-4o-transcribe-diarize',
-                file=handle,
-                response_format='diarized_json',
-                language=language_hint,
+    def _get_diarization_chunking_strategy(self) -> str:
+        strategy = SETTINGS.diarization_chunking_strategy.strip()
+        if not strategy:
+            raise TranscriptionProcessingError(
+                'DIARIZATION_CHUNKING_STRATEGY must be configured for diarization model transcription',
+                source='configuration',
             )
+        return strategy
+
+    def transcribe_file(self, file_path: Path, language_hint: str | None, chunk_index: int, audio_format: str) -> TranscriptResult:
+        chunking_strategy = self._get_diarization_chunking_strategy()
+        try:
+            with file_path.open('rb') as handle:
+                response = self.openai.audio.transcriptions.create(
+                    model=DIARIZATION_MODEL,
+                    file=handle,
+                    response_format=DIARIZED_RESPONSE_FORMAT,
+                    language=language_hint,
+                    chunking_strategy=chunking_strategy,
+                )
+        except Exception as exc:  # noqa: BLE001
+            status_code = getattr(exc, 'status_code', None)
+            error_text = str(exc)
+            log_event(
+                logger,
+                'error',
+                'openai transcription failed',
+                model=DIARIZATION_MODEL,
+                response_format=DIARIZED_RESPONSE_FORMAT,
+                chunking_strategy=chunking_strategy,
+                chunkIndex=chunk_index,
+                fileName=file_path.name,
+                audioFormat=audio_format,
+                responseStatus=status_code,
+                responseText=error_text,
+            )
+            raise TranscriptionProcessingError(
+                f'Transcription request failed for chunk {chunk_index}: {error_text}',
+                source='openai',
+                chunk_index=chunk_index,
+                external_status_code=status_code,
+                context={
+                    'model': DIARIZATION_MODEL,
+                    'response_format': DIARIZED_RESPONSE_FORMAT,
+                    'chunking_strategy': chunking_strategy,
+                    'file_name': file_path.name,
+                    'audio_format': audio_format,
+                },
+            ) from exc
+
         dumped = response.model_dump() if hasattr(response, 'model_dump') else response
         return parse_transcript_response(dumped)
 
@@ -82,7 +143,7 @@ class TranscriptionService:
 
             source_meta = ffprobe_metadata(source_path)
             if source_meta.duration_sec <= 0:
-                raise RuntimeError('invalid source: duration must be > 0')
+                raise TranscriptionProcessingError('invalid source: duration must be > 0', source='validation')
             plan = build_chunk_plan(source_meta.duration_sec, job.sourceBytes or len(source_bytes))
             results: list[tuple[ChunkPlanEntry, TranscriptResult]] = []
 
@@ -98,23 +159,29 @@ class TranscriptionService:
                     run_ffmpeg_chunk(source_path, output, chunk.start_offset_ms / 1000, chunk.estimated_duration_sec, fmt)
                     ok, details = validate_chunk(output, ext)
                     if not ok:
-                        raise RuntimeError(f'chunk validation failed: {details}')
+                        raise TranscriptionProcessingError(
+                            f'chunk validation failed: {details}',
+                            source='validation',
+                            chunk_index=chunk.chunk_index,
+                            context={'file_name': output.name, 'audio_format': ext},
+                        )
 
                     try:
-                        result = self.transcribe_file(output, job.request.languageHint if job.request else None)
+                        result = self.transcribe_file(output, job.request.languageHint if job.request else None, chunk.chunk_index, ext)
                         results.append((chunk, result))
                         transcribed = True
                         break
-                    except Exception as exc:  # noqa: BLE001
-                        status_code = getattr(exc, 'status_code', 500)
-                        error_text = str(exc)
-                        log_event(logger, 'error', 'openai transcription failed', chunkIndex=chunk.chunk_index, responseStatus=status_code, responseText=error_text)
-                        if index == 0 and fmt == 'm4a' and should_fallback(status_code, error_text):
+                    except TranscriptionProcessingError as exc:
+                        if index == 0 and fmt == 'm4a' and should_fallback(exc.external_status_code or 500, str(exc)):
                             continue
-                        raise RuntimeError(f'Transcription request failed for chunk {chunk.chunk_index}: {error_text}') from exc
+                        raise
 
                 if not transcribed:
-                    raise RuntimeError(f'Unable to transcribe chunk {chunk.chunk_index}')
+                    raise TranscriptionProcessingError(
+                        f'Unable to transcribe chunk {chunk.chunk_index}',
+                        source='openai',
+                        chunk_index=chunk.chunk_index,
+                    )
 
             merged = merge_results(results)
             return WorkersCallbackPayload(
