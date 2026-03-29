@@ -1,11 +1,6 @@
 import pytest
 
-from transcription_service import (
-    TranscriptionProcessingError,
-    normalize_transcription_response,
-    parse_transcript_response,
-    should_fallback,
-)
+from transcription_service import normalize_transcription_response, parse_transcript_response, should_fallback
 
 
 def test_should_fallback_only_for_4xx_file_errors():
@@ -40,5 +35,6 @@ def test_normalize_transcription_response_from_json_string():
 
 
 def test_normalize_transcription_response_rejects_unexpected_types():
-    with pytest.raises(TranscriptionProcessingError):
+    with pytest.raises(RuntimeError) as exc:
         normalize_transcription_response(123)
+    assert 'Unexpected transcription response type: int' in str(exc.value)

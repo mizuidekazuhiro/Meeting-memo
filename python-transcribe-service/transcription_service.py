@@ -79,10 +79,28 @@ def parse_transcript_response(payload: dict[str, Any]) -> TranscriptResult:
 
 def normalize_transcription_response(response: Any) -> dict[str, Any]:
     if isinstance(response, dict):
+        log_event(
+            logger,
+            'debug',
+            'normalizing transcription response',
+            responseType=type(response).__name__,
+            hasModelDump=hasattr(response, 'model_dump'),
+            dumpedType=type(response).__name__,
+            dumpedPreview=repr(response)[:1000],
+        )
         return response
 
     has_model_dump = hasattr(response, 'model_dump')
     dumped = response.model_dump() if has_model_dump else response
+    log_event(
+        logger,
+        'debug',
+        'normalizing transcription response',
+        responseType=type(response).__name__,
+        hasModelDump=has_model_dump,
+        dumpedType=type(dumped).__name__,
+        dumpedPreview=repr(dumped)[:1000],
+    )
 
     if isinstance(dumped, dict):
         return dumped
@@ -102,9 +120,8 @@ def normalize_transcription_response(response: Any) -> dict[str, Any]:
             )
         return parsed
 
-    raise TranscriptionProcessingError(
-        f'Unexpected transcription response type: {type(response).__name__} (dumped={type(dumped).__name__})',
-        source='openai_response',
+    raise RuntimeError(
+        f'Unexpected transcription response type: {type(response).__name__} (dumped={type(dumped).__name__})'
     )
 
 
@@ -184,10 +201,9 @@ class TranscriptionService:
 
         has_model_dump = hasattr(response, 'model_dump')
         dumped = response.model_dump() if has_model_dump else response
-        dumped_preview = dumped if isinstance(dumped, str) else repr(dumped)
         log_event(
             logger,
-            'info',
+            'debug',
             'openai transcription response received',
             model=DIARIZATION_MODEL,
             response_format=DIARIZED_RESPONSE_FORMAT,
@@ -196,9 +212,12 @@ class TranscriptionService:
             responseType=type(response).__name__,
             hasModelDump=has_model_dump,
             dumpedType=type(dumped).__name__,
-            dumpedPreview=dumped_preview[:500],
+            dumpedPreview=repr(dumped)[:1000],
         )
-        payload = normalize_transcription_response(response)
+        try:
+            payload = normalize_transcription_response(response)
+        except RuntimeError as exc:
+            raise TranscriptionProcessingError(str(exc), source='openai_response', chunk_index=chunk_index) from exc
         return parse_transcript_response(payload)
 
     def process(self, job: TranscriptionJobRequest, source_bytes: bytes) -> WorkersCallbackPayload:

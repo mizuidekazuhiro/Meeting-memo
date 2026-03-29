@@ -50,6 +50,27 @@ class _FakeStringOpenAI:
         self.audio = _FakeStringAudio()
 
 
+class _FakeBadResponse:
+    def model_dump(self):
+        return 123
+
+
+class _FakeBadTranscriptions(_FakeTranscriptions):
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return _FakeBadResponse()
+
+
+class _FakeBadAudio:
+    def __init__(self):
+        self.transcriptions = _FakeBadTranscriptions()
+
+
+class _FakeBadOpenAI:
+    def __init__(self):
+        self.audio = _FakeBadAudio()
+
+
 def test_chunk_plan_generation_for_long_audio():
     plan = build_chunk_plan(1800, 1024)
     assert len(plan) == 3
@@ -122,6 +143,30 @@ def test_transcribe_file_raises_when_chunking_strategy_missing(monkeypatch, tmp_
 
     assert 'DIARIZATION_CHUNKING_STRATEGY must be configured' in str(exc.value)
 
+
+
+
+def test_transcribe_file_wraps_normalize_runtime_error(monkeypatch, tmp_path):
+    monkeypatch.setenv('DIARIZATION_CHUNKING_STRATEGY', 'auto')
+
+    import importlib
+    import config
+    import transcription_service
+
+    importlib.reload(config)
+    importlib.reload(transcription_service)
+
+    service = transcription_service.TranscriptionService()
+    service.openai = _FakeBadOpenAI()
+
+    audio_path = tmp_path / 'sample.wav'
+    audio_path.write_bytes(b'RIFF')
+
+    with pytest.raises(transcription_service.TranscriptionProcessingError) as exc:
+        service.transcribe_file(audio_path, language_hint='ja', chunk_index=0, audio_format='wav')
+
+    assert exc.value.source == 'openai_response'
+    assert 'Unexpected transcription response type' in str(exc.value)
 
 def test_transcribe_file_accepts_json_string_payload(monkeypatch, tmp_path):
     monkeypatch.setenv('DIARIZATION_CHUNKING_STRATEGY', 'auto')
