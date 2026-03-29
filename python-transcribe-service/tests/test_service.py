@@ -10,6 +10,11 @@ class _FakeResponse:
         return {'text': 'ok', 'diarized_segments': []}
 
 
+class _FakeStringResponse:
+    def model_dump(self):
+        return '{"text":"ok","diarized_segments":[]}'
+
+
 class _FakeTranscriptions:
     def __init__(self):
         self.calls = []
@@ -17,6 +22,12 @@ class _FakeTranscriptions:
     def create(self, **kwargs):
         self.calls.append(kwargs)
         return _FakeResponse()
+
+
+class _FakeStringTranscriptions(_FakeTranscriptions):
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return _FakeStringResponse()
 
 
 class _FakeAudio:
@@ -27,6 +38,16 @@ class _FakeAudio:
 class _FakeOpenAI:
     def __init__(self):
         self.audio = _FakeAudio()
+
+
+class _FakeStringAudio:
+    def __init__(self):
+        self.transcriptions = _FakeStringTranscriptions()
+
+
+class _FakeStringOpenAI:
+    def __init__(self):
+        self.audio = _FakeStringAudio()
 
 
 def test_chunk_plan_generation_for_long_audio():
@@ -100,3 +121,23 @@ def test_transcribe_file_raises_when_chunking_strategy_missing(monkeypatch, tmp_
         service.transcribe_file(audio_path, language_hint='ja', chunk_index=0, audio_format='wav')
 
     assert 'DIARIZATION_CHUNKING_STRATEGY must be configured' in str(exc.value)
+
+
+def test_transcribe_file_accepts_json_string_payload(monkeypatch, tmp_path):
+    monkeypatch.setenv('DIARIZATION_CHUNKING_STRATEGY', 'auto')
+
+    import importlib
+    import config
+    import transcription_service
+
+    importlib.reload(config)
+    importlib.reload(transcription_service)
+
+    service = transcription_service.TranscriptionService()
+    service.openai = _FakeStringOpenAI()
+
+    audio_path = tmp_path / 'sample.wav'
+    audio_path.write_bytes(b'RIFF')
+
+    result = service.transcribe_file(audio_path, language_hint='ja', chunk_index=0, audio_format='wav')
+    assert result.fullText == 'ok'

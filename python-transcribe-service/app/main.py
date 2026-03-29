@@ -8,7 +8,7 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
 
 from .models import TranscriptionJobRequest
-from .service import PipelineService
+from .service import InputValidationError, PipelineService, UpstreamParseError
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
 app = FastAPI(title='meeting-memo-python-transcribe-service')
@@ -44,7 +44,7 @@ def resolve_dropbox_access_token() -> str:
 def download_dropbox_file(job: TranscriptionJobRequest) -> bytes:
     path = job.dropboxFileId or job.dropboxPathLower
     if not path:
-        raise RuntimeError('dropbox file identity is missing')
+        raise InputValidationError('dropbox file identity is missing')
     token = resolve_dropbox_access_token()
     resp = httpx.post('https://content.dropboxapi.com/2/files/download', headers={'authorization': f'Bearer {token}', 'Dropbox-API-Arg': f'{{"path": "{path}"}}'}, timeout=120)
     resp.raise_for_status()
@@ -62,6 +62,12 @@ def start_job(job: TranscriptionJobRequest) -> dict[str, object]:
         payload = service.process(job, download_dropbox_file)
         service.callback_workers(payload, callback_url=job.callbackUrl)
         return {'ok': True, 'recordingId': payload.recordingId, 'status': 'transcribed'}
+    except (InputValidationError, ValueError) as exc:
+        logging.exception('python transcription pipeline input validation failed')
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (UpstreamParseError, httpx.HTTPStatusError) as exc:
+        logging.exception('python transcription pipeline upstream handling failed')
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         logging.exception('python transcription pipeline failed')
         raise HTTPException(status_code=500, detail=str(exc)) from exc

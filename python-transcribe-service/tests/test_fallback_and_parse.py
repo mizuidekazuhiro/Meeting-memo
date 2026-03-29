@@ -1,4 +1,11 @@
-from transcription_service import parse_transcript_response, should_fallback
+import pytest
+
+from transcription_service import (
+    TranscriptionProcessingError,
+    normalize_transcription_response,
+    parse_transcript_response,
+    should_fallback,
+)
 
 
 def test_should_fallback_only_for_4xx_file_errors():
@@ -25,3 +32,13 @@ def test_parse_diarized_payload_handles_unexpected_shapes():
     result = parse_transcript_response({'text': 'hello', 'diarized_segments': 'unexpected'})
     assert result.fullText == 'hello'
     assert result.segments == []
+
+
+def test_normalize_transcription_response_from_json_string():
+    payload = normalize_transcription_response('{"text":"hello","diarized_segments":[]}')
+    assert payload['text'] == 'hello'
+
+
+def test_normalize_transcription_response_rejects_unexpected_types():
+    with pytest.raises(TranscriptionProcessingError):
+        normalize_transcription_response(123)
