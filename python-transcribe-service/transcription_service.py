@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -76,6 +77,37 @@ def parse_transcript_response(payload: dict[str, Any]) -> TranscriptResult:
     return TranscriptResult(fullText=full_text, segments=segments, raw=payload)
 
 
+def normalize_transcription_response(response: Any) -> dict[str, Any]:
+    if isinstance(response, dict):
+        return response
+
+    has_model_dump = hasattr(response, 'model_dump')
+    dumped = response.model_dump() if has_model_dump else response
+
+    if isinstance(dumped, dict):
+        return dumped
+
+    if isinstance(dumped, str):
+        try:
+            parsed = json.loads(dumped)
+        except json.JSONDecodeError as exc:
+            raise TranscriptionProcessingError(
+                f'Unable to parse transcription response as JSON string: {exc}',
+                source='openai_response',
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise TranscriptionProcessingError(
+                f'Transcription response JSON must be an object, got {type(parsed).__name__}',
+                source='openai_response',
+            )
+        return parsed
+
+    raise TranscriptionProcessingError(
+        f'Unexpected transcription response type: {type(response).__name__} (dumped={type(dumped).__name__})',
+        source='openai_response',
+    )
+
+
 def merge_results(results: list[tuple[ChunkPlanEntry, TranscriptResult]]) -> TranscriptResult:
     ordered = sorted(results, key=lambda item: item[0].chunk_index)
     full_texts: list[str] = []
@@ -150,7 +182,9 @@ class TranscriptionService:
                 },
             ) from exc
 
-        dumped = response.model_dump() if hasattr(response, 'model_dump') else response
+        has_model_dump = hasattr(response, 'model_dump')
+        dumped = response.model_dump() if has_model_dump else response
+        dumped_preview = dumped if isinstance(dumped, str) else repr(dumped)
         log_event(
             logger,
             'info',
@@ -159,9 +193,13 @@ class TranscriptionService:
             response_format=DIARIZED_RESPONSE_FORMAT,
             chunking_strategy=chunking_strategy,
             chunkIndex=chunk_index,
-            responseType=type(dumped).__name__,
+            responseType=type(response).__name__,
+            hasModelDump=has_model_dump,
+            dumpedType=type(dumped).__name__,
+            dumpedPreview=dumped_preview[:500],
         )
-        return parse_transcript_response(dumped)
+        payload = normalize_transcription_response(response)
+        return parse_transcript_response(payload)
 
     def process(self, job: TranscriptionJobRequest, source_bytes: bytes) -> WorkersCallbackPayload:
         with tempfile.TemporaryDirectory(dir=SETTINGS.tmp_dir) as tmp_dir:

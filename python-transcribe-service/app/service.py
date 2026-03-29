@@ -18,6 +18,7 @@ from .config import (
     FALLBACK_AUDIO_FORMAT,
     FFMPEG_PATH,
     FFPROBE_PATH,
+    DIARIZATION_CHUNKING_STRATEGY,
     MAX_TRANSCRIBE_DURATION_SEC,
     PRIMARY_AUDIO_FORMAT,
     TARGET_CHUNK_DURATION_SEC,
@@ -28,6 +29,16 @@ from .config import (
 from .models import TranscriptResult, TranscriptSegment, TranscriptionJobRequest, WorkersCallbackPayload
 
 logger = logging.getLogger('python-transcribe-service')
+DIARIZATION_MODEL = 'gpt-4o-transcribe-diarize'
+DIARIZED_RESPONSE_FORMAT = 'diarized_json'
+
+
+class UpstreamParseError(RuntimeError):
+    """Raised when upstream API succeeded but the response payload cannot be interpreted."""
+
+
+class InputValidationError(RuntimeError):
+    """Raised for invalid input payloads or generated artifacts."""
 
 
 @dataclass
@@ -124,6 +135,35 @@ def parse_transcript_response(payload: dict[str, Any]) -> TranscriptResult:
     return TranscriptResult(fullText=full, segments=segments, raw=payload)
 
 
+def normalize_transcription_response(response: Any) -> dict[str, Any]:
+    if isinstance(response, dict):
+        return response
+
+    if hasattr(response, 'model_dump'):
+        dumped = response.model_dump()
+    else:
+        dumped = response
+
+    if isinstance(dumped, dict):
+        return dumped
+
+    if isinstance(dumped, str):
+        try:
+            parsed = json.loads(dumped)
+        except json.JSONDecodeError as exc:
+            raise UpstreamParseError(f'Failed to parse transcription response string as JSON: {exc}') from exc
+        if not isinstance(parsed, dict):
+            raise UpstreamParseError(
+                f'Expected transcription response JSON object, got {type(parsed).__name__}'
+            )
+        return parsed
+
+    raise UpstreamParseError(
+        f'Unexpected transcription response type: {type(response).__name__} '
+        f'(dumped={type(dumped).__name__})'
+    )
+
+
 def should_fallback(status_code: int, error_text: str) -> bool:
     return ENABLE_AUDIO_FALLBACK and 400 <= status_code < 500 and ('corrupted' in error_text.lower() or 'unsupported' in error_text.lower() or 'file' in error_text.lower())
 
@@ -152,8 +192,32 @@ class PipelineService:
 
     def transcribe_file(self, file_path: Path, language_hint: str | None) -> TranscriptResult:
         with file_path.open('rb') as fh:
-            response = self.openai.audio.transcriptions.create(model='gpt-4o-transcribe-diarize', file=fh, response_format='diarized_json', language=language_hint)
-        return parse_transcript_response(response.model_dump() if hasattr(response, 'model_dump') else response)
+            response = self.openai.audio.transcriptions.create(
+                model=DIARIZATION_MODEL,
+                file=fh,
+                response_format=DIARIZED_RESPONSE_FORMAT,
+                language=language_hint,
+                chunking_strategy=DIARIZATION_CHUNKING_STRATEGY,
+            )
+
+        dumped = response.model_dump() if hasattr(response, 'model_dump') else response
+        dumped_preview = dumped if isinstance(dumped, str) else repr(dumped)
+        logger.info(
+            'openai transcription response received',
+            extra={
+                'details': {
+                    'model': DIARIZATION_MODEL,
+                    'response_format': DIARIZED_RESPONSE_FORMAT,
+                    'chunking_strategy': DIARIZATION_CHUNKING_STRATEGY,
+                    'response_type': type(response).__name__,
+                    'has_model_dump': hasattr(response, 'model_dump'),
+                    'dumped_type': type(dumped).__name__,
+                    'dumped_preview': dumped_preview[:500],
+                }
+            },
+        )
+        payload = normalize_transcription_response(response)
+        return parse_transcript_response(payload)
 
     def callback_workers(self, payload: WorkersCallbackPayload, callback_url: str | None = None) -> None:
         final_url = callback_url or WORKERS_CALLBACK_URL
@@ -182,7 +246,7 @@ class PipelineService:
                     ok, details = validate_chunk(out, ext)
                     logger.info('chunk prepared', extra={'recordingId': job.recordingId, 'dropboxFileId': job.dropboxFileId, 'fileName': job.fileName, 'details': {'chunkIndex': entry.chunk_index + 1, 'chunkCount': entry.chunk_count, 'startOffsetMs': entry.start_offset_ms, 'estimatedDurationSec': entry.estimated_duration_sec, 'bytes': out.stat().st_size, 'extension': f'.{ext}', 'mimeType': details.get('mime_type'), 'codec': details.get('codec'), 'container': details.get('container'), 'sampleRate': details.get('sample_rate'), 'channels': details.get('channels'), 'strategy': 'reencoded-aac-m4a' if ext == 'm4a' else 'fallback-pcm-wav', 'validationPassed': ok}})
                     if not ok:
-                        raise RuntimeError(f"chunk validation failed: {details}")
+                        raise InputValidationError(f"chunk validation failed: {details}")
                     try:
                         transcript = self.transcribe_file(out, job.request.languageHint if job.request else None)
                         results.append((entry, transcript))
