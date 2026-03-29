@@ -28,6 +28,25 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+const NON_REPROCESSABLE_STATUSES: ReadonlySet<RecordingJobStatus> = new Set(['queued', 'transcoding', 'transcribing', 'transcribed', 'persisted']);
+const TERMINAL_STATUSES: ReadonlySet<RecordingJobStatus> = new Set(['persisted', 'failed']);
+
+export function isTerminalRecordingJobStatus(status: RecordingJobStatus): boolean {
+  return TERMINAL_STATUSES.has(status);
+}
+
+export function shouldSkipProcessingForStatus(status: RecordingJobStatus): boolean {
+  return NON_REPROCESSABLE_STATUSES.has(status);
+}
+
+export function shouldSkipProcessingForExistingJob(job: RecordingJob): { shouldSkip: boolean; reason?: string } {
+  if (!shouldSkipProcessingForStatus(job.status)) return { shouldSkip: false };
+  return {
+    shouldSkip: true,
+    reason: `existing job is already ${job.status}`,
+  };
+}
+
 export function normalizeDropboxPath(path?: string): string | undefined {
   if (!path) return undefined;
   const normalized = path.trim().toLowerCase();

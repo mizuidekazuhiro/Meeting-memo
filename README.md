@@ -45,7 +45,15 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 5. Python API が Dropbox から直接取得、`ffprobe` / `ffmpeg` で安全分割
 6. Python API が `gpt-4o-transcribe-diarize` へ `chunking_strategy` を指定して chunkIndex 順に送信
 7. Python API が transcript を chunkIndex 順で結合して Workers callback
-8. Workers が Notion に保存
+8. Workers が transcript 完了後に要約（summary / tasks）を生成
+9. Workers が Notion に保存（本文ブロック + Summary/My Tasks/Other Tasks）
+
+### 重複防止ポリシー
+
+- 同一録音判定キー: `recordingId` / `dropboxFileId` / `dropboxPathLower`
+- 既存 job が `queued` / `transcoding` / `transcribing` / `transcribed` / `persisted` の場合は再処理しない
+- `failed` のみ再実行を許可
+- upload / callback の両経路で重複反映を防ぐ（skip reason をログ出力）
 
 ---
 

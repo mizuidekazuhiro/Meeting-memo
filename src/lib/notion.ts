@@ -203,6 +203,7 @@ export async function upsertInterviewFromTranscript(
   request: InterviewRecord['request'],
   metadata: InterviewRecord['metadata'],
   transcript: InterviewRecord['transcript'],
+  insights?: InterviewRecord['insights'],
 ): Promise<{ pageId?: string; created?: boolean; record: InterviewRecord }> {
   const recordedAt = request.recordedAt ?? metadata.server_modified ?? metadata.client_modified ?? new Date().toISOString();
   const date = new Date(recordedAt);
@@ -213,6 +214,7 @@ export async function upsertInterviewFromTranscript(
     metadata: { ...metadata, shared_link: request.dropboxSharedLink },
     request,
     transcript,
+    insights,
     processingStatus: 'transcribed',
   };
   const existing = await findExistingInterview(env, [record.dedupKey]);
