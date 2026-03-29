@@ -39,9 +39,26 @@ def should_fallback(status_code: int, error_text: str) -> bool:
 
 
 def parse_transcript_response(payload: dict[str, Any]) -> TranscriptResult:
+    if not isinstance(payload, dict):
+        log_event(logger, 'warning', 'unexpected transcription response container', responseType=type(payload).__name__, rawResponse=repr(payload))
+        payload = {'raw': payload}
+
     segments_raw = payload.get('diarized_segments') or payload.get('segments') or []
+    if not isinstance(segments_raw, list):
+        log_event(
+            logger,
+            'warning',
+            'unexpected transcription segments format',
+            responseType=type(segments_raw).__name__,
+            rawResponse=repr(payload),
+        )
+        segments_raw = []
+
     segments: list[TranscriptSegment] = []
     for seg in segments_raw:
+        if not isinstance(seg, dict):
+            log_event(logger, 'warning', 'unexpected segment entry format', segmentType=type(seg).__name__, rawSegment=repr(seg))
+            continue
         text = (seg.get('text') or '').strip()
         if not text:
             continue
@@ -134,6 +151,16 @@ class TranscriptionService:
             ) from exc
 
         dumped = response.model_dump() if hasattr(response, 'model_dump') else response
+        log_event(
+            logger,
+            'info',
+            'openai transcription response received',
+            model=DIARIZATION_MODEL,
+            response_format=DIARIZED_RESPONSE_FORMAT,
+            chunking_strategy=chunking_strategy,
+            chunkIndex=chunk_index,
+            responseType=type(dumped).__name__,
+        )
         return parse_transcript_response(dumped)
 
     def process(self, job: TranscriptionJobRequest, source_bytes: bytes) -> WorkersCallbackPayload:
@@ -148,6 +175,16 @@ class TranscriptionService:
             results: list[tuple[ChunkPlanEntry, TranscriptResult]] = []
 
             for chunk in plan:
+                log_event(
+                    logger,
+                    'info',
+                    'transcription chunk started',
+                    recordingId=job.recordingId,
+                    chunkIndex=chunk.chunk_index,
+                    chunkCount=chunk.chunk_count,
+                    startOffsetMs=chunk.start_offset_ms,
+                    endOffsetMs=chunk.end_offset_ms,
+                )
                 formats = [SETTINGS.primary_audio_format]
                 if SETTINGS.enable_audio_fallback and SETTINGS.fallback_audio_format != SETTINGS.primary_audio_format:
                     formats.append(SETTINGS.fallback_audio_format)
@@ -158,6 +195,19 @@ class TranscriptionService:
                     output = Path(tmp_dir) / f'part-{chunk.chunk_index + 1:03d}.{ext}'
                     run_ffmpeg_chunk(source_path, output, chunk.start_offset_ms / 1000, chunk.estimated_duration_sec, fmt)
                     ok, details = validate_chunk(output, ext)
+                    log_event(
+                        logger,
+                        'info',
+                        'chunk prepared',
+                        recordingId=job.recordingId,
+                        chunkIndex=chunk.chunk_index,
+                        model=DIARIZATION_MODEL,
+                        response_format=DIARIZED_RESPONSE_FORMAT,
+                        chunking_strategy=SETTINGS.diarization_chunking_strategy,
+                        audioFormat=ext,
+                        validationPassed=ok,
+                        details=details,
+                    )
                     if not ok:
                         raise TranscriptionProcessingError(
                             f'chunk validation failed: {details}',
@@ -172,6 +222,18 @@ class TranscriptionService:
                         transcribed = True
                         break
                     except TranscriptionProcessingError as exc:
+                        log_event(
+                            logger,
+                            'error',
+                            'chunk transcription failed',
+                            recordingId=job.recordingId,
+                            chunkIndex=chunk.chunk_index,
+                            model=DIARIZATION_MODEL,
+                            response_format=DIARIZED_RESPONSE_FORMAT,
+                            chunking_strategy=SETTINGS.diarization_chunking_strategy,
+                            error=str(exc),
+                            errorSource=exc.source,
+                        )
                         if index == 0 and fmt == 'm4a' and should_fallback(exc.external_status_code or 500, str(exc)):
                             continue
                         raise

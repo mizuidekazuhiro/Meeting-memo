@@ -36,23 +36,27 @@ def test_auth_guard_rejects_invalid_token(monkeypatch):
 
 def test_transcribe_job_maps_external_error_to_502(monkeypatch):
     import main
-    from transcription_service import TranscriptionProcessingError
 
     class FakeDropbox:
         def download_file(self, dropbox_file_id, dropbox_path_lower):
             return b'audio-bytes'
 
-    class FailingService:
+    class SuccessPayload:
+        recordingId = 'rec-1'
+
+    class SuccessService:
         def process(self, job, source_bytes):
-            raise TranscriptionProcessingError(
-                'openai failed',
-                source='openai',
-                chunk_index=1,
-                external_status_code=400,
-            )
+            return SuccessPayload()
+
+    class InlineExecutor:
+        def submit(self, fn, *args, **kwargs):
+            fn(*args, **kwargs)
 
     monkeypatch.setattr(main, 'dropbox', FakeDropbox())
-    monkeypatch.setattr(main, 'service', FailingService())
+    monkeypatch.setattr(main, 'service', SuccessService())
+    monkeypatch.setattr(main, 'send_callback', lambda payload, callback_url=None: True)
+    monkeypatch.setattr(main, 'executor', InlineExecutor())
+    main.job_states.clear()
 
     client = TestClient(main.app)
     import auth
@@ -67,8 +71,38 @@ def test_transcribe_job_maps_external_error_to_502(monkeypatch):
         },
     )
 
-    assert response.status_code == 502
-    detail = response.json()['detail']
-    assert detail['source'] == 'openai'
-    assert detail['chunkIndex'] == 1
-    assert detail['upstreamStatus'] == 400
+    assert response.status_code == 202
+    assert response.json()['accepted'] is True
+    assert response.json()['status'] in {'queued', 'completed'}
+
+    status_response = client.get('/jobs/transcribe/rec-1', headers={'authorization': f'Bearer {token}'})
+    assert status_response.status_code == 200
+    assert status_response.json()['status'] == 'completed'
+
+
+def test_transcribe_job_deduplicates_running_job(monkeypatch):
+    import main
+
+    class InlineExecutor:
+        def submit(self, fn, *args, **kwargs):
+            return None
+
+    monkeypatch.setattr(main, 'executor', InlineExecutor())
+    main.job_states.clear()
+    main.update_job_state('rec-2', 'running', attempts=1)
+
+    client = TestClient(main.app)
+    import auth
+    token = auth.SETTINGS.api_token or 'anything'
+    response = client.post(
+        '/jobs/transcribe',
+        headers={'authorization': f'Bearer {token}'},
+        json={
+            'recordingId': 'rec-2',
+            'dropboxFileId': 'id:123',
+            'fileName': 'audio.m4a',
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()['status'] == 'running'
