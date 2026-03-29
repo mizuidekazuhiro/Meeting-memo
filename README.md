@@ -43,7 +43,7 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
    - 短時間: Workers 内で既存処理を継続
    - 長時間 / 安全判定不能: Python API へ委譲
 5. Python API が Dropbox から直接取得、`ffprobe` / `ffmpeg` で安全分割
-6. Python API が `gpt-4o-transcribe-diarize` へ chunkIndex 順に送信
+6. Python API が `gpt-4o-transcribe-diarize` へ `chunking_strategy` を指定して chunkIndex 順に送信
 7. Python API が transcript を chunkIndex 順で結合して Workers callback
 8. Workers が Notion に保存
 
@@ -104,6 +104,7 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 - `FFMPEG_PATH`
 - `FFPROBE_PATH`
 - `TMP_DIR`
+- `DIARIZATION_CHUNKING_STRATEGY`（diarization transcription 呼び出し時に必須）
 
 ---
 

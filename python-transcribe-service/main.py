@@ -7,7 +7,7 @@ from callback_client import send_callback
 from dropbox_client import DropboxClient
 from logging_utils import configure_logging, get_logger, log_event
 from models import TranscriptionJobRequest
-from transcription_service import TranscriptionService
+from transcription_service import TranscriptionProcessingError, TranscriptionService
 
 configure_logging()
 logger = get_logger()
@@ -33,6 +33,33 @@ def transcribe_job(job: TranscriptionJobRequest) -> dict[str, object]:
             'status': 'transcribed',
             'callbackSucceeded': callback_succeeded,
         }
+    except TranscriptionProcessingError as exc:
+        status_code = 500
+        if exc.source in {'openai', 'dropbox'}:
+            status_code = 502
+        elif exc.source == 'validation':
+            status_code = 400
+
+        log_event(
+            logger,
+            'error',
+            'python transcription pipeline failed',
+            recordingId=job.recordingId,
+            error=str(exc),
+            errorSource=exc.source,
+            chunkIndex=exc.chunk_index,
+            upstreamStatus=exc.external_status_code,
+            context=exc.context,
+        )
+        raise HTTPException(
+            status_code=status_code,
+            detail={
+                'message': str(exc),
+                'source': exc.source,
+                'chunkIndex': exc.chunk_index,
+                'upstreamStatus': exc.external_status_code,
+            },
+        ) from exc
     except Exception as exc:  # noqa: BLE001
-        log_event(logger, 'error', 'python transcription pipeline failed', recordingId=job.recordingId, error=str(exc))
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        log_event(logger, 'error', 'python transcription pipeline failed', recordingId=job.recordingId, error=str(exc), errorType=type(exc).__name__)
+        raise HTTPException(status_code=500, detail={'message': str(exc), 'source': 'internal'}) from exc
