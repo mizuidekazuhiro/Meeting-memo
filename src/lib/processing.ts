@@ -142,18 +142,42 @@ export async function processUploadedInterview(env: Env, request: IntakeRequest,
       await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'transcribed', { transcript });
       let insights;
       let summaryError: string | undefined;
+      let summaryErrorDetails: unknown;
+      let summaryRaw: unknown;
       try {
         insights = await summarizeInterview(env, transcript);
       } catch (error) {
         summaryError = error instanceof Error ? error.message : 'summary generation failed';
-        logEvent('error', 'summary generation failed', {
+        summaryErrorDetails = error instanceof HttpError ? error.details : error;
+        summaryRaw = error instanceof HttpError && error.details && typeof error.details === 'object' && 'payload' in (error.details as Record<string, unknown>)
+          ? (error.details as Record<string, unknown>).payload
+          : undefined;
+        logEvent('warn', 'summary generation recovered with transcript-only persistence', {
           recordingId: job.recordingId,
+          fileName: job.fileName,
+          dropboxFileId: job.dropboxFileId,
+          dropboxPathLower: job.dropboxPathLower,
+          details: summaryErrorDetails,
+        });
+      }
+      let persisted;
+      try {
+        persisted = await upsertInterviewFromTranscript(env, request, metadata, transcript, insights, {
+          errorMessage: summaryError,
+          summaryRaw: insights?.raw ?? summaryRaw,
+          summaryErrorMessage: summaryError,
+          summaryErrorDetails,
+        });
+      } catch (error) {
+        logEvent('error', 'notion persistence failed', {
+          recordingId: job.recordingId,
+          fileName: job.fileName,
           dropboxFileId: job.dropboxFileId,
           dropboxPathLower: job.dropboxPathLower,
           details: error instanceof HttpError ? error.details : error,
         });
+        throw error;
       }
-      const persisted = await upsertInterviewFromTranscript(env, request, metadata, transcript, insights);
       await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'persisted', { errorMessage: summaryError });
       return {
         action: 'processed',
@@ -323,49 +347,81 @@ export async function persistTranscriptionCallback(env: Env, payload: RecordingJ
     server_modified: job.serverModified,
   };
 
+  logEvent('info', 'callback phase started', {
+    phase: 'persist_transcript',
+    recordingId: job.recordingId,
+    fileName: job.fileName,
+    requestId: payload.requestId ?? null,
+    dropboxFileId: job.dropboxFileId,
+    dropboxPathLower: job.dropboxPathLower,
+    storageType: storageMeta.storageType,
+    storageModeDecision: storageMeta.storageModeDecision,
+  });
   try {
-    logEvent('info', 'callback phase started', {
-      phase: 'persist_transcript',
-      recordingId: job.recordingId,
-      fileName: job.fileName,
-      requestId: payload.requestId ?? null,
-      dropboxFileId: job.dropboxFileId,
-      dropboxPathLower: job.dropboxPathLower,
-      storageType: storageMeta.storageType,
-      storageModeDecision: storageMeta.storageModeDecision,
-    });
     await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'transcribed', {
       transcript: payload.transcript,
       sourceDurationSec: payload.sourceDurationSec,
       callbackStatus: 'received',
     });
-    let insights;
-    let summaryError: string | undefined;
-    try {
-      insights = await summarizeInterview(env, payload.transcript);
-    } catch (error) {
-      summaryError = error instanceof Error ? error.message : 'summary generation failed';
-      logEvent('error', 'summary generation failed', {
-        recordingId: job.recordingId,
-        fileName: job.fileName,
-        requestId: payload.requestId ?? null,
-        dropboxFileId: job.dropboxFileId,
-        dropboxPathLower: job.dropboxPathLower,
-        details: error instanceof HttpError ? error.details : error,
-      });
-    }
-    const persisted = await upsertInterviewFromTranscript(env, job.request, metadata, payload.transcript, insights);
+  } catch (error) {
+    await markJobFailed(env, { recordingId: job.recordingId }, error instanceof Error ? error.message : 'callback failed', { callbackStatus: 'failed' });
+    throw error;
+  }
 
-    logEvent('info', 'callback phase started', {
-      phase: 'update_status',
+  let insights;
+  let summaryError: string | undefined;
+  let summaryErrorDetails: unknown;
+  let summaryRaw: unknown;
+  try {
+    insights = await summarizeInterview(env, payload.transcript);
+  } catch (error) {
+    summaryError = error instanceof Error ? error.message : 'summary generation failed';
+    summaryErrorDetails = error instanceof HttpError ? error.details : error;
+    summaryRaw = error instanceof HttpError && error.details && typeof error.details === 'object' && 'payload' in (error.details as Record<string, unknown>)
+      ? (error.details as Record<string, unknown>).payload
+      : undefined;
+    logEvent('warn', 'summary generation recovered with transcript-only persistence', {
       recordingId: job.recordingId,
       fileName: job.fileName,
       requestId: payload.requestId ?? null,
       dropboxFileId: job.dropboxFileId,
       dropboxPathLower: job.dropboxPathLower,
-      storageType: storageMeta.storageType,
-      storageModeDecision: storageMeta.storageModeDecision,
+      details: summaryErrorDetails,
     });
+  }
+
+  let persisted: Awaited<ReturnType<typeof upsertInterviewFromTranscript>>;
+  try {
+    persisted = await upsertInterviewFromTranscript(env, job.request, metadata, payload.transcript, insights, {
+      errorMessage: summaryError,
+      summaryRaw: insights?.raw ?? summaryRaw,
+      summaryErrorMessage: summaryError,
+      summaryErrorDetails,
+    });
+  } catch (error) {
+    await markJobFailed(env, { recordingId: job.recordingId }, error instanceof Error ? error.message : 'callback failed', { callbackStatus: 'failed' });
+    logEvent('error', 'notion persistence failed', {
+      recordingId: job.recordingId,
+      fileName: job.fileName,
+      requestId: payload.requestId ?? null,
+      dropboxFileId: job.dropboxFileId,
+      dropboxPathLower: job.dropboxPathLower,
+      details: error instanceof HttpError ? error.details : error,
+    });
+    throw error;
+  }
+
+  logEvent('info', 'callback phase started', {
+    phase: 'update_status',
+    recordingId: job.recordingId,
+    fileName: job.fileName,
+    requestId: payload.requestId ?? null,
+    dropboxFileId: job.dropboxFileId,
+    dropboxPathLower: job.dropboxPathLower,
+    storageType: storageMeta.storageType,
+    storageModeDecision: storageMeta.storageModeDecision,
+  });
+  try {
     await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'persisted', {
       transcript: payload.transcript,
       sourceDurationSec: payload.sourceDurationSec,
@@ -383,29 +439,33 @@ export async function persistTranscriptionCallback(env: Env, payload: RecordingJ
       storageType: storageMeta.storageType,
       storageModeDecision: storageMeta.storageModeDecision,
     });
-
-    return {
-      action: 'processed',
-      reason: summaryError ? 'Python API callback transcript persisted to Notion, summary failed.' : 'Python API callback persisted to Notion.',
-      pageId: persisted.pageId,
-      created: persisted.created,
-      dedupCandidates: buildDedupCandidates(job.request, metadata),
-      record: persisted.record,
-    };
   } catch (error) {
-    await markJobFailed(env, { recordingId: job.recordingId }, error instanceof Error ? error.message : 'callback failed', { callbackStatus: 'failed' });
-    logEvent('error', 'callback failed', {
-      phase: error instanceof HttpError ? 'persist_transcript' : 'update_status',
+    logEvent('warn', 'status update failed after notion persisted', {
       recordingId: job.recordingId,
       fileName: job.fileName,
       requestId: payload.requestId ?? null,
       dropboxFileId: job.dropboxFileId,
       dropboxPathLower: job.dropboxPathLower,
       details: error instanceof HttpError ? error.details : error,
-      stack: error instanceof Error ? error.stack : undefined,
-      storageType: storageMeta.storageType,
-      storageModeDecision: storageMeta.storageModeDecision,
     });
-    throw error;
+    return {
+      action: 'processed',
+      reason: summaryError
+        ? 'Python API callback persisted transcript to Notion (summary failed, status update failed after Notion persistence).'
+        : 'Python API callback persisted to Notion; status update failed after Notion persistence.',
+      pageId: persisted.pageId,
+      created: persisted.created,
+      dedupCandidates: buildDedupCandidates(job.request, metadata),
+      record: persisted.record,
+    };
   }
+
+  return {
+    action: 'processed',
+    reason: summaryError ? 'Python API callback transcript persisted to Notion, summary failed.' : 'Python API callback persisted to Notion.',
+    pageId: persisted.pageId,
+    created: persisted.created,
+    dedupCandidates: buildDedupCandidates(job.request, metadata),
+    record: persisted.record,
+  };
 }

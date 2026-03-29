@@ -213,13 +213,17 @@ test('summary generation failure still persists transcript in callback path', as
   await upsertRecordingJob(env, job);
 
   const originalFetch = global.fetch;
+  const pagePayloads: any[] = [];
   global.fetch = (async (input: string, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();
     if (url.includes('/v1/responses')) {
-      return new Response(JSON.stringify({ error: 'summary down' }), { status: 500, headers: { 'content-type': 'application/json' } });
+      return new Response(JSON.stringify({ output: [{ content: [{ type: 'output_text', text: '{broken-json' }] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     if (url.includes('/databases/') && url.endsWith('/query')) return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
-    if (url.endsWith('/pages')) return new Response(JSON.stringify({ id: 'page_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.endsWith('/pages')) {
+      if (typeof init?.body === 'string') pagePayloads.push(JSON.parse(init.body));
+      return new Response(JSON.stringify({ id: 'page_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
     if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
   }) as any;
@@ -230,7 +234,47 @@ test('summary generation failure still persists transcript in callback path', as
   const updated = await getRecordingJob(env, { recordingId: job.recordingId });
   assert.equal(result.action, 'processed');
   assert.equal(updated?.status, 'persisted');
-  assert.match(updated?.errorMessage ?? '', /Summary generation failed/);
+  assert.match(updated?.errorMessage ?? '', /Summary response parse failed/);
+  const rawJsonContent = pagePayloads[0]?.properties?.['Raw JSON']?.rich_text?.[0]?.text?.content ?? '';
+  assert.ok(pagePayloads[0]?.properties?.['Error Message']?.rich_text?.[0]?.text?.content.includes('Summary response parse failed'));
+  assert.ok(rawJsonContent.includes('"summaryErrorMessage"'));
+});
+
+test('callback returns partial success when status update fails after Notion persistence', async () => {
+  const kv = new MockKv();
+  const env = makeEnv(kv, { OPENAI_API_KEY: 'test' });
+  const job = createRecordingJob({ request: { fileName: 'status-fail.m4a' }, dropboxFileId: 'id:status-fail', dropboxPathLower: '/apps/meetingmemo/inbox/status-fail.m4a', fileName: 'status-fail.m4a' });
+  await upsertRecordingJob(env, job);
+
+  const originalFetch = global.fetch;
+  global.fetch = (async (input: string, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url.includes('/v1/responses')) return new Response(JSON.stringify({ output_text: JSON.stringify({ summary: 'ok', myTasks: [], otherTasks: [], ambiguities: [] }) }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/databases/') && url.endsWith('/query')) return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.endsWith('/pages')) return new Response(JSON.stringify({ id: 'page_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+
+  let updates = 0;
+  const originalPut = kv.put.bind(kv);
+  kv.put = async (key: string, value: string) => {
+    if (key === `recordingJob:recordingId:${job.recordingId}`) {
+      const parsed = JSON.parse(value);
+      if (parsed.status === 'persisted') {
+        updates += 1;
+        if (updates >= 1) throw new Error('kv persisted write failed');
+      }
+    }
+    await originalPut(key, value);
+  };
+
+  const result = await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
+  global.fetch = originalFetch;
+
+  assert.equal(result.action, 'processed');
+  assert.match(result.reason, /status update failed after Notion persistence/);
+  assert.equal(result.pageId, 'page_1');
 });
 
 test('upsert uses persistent KV abstraction for writes', async () => {

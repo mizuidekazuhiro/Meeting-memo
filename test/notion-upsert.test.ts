@@ -29,6 +29,7 @@ test('upsertInterviewFromTranscript stores insights fields and transcript raw JS
     { id: 'id:direct', name: 'direct.m4a', path_lower: '/apps/meetingmemo/inbox/direct.m4a' },
     { fullText: 'これは文字起こしです', segments: [{ speaker: 'spk_0', text: 'これは文字起こしです', startMs: 0, endMs: 1000 }], raw: { transcript: true } },
     { summary: '要点', myTasks: ['私のタスク'], otherTasks: ['相手のタスク'], ambiguities: [], raw: { insights: true } },
+    { errorMessage: 'summary failed but transcript persisted', summaryRaw: { provider: 'responses' }, summaryErrorMessage: 'summary failed', summaryErrorDetails: { code: 'parse_failed' } },
   );
 
   global.fetch = originalFetch;
@@ -39,4 +40,6 @@ test('upsertInterviewFromTranscript stores insights fields and transcript raw JS
   assert.ok(properties['Other Tasks'].rich_text[0].text.content.includes('相手のタスク'));
   assert.ok(properties['Raw JSON'].rich_text[0].text.content.includes('"transcript":'));
   assert.ok(properties['Raw JSON'].rich_text[0].text.content.includes('"insights":'));
+  assert.ok(properties['Raw JSON'].rich_text[0].text.content.includes('"summaryRaw":'));
+  assert.ok(properties['Error Message'].rich_text[0].text.content.includes('summary failed'));
 });
