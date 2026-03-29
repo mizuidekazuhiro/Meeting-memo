@@ -36,6 +36,35 @@ jobs:
             echo "❌ Placeholder configuration value detected. Replace it before deploy."
             exit 1
           fi
+          recording_job_kv_id="$(awk '
+            /^\[\[kv_namespaces\]\]$/ { in_block=1; binding=""; id=""; next }
+            in_block && /^\[\[/ {
+              if (binding == "RECORDING_JOB_KV") {
+                print id
+                exit
+              }
+              in_block=0
+            }
+            in_block && /^binding[[:space:]]*=/ {
+              line=$0; sub(/^[^=]*=[[:space:]]*"/, "", line); sub(/".*$/, "", line); binding=line
+            }
+            in_block && /^id[[:space:]]*=/ {
+              line=$0; sub(/^[^=]*=[[:space:]]*"/, "", line); sub(/".*$/, "", line); id=line
+            }
+            END {
+              if (in_block && binding == "RECORDING_JOB_KV") {
+                print id
+              }
+            }
+          ' wrangler.toml)"
+          if [[ -z "${recording_job_kv_id}" ]]; then
+            echo "❌ RECORDING_JOB_KV namespace id is missing in wrangler.toml"
+            exit 1
+          fi
+          if [[ "${recording_job_kv_id}" == "replace-with-your-recording-job-kv-id" || "${recording_job_kv_id}" == replace-with-your-* ]]; then
+            echo "❌ RECORDING_JOB_KV namespace id is still a placeholder in wrangler.toml"
+            exit 1
+          fi
           echo "✅ No placeholder configuration values found."
 
       - name: Show Wrangler config source for deploy
