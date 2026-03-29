@@ -171,6 +171,16 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     };
     const seededJob = createRecordingJob({ request: requestWithDropbox, dropboxFileId: metadata.id ?? '', dropboxPathLower: metadata.path_lower, fileName: metadata.name, sourceBytes: metadata.size ?? intake.fileSizeBytes, clientModified: metadata.client_modified, serverModified: metadata.server_modified });
     const { job, created } = await upsertRecordingJob(env, seededJob);
+    logEvent('info', 'recording job created', {
+      event: 'recording job created',
+      recordingId: job.recordingId,
+      dropboxFileId: job.dropboxFileId,
+      dropboxPathLower: job.dropboxPathLower,
+      fileName: job.fileName,
+      storageType: env.RECORDING_JOB_KV ? 'cloudflare-kv' : 'fallback',
+      internalKey: `recordingJob:recordingId:${job.recordingId}`,
+      created,
+    });
     const result = await processUploadedInterview(env, requestWithDropbox, metadata, job, { dryRun });
     return jsonResponse({ ok: result.action === 'processed', action: result.action, reason: result.reason, pageId: result.pageId, created: result.created, dropboxFileId: metadata.id, dropboxPathLower: metadata.path_lower, storedFileName: metadata.name, fileSizeBytes: metadata.size, recordingId: job.recordingId, jobStatus: job.status, createdJob: created, dedupCandidates: result.dedupCandidates, errorMessage: result.record?.errorMessage });
   } catch (error) {
@@ -181,9 +191,31 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
 
 async function handleTranscriptionCallback(request: Request, env: Env): Promise<Response> {
   requireWebhookSecret(request, env.INTERVIEW_WEBHOOK_SECRET);
-  const payload = await parseJson<RecordingJobCallbackPayload>(request);
-  const result = await persistTranscriptionCallback(env, payload);
-  return jsonResponse({ ok: result.action === 'processed', action: result.action, reason: result.reason, pageId: result.pageId, created: result.created });
+  let payload: RecordingJobCallbackPayload;
+  try {
+    payload = await parseJson<RecordingJobCallbackPayload>(request);
+  } catch (error) {
+    logEvent('error', 'transcription callback failed', {
+      phase: 'parse_payload',
+      details: error instanceof HttpError ? error.details : error,
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    throw error;
+  }
+  try {
+    const result = await persistTranscriptionCallback(env, payload);
+    return jsonResponse({ ok: result.action === 'processed', action: result.action, reason: result.reason, pageId: result.pageId, created: result.created });
+  } catch (error) {
+    logEvent('error', 'transcription callback failed', {
+      phase: error instanceof HttpError ? ((error.details as { phase?: string } | undefined)?.phase ?? 'unknown') : 'unknown',
+      recordingId: payload.recordingId ?? null,
+      dropboxFileId: payload.dropboxFileId ?? null,
+      dropboxPathLower: payload.dropboxPathLower ?? null,
+      details: error instanceof HttpError ? error.details : error,
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    throw error;
+  }
 }
 
 async function handleDebugDropbox(request: Request, env: Env): Promise<Response> {
