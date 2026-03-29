@@ -2,10 +2,36 @@ import type { DropboxFileMetadata, Env, IntakeRequest, ProcessInterviewResult, R
 import { buildDedupCandidates } from './dedup';
 import { downloadDropboxFile } from './dropbox';
 import { HttpError } from './http';
-import { findRecordingJobWithSource, markJobFailed, updateRecordingJobStatus } from './jobs';
+import { findRecordingJobWithSource, getRecordingJobStorageMeta, markJobFailed, normalizeDropboxPath, updateRecordingJobStatus } from './jobs';
 import { logEvent } from './logger';
 import { upsertInterviewFromTranscript } from './notion';
 import { inspectAudioSource, MAX_TRANSCRIBE_DURATION_SEC, transcribeWithDiarization } from './openai';
+
+
+function parsePositiveInt(value: string | undefined, fallback: number): number {
+  if (!value) return fallback;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
+function buildCallbackLookupRetryConfig(env: Env): { maxAttempts: number; baseDelayMs: number; maxDelayMs: number } {
+  const maxAttempts = Math.min(parsePositiveInt(env.CALLBACK_JOB_LOOKUP_MAX_ATTEMPTS, 6), 12);
+  const baseDelayMs = Math.min(parsePositiveInt(env.CALLBACK_JOB_LOOKUP_BASE_DELAY_MS, 200), 2_000);
+  const maxDelayMs = Math.min(parsePositiveInt(env.CALLBACK_JOB_LOOKUP_MAX_DELAY_MS, 1_600), 5_000);
+  return { maxAttempts, baseDelayMs, maxDelayMs };
+}
+
+function getRetryDelayMs(attempt: number, config: { baseDelayMs: number; maxDelayMs: number }): number {
+  if (attempt <= 1) return 0;
+  const exponential = config.baseDelayMs * 2 ** (attempt - 2);
+  return Math.min(exponential, config.maxDelayMs);
+}
+
+async function waitMs(delayMs: number): Promise<void> {
+  if (delayMs <= 0) return;
+  await new Promise((resolve) => setTimeout(resolve, delayMs));
+}
 
 export function shouldAttemptDirectWorkerTranscription(metadata: DropboxFileMetadata, durationSec: number | undefined): boolean {
   const extension = metadata.name.includes('.') ? metadata.name.split('.').pop()?.toLowerCase() : '';
@@ -134,21 +160,69 @@ export async function processUploadedInterview(env: Env, request: IntakeRequest,
 export async function persistTranscriptionCallback(env: Env, payload: RecordingJobCallbackPayload): Promise<ProcessInterviewResult> {
   const recordingId = payload.recordingId?.trim();
   const dropboxFileId = payload.dropboxFileId?.trim();
-  const dropboxPathLower = payload.dropboxPathLower?.trim().toLowerCase();
+  const rawDropboxPathLower = payload.dropboxPathLower;
+  const dropboxPathLower = normalizeDropboxPath(payload.dropboxPathLower);
   const fileName = payload.fileName?.trim();
+  const storageMeta = getRecordingJobStorageMeta(env);
+  const retryConfig = buildCallbackLookupRetryConfig(env);
 
   logEvent('info', 'recording job lookup started', {
     event: 'recording job lookup started',
     recordingId: recordingId ?? null,
     dropboxFileId: dropboxFileId ?? null,
     dropboxPathLower: dropboxPathLower ?? null,
+    fileName: fileName ?? null,
+    requestId: payload.requestId ?? null,
+    rawValues: {
+      recordingId: payload.recordingId ?? null,
+      dropboxFileId: payload.dropboxFileId ?? null,
+      dropboxPathLower: rawDropboxPathLower ?? null,
+      fileName: payload.fileName ?? null,
+    },
+    normalizedValues: {
+      recordingId: recordingId ?? null,
+      dropboxFileId: dropboxFileId ?? null,
+      dropboxPathLower: dropboxPathLower ?? null,
+      fileName: fileName ?? null,
+    },
+    retryConfig,
+    storageType: storageMeta.storageType,
+    storageModeDecision: storageMeta.storageModeDecision,
   });
-  logEvent('info', 'recording job lookup tried', { triedBy: 'recordingId', recordingId: recordingId ?? null });
-  logEvent('info', 'recording job lookup tried', { triedBy: 'dropboxFileId', dropboxFileId: dropboxFileId ?? null });
-  logEvent('info', 'recording job lookup tried', { triedBy: 'dropboxPathLower', dropboxPathLower: dropboxPathLower ?? null });
 
-  const lookup = await findRecordingJobWithSource(env, { recordingId, dropboxFileId, dropboxPathLower });
-  const job = lookup.job;
+  let lookup: Awaited<ReturnType<typeof findRecordingJobWithSource>> | null = null;
+  let lastAttempt = 0;
+  let totalWaitMs = 0;
+  const lastTriedSources: string[] = [];
+
+  for (let attempt = 1; attempt <= retryConfig.maxAttempts; attempt += 1) {
+    const waitedMs = getRetryDelayMs(attempt, retryConfig);
+    if (waitedMs > 0) {
+      await waitMs(waitedMs);
+      totalWaitMs += waitedMs;
+    }
+
+    logEvent('info', 'recording job lookup attempt', {
+      event: 'recording job lookup attempt',
+      attempt,
+      waitedMs,
+      totalWaitMs,
+      recordingId: recordingId ?? null,
+      dropboxFileId: dropboxFileId ?? null,
+      dropboxPathLower: dropboxPathLower ?? null,
+      fileName: fileName ?? null,
+      requestId: payload.requestId ?? null,
+      storageType: storageMeta.storageType,
+      storageModeDecision: storageMeta.storageModeDecision,
+    });
+
+    lookup = await findRecordingJobWithSource(env, { recordingId, dropboxFileId, dropboxPathLower });
+    lastAttempt = attempt;
+    lastTriedSources.push(lookup.source ?? 'none');
+    if (lookup.job) break;
+  }
+
+  const job = lookup?.job;
   if (!job) {
     const transcriptPreview = payload.transcript?.fullText ? payload.transcript.fullText.slice(0, 512) : '';
     logEvent('error', 'recording job lookup not found', {
@@ -156,12 +230,21 @@ export async function persistTranscriptionCallback(env: Env, payload: RecordingJ
       recordingId: recordingId ?? null,
       dropboxFileId: dropboxFileId ?? null,
       dropboxPathLower: dropboxPathLower ?? null,
+      fileName: fileName ?? null,
+      requestId: payload.requestId ?? null,
       transcriptPreview,
       transcriptPreviewLength: transcriptPreview.length,
       transcriptSegmentCount: payload.transcript?.segments?.length ?? 0,
+      attempts: lastAttempt,
+      totalWaitMs,
+      lastTriedSources,
+      storageType: storageMeta.storageType,
+      storageModeDecision: storageMeta.storageModeDecision,
     });
     throw new HttpError('Recording job not found for callback.', 404, {
       phase: 'lookup_job',
+      attempts: lastAttempt,
+      totalWaitMs,
       recordingId: recordingId ?? null,
       dropboxFileId: dropboxFileId ?? null,
       dropboxPathLower: dropboxPathLower ?? null,
@@ -169,19 +252,29 @@ export async function persistTranscriptionCallback(env: Env, payload: RecordingJ
   }
 
   logEvent('info', 'recording job lookup hit', {
-    foundBy: lookup.source,
+    foundBy: lookup?.source,
+    attempts: lastAttempt,
+    totalWaitMs,
     recordingId: job.recordingId,
+    fileName: job.fileName,
+    requestId: payload.requestId ?? null,
     internalKey: `recordingJob:recordingId:${job.recordingId}`,
     dropboxFileId: job.dropboxFileId,
     dropboxPathLower: job.dropboxPathLower,
+    storageType: storageMeta.storageType,
+    storageModeDecision: storageMeta.storageModeDecision,
   });
 
   if (job.status === 'persisted' && job.callbackStatus === 'persisted') {
     logEvent('info', 'callback duplicate ignored', {
       recordingId: job.recordingId,
+      fileName: job.fileName,
+      requestId: payload.requestId ?? null,
       dropboxFileId: job.dropboxFileId,
       dropboxPathLower: job.dropboxPathLower,
       status: job.status,
+      storageType: storageMeta.storageType,
+      storageModeDecision: storageMeta.storageModeDecision,
     });
     return {
       action: 'processed',
@@ -204,7 +297,16 @@ export async function persistTranscriptionCallback(env: Env, payload: RecordingJ
   };
 
   try {
-    logEvent('info', 'callback phase started', { phase: 'persist_transcript', recordingId: job.recordingId });
+    logEvent('info', 'callback phase started', {
+      phase: 'persist_transcript',
+      recordingId: job.recordingId,
+      fileName: job.fileName,
+      requestId: payload.requestId ?? null,
+      dropboxFileId: job.dropboxFileId,
+      dropboxPathLower: job.dropboxPathLower,
+      storageType: storageMeta.storageType,
+      storageModeDecision: storageMeta.storageModeDecision,
+    });
     await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'transcribed', {
       transcript: payload.transcript,
       sourceDurationSec: payload.sourceDurationSec,
@@ -212,7 +314,16 @@ export async function persistTranscriptionCallback(env: Env, payload: RecordingJ
     });
     const persisted = await upsertInterviewFromTranscript(env, job.request, metadata, payload.transcript);
 
-    logEvent('info', 'callback phase started', { phase: 'update_status', recordingId: job.recordingId });
+    logEvent('info', 'callback phase started', {
+      phase: 'update_status',
+      recordingId: job.recordingId,
+      fileName: job.fileName,
+      requestId: payload.requestId ?? null,
+      dropboxFileId: job.dropboxFileId,
+      dropboxPathLower: job.dropboxPathLower,
+      storageType: storageMeta.storageType,
+      storageModeDecision: storageMeta.storageModeDecision,
+    });
     await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'persisted', {
       transcript: payload.transcript,
       sourceDurationSec: payload.sourceDurationSec,
@@ -220,8 +331,14 @@ export async function persistTranscriptionCallback(env: Env, payload: RecordingJ
     });
     logEvent('info', 'recording job status updated', {
       recordingId: job.recordingId,
+      fileName: job.fileName,
+      requestId: payload.requestId ?? null,
       status: 'persisted',
       callbackStatus: 'persisted',
+      dropboxFileId: job.dropboxFileId,
+      dropboxPathLower: job.dropboxPathLower,
+      storageType: storageMeta.storageType,
+      storageModeDecision: storageMeta.storageModeDecision,
     });
 
     return {
@@ -238,10 +355,13 @@ export async function persistTranscriptionCallback(env: Env, payload: RecordingJ
       phase: error instanceof HttpError ? 'persist_transcript' : 'update_status',
       recordingId: job.recordingId,
       fileName: job.fileName,
+      requestId: payload.requestId ?? null,
       dropboxFileId: job.dropboxFileId,
       dropboxPathLower: job.dropboxPathLower,
       details: error instanceof HttpError ? error.details : error,
       stack: error instanceof Error ? error.stack : undefined,
+      storageType: storageMeta.storageType,
+      storageModeDecision: storageMeta.storageModeDecision,
     });
     throw error;
   }

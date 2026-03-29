@@ -10,6 +10,16 @@ type GlobalFallbackStore = {
   recordingIdByDropboxPathLower: Map<string, string>;
 };
 
+export type RecordingJobStorageType = 'cloudflare-kv' | 'in-memory-fallback';
+
+export interface RecordingJobStorageDecision {
+  storageType: RecordingJobStorageType;
+  storageModeDecision: 'kv_binding_present' | 'explicit_test_fallback';
+  allowInMemoryFallback: boolean;
+  hasRecordingJobKvBinding: boolean;
+  appEnv: string;
+}
+
 const globalState = globalThis as typeof globalThis & {
   __meetingMemoFallbackStore?: GlobalFallbackStore;
 };
@@ -18,9 +28,10 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function normalizeDropboxPath(path?: string): string | undefined {
+export function normalizeDropboxPath(path?: string): string | undefined {
   if (!path) return undefined;
-  return path.trim().toLowerCase();
+  const normalized = path.trim().toLowerCase();
+  return normalized || undefined;
 }
 
 function buildJobKeyByRecordingId(recordingId: string): string {
@@ -39,6 +50,45 @@ function buildLegacyJobKeyByDropboxFileId(dropboxFileId: string): string {
   return `recordingJob:dropboxFileId:${dropboxFileId}`;
 }
 
+export function buildRecordingJobStorageDecision(env: Env): RecordingJobStorageDecision {
+  const hasRecordingJobKvBinding = Boolean(env.RECORDING_JOB_KV);
+  const allowInMemoryFallback = env.ALLOW_IN_MEMORY_RECORDING_JOB_STORE?.toLowerCase() === 'true';
+  const appEnv = env.APP_ENV ?? 'unknown';
+
+  if (hasRecordingJobKvBinding) {
+    return {
+      storageType: 'cloudflare-kv',
+      storageModeDecision: 'kv_binding_present',
+      allowInMemoryFallback,
+      hasRecordingJobKvBinding,
+      appEnv,
+    };
+  }
+
+  if (allowInMemoryFallback) {
+    return {
+      storageType: 'in-memory-fallback',
+      storageModeDecision: 'explicit_test_fallback',
+      allowInMemoryFallback,
+      hasRecordingJobKvBinding,
+      appEnv,
+    };
+  }
+
+  throw new HttpError('RECORDING_JOB_KV binding is required in deployed Workers runtime. In-memory store is disabled unless ALLOW_IN_MEMORY_RECORDING_JOB_STORE=true.', 500, {
+    phase: 'recording_job_storage_init',
+    storageModeDecision: 'kv_missing_and_fallback_disabled',
+    storageType: 'none',
+    hasRecordingJobKvBinding,
+    allowInMemoryFallback,
+    appEnv,
+  });
+}
+
+export function getRecordingJobStorageMeta(env: Env): RecordingJobStorageDecision {
+  return buildRecordingJobStorageDecision(env);
+}
+
 function getFallbackStore(): GlobalFallbackStore {
   if (!globalState.__meetingMemoFallbackStore) {
     globalState.__meetingMemoFallbackStore = {
@@ -51,47 +101,45 @@ function getFallbackStore(): GlobalFallbackStore {
 }
 
 function getJobKv(env: Env): RecordingJobKvStore {
-  if (!env.RECORDING_JOB_KV) {
-    if (env.APP_ENV === 'test') {
-      return {
-        async get(key: string, options?: any): Promise<any> {
-          const store = getFallbackStore();
-          const value =
-            store.jobsByRecordingId.get(key.replace('recordingJob:recordingId:', '')) ??
-            store.recordingIdByDropboxFileId.get(key.replace('recordingJob:index:dropboxFileId:', '')) ??
-            store.recordingIdByDropboxPathLower.get(key.replace('recordingJob:index:dropboxPathLower:', ''));
-          if (options?.type === 'json') return value ?? null;
-          return value ? JSON.stringify(value) : null;
-        },
-        async put(key: string, value: string): Promise<void> {
-          const store = getFallbackStore();
-          if (key.startsWith('recordingJob:recordingId:')) {
-            const parsed = JSON.parse(value) as RecordingJob;
-            store.jobsByRecordingId.set(parsed.recordingId, parsed);
-            return;
-          }
-          if (key.startsWith('recordingJob:index:dropboxFileId:')) {
-            store.recordingIdByDropboxFileId.set(key.replace('recordingJob:index:dropboxFileId:', ''), value);
-            return;
-          }
-          if (key.startsWith('recordingJob:index:dropboxPathLower:')) {
-            store.recordingIdByDropboxPathLower.set(key.replace('recordingJob:index:dropboxPathLower:', ''), value);
-            return;
-          }
-        },
-      } as RecordingJobKvStore;
-    }
-    throw new HttpError('RECORDING_JOB_KV binding is required for persistent recording job storage.', 500);
-  }
-  return env.RECORDING_JOB_KV;
+  const decision = buildRecordingJobStorageDecision(env);
+  if (decision.storageType === 'cloudflare-kv') return env.RECORDING_JOB_KV as RecordingJobKvStore;
+
+  return {
+    async get(key: string, options?: any): Promise<any> {
+      const store = getFallbackStore();
+      const value =
+        store.jobsByRecordingId.get(key.replace('recordingJob:recordingId:', '')) ??
+        store.recordingIdByDropboxFileId.get(key.replace('recordingJob:index:dropboxFileId:', '')) ??
+        store.recordingIdByDropboxPathLower.get(key.replace('recordingJob:index:dropboxPathLower:', ''));
+      if (options?.type === 'json' || options === 'json') return value ?? null;
+      return value ? JSON.stringify(value) : null;
+    },
+    async put(key: string, value: string): Promise<void> {
+      const store = getFallbackStore();
+      if (key.startsWith('recordingJob:recordingId:')) {
+        const parsed = JSON.parse(value) as RecordingJob;
+        store.jobsByRecordingId.set(parsed.recordingId, parsed);
+        return;
+      }
+      if (key.startsWith('recordingJob:index:dropboxFileId:')) {
+        store.recordingIdByDropboxFileId.set(key.replace('recordingJob:index:dropboxFileId:', ''), value);
+        return;
+      }
+      if (key.startsWith('recordingJob:index:dropboxPathLower:')) {
+        store.recordingIdByDropboxPathLower.set(key.replace('recordingJob:index:dropboxPathLower:', ''), value);
+        return;
+      }
+    },
+  } as RecordingJobKvStore;
 }
 
 async function writeJobAndIndexes(env: Env, job: RecordingJob): Promise<void> {
   const kv = getJobKv(env);
+  const normalizedDropboxPathLower = normalizeDropboxPath(job.dropboxPathLower);
   await Promise.all([
-    kv.put(buildJobKeyByRecordingId(job.recordingId), JSON.stringify(job)),
+    kv.put(buildJobKeyByRecordingId(job.recordingId), JSON.stringify({ ...job, dropboxPathLower: normalizedDropboxPathLower })),
     kv.put(buildRecordingIdIndexByDropboxFileId(job.dropboxFileId), job.recordingId),
-    job.dropboxPathLower ? kv.put(buildRecordingIdIndexByDropboxPathLower(job.dropboxPathLower), job.recordingId) : Promise.resolve(),
+    normalizedDropboxPathLower ? kv.put(buildRecordingIdIndexByDropboxPathLower(normalizedDropboxPathLower), job.recordingId) : Promise.resolve(),
   ]);
 }
 
@@ -107,7 +155,7 @@ async function getJobByDropboxFileId(env: Env, dropboxFileId: string): Promise<R
 
   const legacy = (await kv.get(buildLegacyJobKeyByDropboxFileId(dropboxFileId), 'json')) as RecordingJob | null;
   if (!legacy) return null;
-  await writeJobAndIndexes(env, { ...legacy, updatedAt: nowIso() });
+  await writeJobAndIndexes(env, { ...legacy, updatedAt: nowIso(), dropboxPathLower: normalizeDropboxPath(legacy.dropboxPathLower) });
   return legacy;
 }
 
@@ -178,10 +226,11 @@ export function createRecordingJob(input: {
 }
 
 export async function upsertRecordingJob(env: Env, job: RecordingJob): Promise<{ job: RecordingJob; created: boolean }> {
+  const normalizedDropboxPathLower = normalizeDropboxPath(job.dropboxPathLower);
   const lookup = await findRecordingJobWithSource(env, {
     recordingId: job.recordingId,
     dropboxFileId: job.dropboxFileId,
-    dropboxPathLower: job.dropboxPathLower,
+    dropboxPathLower: normalizedDropboxPathLower,
   });
 
   if (lookup.job) {
@@ -191,7 +240,7 @@ export async function upsertRecordingJob(env: Env, job: RecordingJob): Promise<{
       ...job,
       recordingId: existing.recordingId,
       dropboxFileId: existing.dropboxFileId,
-      dropboxPathLower: existing.dropboxPathLower ?? normalizeDropboxPath(job.dropboxPathLower),
+      dropboxPathLower: existing.dropboxPathLower ?? normalizedDropboxPathLower,
       createdAt: existing.createdAt,
       updatedAt: nowIso(),
       callbackStatus: existing.callbackStatus ?? job.callbackStatus,
@@ -202,7 +251,7 @@ export async function upsertRecordingJob(env: Env, job: RecordingJob): Promise<{
 
   const stored: RecordingJob = {
     ...job,
-    dropboxPathLower: normalizeDropboxPath(job.dropboxPathLower),
+    dropboxPathLower: normalizedDropboxPathLower,
     updatedAt: nowIso(),
   };
   await writeJobAndIndexes(env, stored);
