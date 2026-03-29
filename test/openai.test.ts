@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import { Blob } from 'node:buffer';
 
-import { createChunkPlan, validateChunk, transcribeWithDiarization, buildChunkLogMeta } from '../src/lib/openai';
+import { createChunkPlan, validateChunk, transcribeWithDiarization, buildChunkLogMeta, summarizeInterview } from '../src/lib/openai';
 import { HttpError } from '../src/lib/http';
 
 const env = { OPENAI_API_KEY: 'test' } as any;
@@ -111,4 +111,43 @@ test('log metadata contains required fields', () => {
   for (const key of ['sourceFileName','sourceDurationSec','sourceBytes','chunkIndex','chunkCount','startOffsetMs','estimatedDurationSec','bytes','extension','mimeType','codec','container','sampleRate','channels','strategy','validationPassed']) {
     assert.ok(key in meta, `missing ${key}`);
   }
+});
+
+test('summarizeInterview accepts payload.output_text', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = (async () => new Response(JSON.stringify({
+    output_text: JSON.stringify({ summary: '要約A', myTasks: ['A'], otherTasks: ['B'], ambiguities: [] }),
+  }), { status: 200, headers: { 'content-type': 'application/json' } })) as any;
+
+  const result = await summarizeInterview(env, { fullText: 'text', segments: [], raw: { source: true } });
+  global.fetch = originalFetch;
+
+  assert.equal(result.summary, '要約A');
+  assert.deepEqual(result.myTasks, ['A']);
+});
+
+test('summarizeInterview accepts payload.output[].content[].text', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = (async () => new Response(JSON.stringify({
+    output: [{ content: [{ type: 'output_text', text: JSON.stringify({ summary: '要約B', myTasks: ['C'], otherTasks: ['D'], ambiguities: [] }) }] }],
+  }), { status: 200, headers: { 'content-type': 'application/json' } })) as any;
+
+  const result = await summarizeInterview(env, { fullText: 'text', segments: [], raw: { source: true } });
+  global.fetch = originalFetch;
+
+  assert.equal(result.summary, '要約B');
+  assert.deepEqual(result.otherTasks, ['D']);
+});
+
+test('summarizeInterview throws parse error when summary json is invalid', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = (async () => new Response(JSON.stringify({
+    output: [{ content: [{ type: 'output_text', text: '{broken-json' }] }],
+  }), { status: 200, headers: { 'content-type': 'application/json' } })) as any;
+
+  await assert.rejects(
+    summarizeInterview(env, { fullText: 'text', segments: [], raw: { source: true } }),
+    /Summary response parse failed/,
+  );
+  global.fetch = originalFetch;
 });

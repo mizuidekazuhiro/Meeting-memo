@@ -501,18 +501,68 @@ export async function transcribeWithDiarization(env: Env, audio: Blob, fileName:
 }
 
 export async function summarizeInterview(env: Env, transcript: TranscriptResult): Promise<InterviewInsights> {
-  const response = await fetch(`${OPENAI_API}/responses`, {
-    method: 'POST',
-    headers: { authorization: `Bearer ${env.OPENAI_API_KEY}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ model: env.OPENAI_MODEL_SUMMARIZE ?? 'gpt-4.1-mini', input: [{ role: 'system', content: [{ type: 'input_text', text: ['あなたは会議メモ作成アシスタントです。', '文字起こしに基づいてのみ、日本語で簡潔に要点を要約してください。', '誇張や推測は禁止です。', 'JSONは summary, myTasks, otherTasks, ambiguities の4キーだけを返してください。', 'myTasks と otherTasks は文字列配列にしてください。', '担当不明なタスクは推測せず ambiguities に書いてください。'].join(' ') }] }, { role: 'user', content: [{ type: 'input_text', text: transcript.fullText }] }], text: { format: { type: 'json_schema', name: 'interview_insights', schema: { type: 'object', additionalProperties: false, required: ['summary', 'myTasks', 'otherTasks', 'ambiguities'], properties: { summary: { type: 'string' }, myTasks: { type: 'array', items: { type: 'string' } }, otherTasks: { type: 'array', items: { type: 'string' } }, ambiguities: { type: 'array', items: { type: 'string' } } } } } } }),
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${OPENAI_API}/responses`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${env.OPENAI_API_KEY}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: env.OPENAI_MODEL_SUMMARIZE ?? 'gpt-4.1-mini', input: [{ role: 'system', content: [{ type: 'input_text', text: ['あなたは会議メモ作成アシスタントです。', '文字起こしに基づいてのみ、日本語で簡潔に要点を要約してください。', '誇張や推測は禁止です。', 'JSONは summary, myTasks, otherTasks, ambiguities の4キーだけを返してください。', 'myTasks と otherTasks は文字列配列にしてください。', '担当不明なタスクは推測せず ambiguities に書いてください。'].join(' ') }] }, { role: 'user', content: [{ type: 'input_text', text: transcript.fullText }] }], text: { format: { type: 'json_schema', name: 'interview_insights', schema: { type: 'object', additionalProperties: false, required: ['summary', 'myTasks', 'otherTasks', 'ambiguities'], properties: { summary: { type: 'string' }, myTasks: { type: 'array', items: { type: 'string' } }, otherTasks: { type: 'array', items: { type: 'string' } }, ambiguities: { type: 'array', items: { type: 'string' } } } } } } }),
+    });
+  } catch (error) {
+    logEvent('error', 'summary request failed', { details: error instanceof Error ? error.message : error });
+    throw new HttpError('Summary request failed.', 502, { cause: error instanceof Error ? error.message : error });
+  }
   if (!response.ok) {
     const responseText = await readResponseTextSafely(response);
-    console.error('openai.summary.failed', { responseStatus: response.status, responseText });
-    throw new HttpError('Summary generation failed.', 502, { responseStatus: response.status, responseText });
+    logEvent('error', 'summary request failed', { responseStatus: response.status, responseTextPreview: responseText.slice(0, 300) });
+    throw new HttpError('Summary generation failed.', 502, { responseStatus: response.status, responseTextPreview: responseText.slice(0, 300) });
   }
-  const payload = (await response.json()) as { output_text?: string };
-  if (!payload.output_text) throw new HttpError('Summary response did not include output_text.', 502, payload);
-  const parsed = JSON.parse(payload.output_text) as Omit<InterviewInsights, 'raw'>;
-  return { ...parsed, raw: payload };
+  const payload = (await response.json()) as unknown;
+  const summaryText = extractSummaryTextFromResponsesPayload(payload);
+  if (!summaryText) {
+    const payloadPreview = buildSummaryPayloadPreview(payload);
+    logEvent('error', 'summary response text missing', payloadPreview);
+    throw new HttpError('Summary response text missing.', 502, payloadPreview);
+  }
+  try {
+    const parsed = JSON.parse(summaryText) as Omit<InterviewInsights, 'raw'>;
+    return { ...parsed, raw: payload };
+  } catch (error) {
+    const details = { ...buildSummaryPayloadPreview(payload), summaryTextPreview: summaryText.slice(0, 400), parseMessage: error instanceof Error ? error.message : String(error) };
+    logEvent('error', 'summary response parse failed', details);
+    throw new HttpError('Summary response parse failed.', 502, details);
+  }
+}
+
+type ResponsesOutputContent = { type?: string; text?: string };
+type ResponsesOutputItem = { content?: ResponsesOutputContent[] };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function buildSummaryPayloadPreview(payload: unknown): Record<string, unknown> {
+  if (!isRecord(payload)) return { payloadType: typeof payload };
+  const output = Array.isArray(payload.output) ? payload.output : [];
+  return {
+    payloadKeys: Object.keys(payload).slice(0, 20),
+    outputLength: output.length,
+    firstOutputContentTypes: isRecord(output[0]) && Array.isArray(output[0].content)
+      ? output[0].content.map((entry) => (isRecord(entry) && typeof entry.type === 'string' ? entry.type : typeof entry)).slice(0, 10)
+      : [],
+  };
+}
+
+export function extractSummaryTextFromResponsesPayload(payload: unknown): string | undefined {
+  if (!isRecord(payload)) return undefined;
+  if (typeof payload.output_text === 'string' && payload.output_text.trim()) return payload.output_text;
+  if (!Array.isArray(payload.output)) return undefined;
+
+  for (const outputItem of payload.output as ResponsesOutputItem[]) {
+    if (!outputItem || !Array.isArray(outputItem.content)) continue;
+    for (const contentItem of outputItem.content) {
+      if (contentItem?.type === 'output_text' && typeof contentItem.text === 'string' && contentItem.text.trim()) return contentItem.text;
+    }
+  }
+  return undefined;
 }

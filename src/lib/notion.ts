@@ -139,6 +139,13 @@ function buildTranscriptParagraphs(record: InterviewRecord): string[] {
 
 function buildProperties(record: InterviewRecord) {
   const recordedAt = record.request.recordedAt ?? record.metadata.client_modified ?? record.metadata.server_modified;
+  const rawJson = {
+    transcript: record.transcript?.raw,
+    insights: record.insights?.raw,
+    summaryRaw: record.summaryRaw,
+    summaryErrorMessage: record.summaryErrorMessage,
+    summaryErrorDetails: record.summaryErrorDetails,
+  };
   return {
     Name: {
       title: titleText(record.title),
@@ -164,7 +171,7 @@ function buildProperties(record: InterviewRecord) {
       },
     },
     'Error Message': record.errorMessage ? { rich_text: richText(record.errorMessage) } : undefined,
-    'Raw JSON': { rich_text: richText(JSON.stringify({ transcript: record.transcript?.raw, insights: record.insights?.raw })) },
+    'Raw JSON': { rich_text: richText(JSON.stringify(rawJson)) },
     'Imported At': { date: { start: new Date().toISOString() } },
     'Dedup Key': { rich_text: richText(record.dedupKey) },
   };
@@ -204,6 +211,7 @@ export async function upsertInterviewFromTranscript(
   metadata: InterviewRecord['metadata'],
   transcript: InterviewRecord['transcript'],
   insights?: InterviewRecord['insights'],
+  options: { errorMessage?: string; summaryRaw?: unknown; summaryErrorMessage?: string; summaryErrorDetails?: unknown } = {},
 ): Promise<{ pageId?: string; created?: boolean; record: InterviewRecord }> {
   const recordedAt = request.recordedAt ?? metadata.server_modified ?? metadata.client_modified ?? new Date().toISOString();
   const date = new Date(recordedAt);
@@ -215,7 +223,11 @@ export async function upsertInterviewFromTranscript(
     request,
     transcript,
     insights,
+    summaryRaw: options.summaryRaw,
+    summaryErrorMessage: options.summaryErrorMessage,
+    summaryErrorDetails: options.summaryErrorDetails,
     processingStatus: 'transcribed',
+    errorMessage: options.errorMessage,
   };
   const existing = await findExistingInterview(env, [record.dedupKey]);
   const result = await upsertInterviewPage(env, record, existing);

@@ -108,6 +108,9 @@ export interface InterviewRecord {
   metadata: DropboxFileMetadata;
   transcript?: TranscriptResult;
   insights?: InterviewInsights;
+  summaryRaw?: unknown;
+  summaryErrorMessage?: string;
+  summaryErrorDetails?: unknown;
   request: IntakeRequest;
   processingStatus: 'pending' | 'transcribing' | 'transcribed' | 'completed' | 'persisted' | 'error';
   errorMessage?: string;
