@@ -1,18 +1,18 @@
 import pytest
 
-from ffmpeg_utils import ChunkPlanEntry, build_chunk_plan
+from ffmpeg_utils import ChunkPlanEntry, SourceMetadata, build_chunk_plan
 from models import TranscriptResult, TranscriptSegment
 from transcription_service import merge_results
 
 
 class _FakeResponse:
     def model_dump(self):
-        return {'text': 'ok', 'diarized_segments': []}
+        return {'text': 'ok', 'segments': []}
 
 
 class _FakeStringResponse:
     def model_dump(self):
-        return '{"text":"ok","diarized_segments":[]}'
+        return '{"text":"ok","segments":[]}'
 
 
 class _FakeTranscriptions:
@@ -71,6 +71,10 @@ class _FakeBadOpenAI:
         self.audio = _FakeBadAudio()
 
 
+def _stub_ffprobe(*args, **kwargs):
+    return SourceMetadata(duration_sec=1.2, codec='aac', sample_rate=48000, channels=2, container='mp4')
+
+
 def test_chunk_plan_generation_for_long_audio():
     plan = build_chunk_plan(1800, 1024)
     assert len(plan) == 3
@@ -87,7 +91,7 @@ def test_transcript_merge_order_by_chunk_index():
     merged = merge_results([
         (
             ChunkPlanEntry(1, 2, 600000, 1200000, 600),
-            TranscriptResult(fullText='second', segments=[TranscriptSegment(speaker='spk2', startMs=0, endMs=500, text='second')], raw={'idx': 1}),
+            TranscriptResult(fullText=' second\n\n\n', segments=[TranscriptSegment(speaker='spk2', startMs=0, endMs=500, text='second')], raw={'idx': 1}),
         ),
         (
             ChunkPlanEntry(0, 2, 0, 600000, 600),
@@ -96,6 +100,21 @@ def test_transcript_merge_order_by_chunk_index():
     ])
     assert merged.fullText == 'first\n\nsecond'
     assert [s.startMs for s in merged.segments] == [0, 600000]
+
+
+def test_merge_results_corrects_inverted_timestamps():
+    merged = merge_results([
+        (
+            ChunkPlanEntry(0, 1, 1000, 2000, 1),
+            TranscriptResult(
+                fullText='x',
+                segments=[TranscriptSegment(speaker='spk', startMs=300, endMs=100, text='text')],
+                raw={'idx': 0},
+            ),
+        )
+    ])
+    assert merged.segments[0].startMs == 1300
+    assert merged.segments[0].endMs == 1300
 
 
 def test_transcribe_file_passes_chunking_strategy(monkeypatch, tmp_path):
@@ -107,6 +126,8 @@ def test_transcribe_file_passes_chunking_strategy(monkeypatch, tmp_path):
 
     importlib.reload(config)
     importlib.reload(transcription_service)
+
+    monkeypatch.setattr(transcription_service, 'ffprobe_metadata', _stub_ffprobe)
 
     service = transcription_service.TranscriptionService()
     fake = _FakeOpenAI()
@@ -144,8 +165,6 @@ def test_transcribe_file_raises_when_chunking_strategy_missing(monkeypatch, tmp_
     assert 'DIARIZATION_CHUNKING_STRATEGY must be configured' in str(exc.value)
 
 
-
-
 def test_transcribe_file_wraps_normalize_runtime_error(monkeypatch, tmp_path):
     monkeypatch.setenv('DIARIZATION_CHUNKING_STRATEGY', 'auto')
 
@@ -155,6 +174,8 @@ def test_transcribe_file_wraps_normalize_runtime_error(monkeypatch, tmp_path):
 
     importlib.reload(config)
     importlib.reload(transcription_service)
+
+    monkeypatch.setattr(transcription_service, 'ffprobe_metadata', _stub_ffprobe)
 
     service = transcription_service.TranscriptionService()
     service.openai = _FakeBadOpenAI()
@@ -168,6 +189,7 @@ def test_transcribe_file_wraps_normalize_runtime_error(monkeypatch, tmp_path):
     assert exc.value.source == 'openai_response'
     assert 'Unexpected transcription response type' in str(exc.value)
 
+
 def test_transcribe_file_accepts_json_string_payload(monkeypatch, tmp_path):
     monkeypatch.setenv('DIARIZATION_CHUNKING_STRATEGY', 'auto')
 
@@ -177,6 +199,8 @@ def test_transcribe_file_accepts_json_string_payload(monkeypatch, tmp_path):
 
     importlib.reload(config)
     importlib.reload(transcription_service)
+
+    monkeypatch.setattr(transcription_service, 'ffprobe_metadata', _stub_ffprobe)
 
     service = transcription_service.TranscriptionService()
     service.openai = _FakeStringOpenAI()
