@@ -19,3 +19,9 @@ def test_parse_diarized_payload():
     assert result.segments[0].speaker == 'spk1'
     assert result.segments[0].startMs == 0
     assert result.segments[0].endMs == 1000
+
+
+def test_parse_diarized_payload_handles_unexpected_shapes():
+    result = parse_transcript_response({'text': 'hello', 'diarized_segments': 'unexpected'})
+    assert result.fullText == 'hello'
+    assert result.segments == []
