@@ -11,6 +11,7 @@ from .models import TranscriptionJobRequest
 from .service import InputValidationError, PipelineService, UpstreamParseError
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
+logger = logging.getLogger(__name__)
 app = FastAPI(title='meeting-memo-python-transcribe-service')
 service = PipelineService()
 
@@ -63,11 +64,11 @@ def start_job(job: TranscriptionJobRequest) -> dict[str, object]:
         service.callback_workers(payload, callback_url=job.callbackUrl)
         return {'ok': True, 'recordingId': payload.recordingId, 'status': 'transcribed'}
     except (InputValidationError, ValueError) as exc:
-        logging.exception('python transcription pipeline input validation failed')
+        logger.exception('python transcription pipeline input validation failed')
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except (UpstreamParseError, httpx.HTTPStatusError) as exc:
-        logging.exception('python transcription pipeline upstream handling failed')
+        logger.exception('python transcription pipeline upstream handling failed')
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        logging.exception('python transcription pipeline failed')
+        logger.exception('python transcription pipeline failed')
         raise HTTPException(status_code=500, detail=str(exc)) from exc
