@@ -228,6 +228,11 @@ async function handleTranscriptionCallback(request: Request, env: Env): Promise<
     });
     throw error;
   }
+  logEvent('info', 'transcription callback received', {
+    recordingId: payload.recordingId ?? null,
+    dropboxFileId: payload.dropboxFileId ?? null,
+    path: payload.dropboxPathLower ?? null,
+  });
   try {
     const result = await persistTranscriptionCallback(env, payload);
     return jsonResponse({ ok: result.action === 'processed', action: result.action, reason: result.reason, pageId: result.pageId, created: result.created });
