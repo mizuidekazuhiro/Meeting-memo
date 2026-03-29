@@ -1,17 +1,140 @@
-import type { Env, IntakeRequest, RecordingJob, RecordingJobCallbackPayload, RecordingJobStatus } from '../types';
+import { HttpError } from './http';
+import type { Env, IntakeRequest, RecordingJob, RecordingJobCallbackPayload, RecordingJobKvStore, RecordingJobStatus } from '../types';
 
-const globalState = globalThis as typeof globalThis & {
-  __meetingMemoJobs?: Map<string, RecordingJob>;
-  __meetingMemoJobsByRecordingId?: Map<string, string>;
+type LookupKey = { recordingId?: string; dropboxFileId?: string; dropboxPathLower?: string };
+type LookupSource = 'recordingId' | 'dropboxFileId' | 'dropboxPathLower' | 'legacyDropboxFileId';
+
+type GlobalFallbackStore = {
+  jobsByRecordingId: Map<string, RecordingJob>;
+  recordingIdByDropboxFileId: Map<string, string>;
+  recordingIdByDropboxPathLower: Map<string, string>;
 };
 
-function jobStore(): { byDropboxId: Map<string, RecordingJob>; byRecordingId: Map<string, string> } {
-  if (!globalState.__meetingMemoJobs) globalState.__meetingMemoJobs = new Map();
-  if (!globalState.__meetingMemoJobsByRecordingId) globalState.__meetingMemoJobsByRecordingId = new Map();
-  return { byDropboxId: globalState.__meetingMemoJobs, byRecordingId: globalState.__meetingMemoJobsByRecordingId };
+const globalState = globalThis as typeof globalThis & {
+  __meetingMemoFallbackStore?: GlobalFallbackStore;
+};
+
+function nowIso(): string {
+  return new Date().toISOString();
 }
 
-function nowIso(): string { return new Date().toISOString(); }
+function normalizeDropboxPath(path?: string): string | undefined {
+  if (!path) return undefined;
+  return path.trim().toLowerCase();
+}
+
+function buildJobKeyByRecordingId(recordingId: string): string {
+  return `recordingJob:recordingId:${recordingId}`;
+}
+
+function buildRecordingIdIndexByDropboxFileId(dropboxFileId: string): string {
+  return `recordingJob:index:dropboxFileId:${dropboxFileId}`;
+}
+
+function buildRecordingIdIndexByDropboxPathLower(dropboxPathLower: string): string {
+  return `recordingJob:index:dropboxPathLower:${dropboxPathLower}`;
+}
+
+function buildLegacyJobKeyByDropboxFileId(dropboxFileId: string): string {
+  return `recordingJob:dropboxFileId:${dropboxFileId}`;
+}
+
+function getFallbackStore(): GlobalFallbackStore {
+  if (!globalState.__meetingMemoFallbackStore) {
+    globalState.__meetingMemoFallbackStore = {
+      jobsByRecordingId: new Map(),
+      recordingIdByDropboxFileId: new Map(),
+      recordingIdByDropboxPathLower: new Map(),
+    };
+  }
+  return globalState.__meetingMemoFallbackStore;
+}
+
+function getJobKv(env: Env): RecordingJobKvStore {
+  if (!env.RECORDING_JOB_KV) {
+    if (env.APP_ENV === 'test') {
+      return {
+        async get(key: string, options?: any): Promise<any> {
+          const store = getFallbackStore();
+          const value =
+            store.jobsByRecordingId.get(key.replace('recordingJob:recordingId:', '')) ??
+            store.recordingIdByDropboxFileId.get(key.replace('recordingJob:index:dropboxFileId:', '')) ??
+            store.recordingIdByDropboxPathLower.get(key.replace('recordingJob:index:dropboxPathLower:', ''));
+          if (options?.type === 'json') return value ?? null;
+          return value ? JSON.stringify(value) : null;
+        },
+        async put(key: string, value: string): Promise<void> {
+          const store = getFallbackStore();
+          if (key.startsWith('recordingJob:recordingId:')) {
+            const parsed = JSON.parse(value) as RecordingJob;
+            store.jobsByRecordingId.set(parsed.recordingId, parsed);
+            return;
+          }
+          if (key.startsWith('recordingJob:index:dropboxFileId:')) {
+            store.recordingIdByDropboxFileId.set(key.replace('recordingJob:index:dropboxFileId:', ''), value);
+            return;
+          }
+          if (key.startsWith('recordingJob:index:dropboxPathLower:')) {
+            store.recordingIdByDropboxPathLower.set(key.replace('recordingJob:index:dropboxPathLower:', ''), value);
+            return;
+          }
+        },
+      } as RecordingJobKvStore;
+    }
+    throw new HttpError('RECORDING_JOB_KV binding is required for persistent recording job storage.', 500);
+  }
+  return env.RECORDING_JOB_KV;
+}
+
+async function writeJobAndIndexes(env: Env, job: RecordingJob): Promise<void> {
+  const kv = getJobKv(env);
+  await Promise.all([
+    kv.put(buildJobKeyByRecordingId(job.recordingId), JSON.stringify(job)),
+    kv.put(buildRecordingIdIndexByDropboxFileId(job.dropboxFileId), job.recordingId),
+    job.dropboxPathLower ? kv.put(buildRecordingIdIndexByDropboxPathLower(job.dropboxPathLower), job.recordingId) : Promise.resolve(),
+  ]);
+}
+
+async function getJobByRecordingId(env: Env, recordingId: string): Promise<RecordingJob | null> {
+  const kv = getJobKv(env);
+  return (await kv.get(buildJobKeyByRecordingId(recordingId), 'json')) as RecordingJob | null;
+}
+
+async function getJobByDropboxFileId(env: Env, dropboxFileId: string): Promise<RecordingJob | null> {
+  const kv = getJobKv(env);
+  const recordingId = await kv.get(buildRecordingIdIndexByDropboxFileId(dropboxFileId));
+  if (typeof recordingId === 'string' && recordingId) return getJobByRecordingId(env, recordingId);
+
+  const legacy = (await kv.get(buildLegacyJobKeyByDropboxFileId(dropboxFileId), 'json')) as RecordingJob | null;
+  if (!legacy) return null;
+  await writeJobAndIndexes(env, { ...legacy, updatedAt: nowIso() });
+  return legacy;
+}
+
+async function getJobByDropboxPathLower(env: Env, dropboxPathLower: string): Promise<RecordingJob | null> {
+  const kv = getJobKv(env);
+  const normalized = normalizeDropboxPath(dropboxPathLower);
+  if (!normalized) return null;
+  const recordingId = await kv.get(buildRecordingIdIndexByDropboxPathLower(normalized));
+  if (typeof recordingId !== 'string' || !recordingId) return null;
+  return getJobByRecordingId(env, recordingId);
+}
+
+export async function findRecordingJobWithSource(env: Env, lookup: LookupKey): Promise<{ job: RecordingJob | null; source?: LookupSource }> {
+  if (lookup.recordingId) {
+    const byRecordingId = await getJobByRecordingId(env, lookup.recordingId);
+    if (byRecordingId) return { job: byRecordingId, source: 'recordingId' };
+  }
+  if (lookup.dropboxFileId) {
+    const byDropboxId = await getJobByDropboxFileId(env, lookup.dropboxFileId);
+    if (byDropboxId) return { job: byDropboxId, source: 'dropboxFileId' };
+  }
+  if (lookup.dropboxPathLower) {
+    const byPath = await getJobByDropboxPathLower(env, lookup.dropboxPathLower);
+    if (byPath) return { job: byPath, source: 'dropboxPathLower' };
+  }
+  return { job: null };
+}
 
 export function buildRecordingId(dropboxFileId: string, fileName: string): string {
   const safeName = fileName.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/-{2,}/g, '-').replace(/^-+|-+$/g, '') || 'audio';
@@ -34,60 +157,94 @@ export function createRecordingJob(input: {
     recordingId,
     fileName: input.fileName,
     dropboxFileId: input.dropboxFileId,
-    dropboxPathLower: input.dropboxPathLower,
+    dropboxPathLower: normalizeDropboxPath(input.dropboxPathLower),
     sourceBytes: input.sourceBytes,
     sourceDurationSec: input.sourceDurationSec,
     uploadSource: 'shortcut',
     status: 'uploaded',
+    callbackStatus: 'pending',
     retryCount: 0,
     createdAt: timestamp,
     updatedAt: timestamp,
     clientModified: input.clientModified,
     serverModified: input.serverModified,
     request: input.request,
+    transcriptionRequestMetadata: {
+      requestFileName: input.request.fileName,
+      requestDropboxFileId: input.request.dropboxFileId,
+      requestDropboxPathLower: input.request.dropboxPathLower,
+    },
   };
 }
 
-export async function upsertRecordingJob(_env: Env, job: RecordingJob): Promise<{ job: RecordingJob; created: boolean }> {
-  const store = jobStore();
-  const existing = store.byDropboxId.get(job.dropboxFileId) ?? (store.byRecordingId.get(job.recordingId) ? store.byDropboxId.get(store.byRecordingId.get(job.recordingId)!) : undefined);
-  if (existing) {
-    const merged = { ...existing, ...job, recordingId: existing.recordingId, dropboxFileId: existing.dropboxFileId, createdAt: existing.createdAt, updatedAt: nowIso() };
-    store.byDropboxId.set(existing.dropboxFileId, merged);
-    store.byRecordingId.set(existing.recordingId, existing.dropboxFileId);
+export async function upsertRecordingJob(env: Env, job: RecordingJob): Promise<{ job: RecordingJob; created: boolean }> {
+  const lookup = await findRecordingJobWithSource(env, {
+    recordingId: job.recordingId,
+    dropboxFileId: job.dropboxFileId,
+    dropboxPathLower: job.dropboxPathLower,
+  });
+
+  if (lookup.job) {
+    const existing = lookup.job;
+    const merged: RecordingJob = {
+      ...existing,
+      ...job,
+      recordingId: existing.recordingId,
+      dropboxFileId: existing.dropboxFileId,
+      dropboxPathLower: existing.dropboxPathLower ?? normalizeDropboxPath(job.dropboxPathLower),
+      createdAt: existing.createdAt,
+      updatedAt: nowIso(),
+      callbackStatus: existing.callbackStatus ?? job.callbackStatus,
+    };
+    await writeJobAndIndexes(env, merged);
     return { job: merged, created: false };
   }
-  const stored = { ...job, updatedAt: nowIso() };
-  store.byDropboxId.set(stored.dropboxFileId, stored);
-  store.byRecordingId.set(stored.recordingId, stored.dropboxFileId);
+
+  const stored: RecordingJob = {
+    ...job,
+    dropboxPathLower: normalizeDropboxPath(job.dropboxPathLower),
+    updatedAt: nowIso(),
+  };
+  await writeJobAndIndexes(env, stored);
   return { job: stored, created: true };
 }
 
-export async function getRecordingJob(env: Env, lookup: { recordingId?: string; dropboxFileId?: string }): Promise<RecordingJob | null> {
-  void env;
-  const store = jobStore();
-  if (lookup.dropboxFileId) return store.byDropboxId.get(lookup.dropboxFileId) ?? null;
-  if (lookup.recordingId) {
-    const dropboxId = store.byRecordingId.get(lookup.recordingId);
-    return dropboxId ? store.byDropboxId.get(dropboxId) ?? null : null;
-  }
-  return null;
+export async function getRecordingJob(env: Env, lookup: LookupKey): Promise<RecordingJob | null> {
+  const found = await findRecordingJobWithSource(env, lookup);
+  return found.job;
 }
 
-export async function updateRecordingJobStatus(env: Env, lookup: { recordingId?: string; dropboxFileId?: string }, status: RecordingJobStatus, patch: Partial<RecordingJob> = {}): Promise<RecordingJob | null> {
+export async function updateRecordingJobStatus(env: Env, lookup: LookupKey, status: RecordingJobStatus, patch: Partial<RecordingJob> = {}): Promise<RecordingJob | null> {
   const existing = await getRecordingJob(env, lookup);
   if (!existing) return null;
-  const updated: RecordingJob = { ...existing, ...patch, status, updatedAt: nowIso() };
-  jobStore().byDropboxId.set(existing.dropboxFileId, updated);
+  const updated: RecordingJob = {
+    ...existing,
+    ...patch,
+    dropboxPathLower: normalizeDropboxPath(patch.dropboxPathLower) ?? existing.dropboxPathLower,
+    status,
+    updatedAt: nowIso(),
+  };
+  await writeJobAndIndexes(env, updated);
   return updated;
 }
 
-export async function markJobFailed(env: Env, lookup: { recordingId?: string; dropboxFileId?: string }, errorMessage: string, patch: Partial<RecordingJob> = {}): Promise<RecordingJob | null> {
+export async function markJobFailed(env: Env, lookup: LookupKey, errorMessage: string, patch: Partial<RecordingJob> = {}): Promise<RecordingJob | null> {
   const existing = await getRecordingJob(env, lookup);
   if (!existing) return null;
-  return updateRecordingJobStatus(env, lookup, 'failed', { ...patch, errorMessage, retryCount: existing.retryCount + 1 });
+  return updateRecordingJobStatus(env, lookup, 'failed', {
+    ...patch,
+    callbackStatus: 'failed',
+    errorMessage,
+    retryCount: existing.retryCount + 1,
+  });
 }
 
 export function buildCallbackPayload(job: RecordingJob, payload: RecordingJobCallbackPayload): RecordingJobCallbackPayload {
-  return { ...payload, recordingId: job.recordingId, dropboxFileId: job.dropboxFileId, dropboxPathLower: job.dropboxPathLower, fileName: job.fileName };
+  return {
+    ...payload,
+    recordingId: job.recordingId,
+    dropboxFileId: job.dropboxFileId,
+    dropboxPathLower: job.dropboxPathLower,
+    fileName: job.fileName,
+  };
 }

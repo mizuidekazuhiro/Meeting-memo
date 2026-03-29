@@ -11,3 +11,7 @@ DROPBOX_INTERVIEW_SCAN_FOLDER = "/Apps/MeetingMemo/inbox"
 DROPBOX_INTERVIEW_SCAN_RECURSIVE = "false"
 INTERVIEW_SCAN_MAX_FILES = "20"
 DROPBOX_UPLOAD_FOLDER = "/Apps/MeetingMemo/inbox"
+
+[[kv_namespaces]]
+binding = "RECORDING_JOB_KV"
+id = "replace-with-your-recording-job-kv-id"

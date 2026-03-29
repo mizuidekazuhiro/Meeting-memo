@@ -84,7 +84,22 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 
 - `PYTHON_TRANSCRIBE_API_URL`（ベースURL）
 - `PYTHON_TRANSCRIBE_API_TOKEN`
+- `RECORDING_JOB_KV`（recording job 永続化用 KV バインディング）
 - 既存 Dropbox / OpenAI / Notion 関連 env
+
+## Recording callback の lookup 仕様
+
+- job 保存は `recordingId` を主キーに KV 永続化
+- secondary index:
+  - `dropboxFileId -> recordingId`
+  - `dropboxPathLower -> recordingId`
+- callback lookup 順序:
+  1. `recordingId`
+  2. `dropboxFileId`
+  3. `dropboxPathLower`
+
+lookup 失敗時は `Recording job not found for callback.` を返しつつ、
+Worker ログに lookup 条件と transcript preview（長さ制限あり）を出力します。
 
 ### Python API 側
 

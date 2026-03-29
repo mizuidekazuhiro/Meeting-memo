@@ -1,3 +1,8 @@
+export interface RecordingJobKvStore {
+  get(key: string, type?: 'text' | 'json'): Promise<string | null | unknown>;
+  put(key: string, value: string): Promise<void>;
+}
+
 export interface Env {
   APP_ENV?: string;
   INTERVIEW_WEBHOOK_SECRET: string;
@@ -17,6 +22,7 @@ export interface Env {
   PYTHON_TRANSCRIBE_API_URL?: string;
   PYTHON_TRANSCRIBE_API_TOKEN?: string;
   WORKERS_CALLBACK_BASE_URL?: string;
+  RECORDING_JOB_KV?: RecordingJobKvStore;
 }
 
 export interface IntakeRequest {
@@ -136,15 +142,17 @@ export interface RecordingJob {
   clientModified?: string;
   serverModified?: string;
   request: IntakeRequest;
+  callbackStatus?: 'pending' | 'received' | 'persisted' | 'failed';
+  transcriptionRequestMetadata?: Record<string, unknown>;
   transcript?: TranscriptResult;
   errorMessage?: string;
 }
 
 export interface RecordingJobCallbackPayload {
-  recordingId: string;
-  dropboxFileId: string;
+  recordingId?: string;
+  dropboxFileId?: string;
   dropboxPathLower?: string;
-  fileName: string;
+  fileName?: string;
   sourceDurationSec?: number;
   transcript: TranscriptResult;
 }

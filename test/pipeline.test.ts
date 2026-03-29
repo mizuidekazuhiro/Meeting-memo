@@ -6,7 +6,20 @@ import { createRecordingJob, getRecordingJob, upsertRecordingJob } from '../src/
 import { mergeTranscriptResultsInOrder } from '../src/lib/transcript-merge';
 import { shouldAttemptDirectWorkerTranscription } from '../src/lib/processing';
 
-const env = {} as any;
+class MockKv {
+  map = new Map<string, string>();
+  async get(key: string, type?: 'text' | 'json') {
+    const value = this.map.get(key);
+    if (value === undefined) return null;
+    if (type === 'json') return JSON.parse(value);
+    return value;
+  }
+  async put(key: string, value: string) {
+    this.map.set(key, value);
+  }
+}
+
+const env = { APP_ENV: 'test', RECORDING_JOB_KV: new MockKv() } as any;
 
 test('upload metadata immediately creates a job without Dropbox scan', async () => {
   const seeded = createRecordingJob({

@@ -2,7 +2,7 @@ import type { DropboxFileMetadata, Env, IntakeRequest, ProcessInterviewResult, R
 import { buildDedupCandidates } from './dedup';
 import { downloadDropboxFile } from './dropbox';
 import { HttpError } from './http';
-import { getRecordingJob, markJobFailed, updateRecordingJobStatus } from './jobs';
+import { findRecordingJobWithSource, markJobFailed, updateRecordingJobStatus } from './jobs';
 import { logEvent } from './logger';
 import { upsertInterviewFromTranscript } from './notion';
 import { inspectAudioSource, MAX_TRANSCRIBE_DURATION_SEC, transcribeWithDiarization } from './openai';
@@ -33,13 +33,17 @@ function resolvePythonTranscribeDispatchUrl(baseUrl: string | undefined): string
 
 export async function dispatchLongAudioJob(env: Env, job: RecordingJob, metadata: DropboxFileMetadata): Promise<void> {
   const dispatchUrl = resolvePythonTranscribeDispatchUrl(env.PYTHON_TRANSCRIBE_API_URL);
+  const callbackUrl = env.WORKERS_CALLBACK_BASE_URL ? `${env.WORKERS_CALLBACK_BASE_URL}/api/interviews/transcription-callback` : undefined;
 
-  logEvent('info', 'python service dispatch started', {
+  logEvent('info', 'transcription dispatched', {
     recordingId: job.recordingId,
-    fileName: job.fileName,
-    dropboxFileId: job.dropboxFileId,
-    dropboxPathLower: job.dropboxPathLower,
-    details: { dispatchUrl },
+    callbackUrl,
+    details: {
+      dispatchUrl,
+      fileName: job.fileName,
+      dropboxFileId: job.dropboxFileId,
+      dropboxPathLower: job.dropboxPathLower,
+    },
   });
 
   const response = await fetch(dispatchUrl, {
@@ -58,7 +62,7 @@ export async function dispatchLongAudioJob(env: Env, job: RecordingJob, metadata
       client_modified: metadata.client_modified,
       server_modified: metadata.server_modified,
       request: job.request,
-      callbackUrl: env.WORKERS_CALLBACK_BASE_URL ? `${env.WORKERS_CALLBACK_BASE_URL}/api/interviews/transcription-callback` : undefined,
+      callbackUrl,
     }),
   });
 
@@ -128,23 +132,98 @@ export async function processUploadedInterview(env: Env, request: IntakeRequest,
 }
 
 export async function persistTranscriptionCallback(env: Env, payload: RecordingJobCallbackPayload): Promise<ProcessInterviewResult> {
-  const job = await getRecordingJob(env, { recordingId: payload.recordingId, dropboxFileId: payload.dropboxFileId });
-  if (!job) throw new HttpError('Recording job not found for callback.', 404, payload);
+  const recordingId = payload.recordingId?.trim();
+  const dropboxFileId = payload.dropboxFileId?.trim();
+  const dropboxPathLower = payload.dropboxPathLower?.trim().toLowerCase();
+  const fileName = payload.fileName?.trim();
+
+  logEvent('info', 'recording job lookup started', {
+    event: 'recording job lookup started',
+    recordingId: recordingId ?? null,
+    dropboxFileId: dropboxFileId ?? null,
+    dropboxPathLower: dropboxPathLower ?? null,
+  });
+  logEvent('info', 'recording job lookup tried', { triedBy: 'recordingId', recordingId: recordingId ?? null });
+  logEvent('info', 'recording job lookup tried', { triedBy: 'dropboxFileId', dropboxFileId: dropboxFileId ?? null });
+  logEvent('info', 'recording job lookup tried', { triedBy: 'dropboxPathLower', dropboxPathLower: dropboxPathLower ?? null });
+
+  const lookup = await findRecordingJobWithSource(env, { recordingId, dropboxFileId, dropboxPathLower });
+  const job = lookup.job;
+  if (!job) {
+    const transcriptPreview = payload.transcript?.fullText ? payload.transcript.fullText.slice(0, 512) : '';
+    logEvent('error', 'recording job lookup not found', {
+      event: 'recording job lookup not found',
+      recordingId: recordingId ?? null,
+      dropboxFileId: dropboxFileId ?? null,
+      dropboxPathLower: dropboxPathLower ?? null,
+      transcriptPreview,
+      transcriptPreviewLength: transcriptPreview.length,
+      transcriptSegmentCount: payload.transcript?.segments?.length ?? 0,
+    });
+    throw new HttpError('Recording job not found for callback.', 404, {
+      phase: 'lookup_job',
+      recordingId: recordingId ?? null,
+      dropboxFileId: dropboxFileId ?? null,
+      dropboxPathLower: dropboxPathLower ?? null,
+    });
+  }
+
+  logEvent('info', 'recording job lookup hit', {
+    foundBy: lookup.source,
+    recordingId: job.recordingId,
+    internalKey: `recordingJob:recordingId:${job.recordingId}`,
+    dropboxFileId: job.dropboxFileId,
+    dropboxPathLower: job.dropboxPathLower,
+  });
+
+  if (job.status === 'persisted' && job.callbackStatus === 'persisted') {
+    logEvent('info', 'callback duplicate ignored', {
+      recordingId: job.recordingId,
+      dropboxFileId: job.dropboxFileId,
+      dropboxPathLower: job.dropboxPathLower,
+      status: job.status,
+    });
+    return {
+      action: 'processed',
+      reason: 'Duplicate callback ignored because recording job is already persisted.',
+      dedupCandidates: buildDedupCandidates(job.request, {
+        id: job.dropboxFileId,
+        path_lower: job.dropboxPathLower,
+        name: job.fileName,
+      }),
+    };
+  }
+
   const metadata: DropboxFileMetadata = {
-    id: payload.dropboxFileId,
-    path_lower: payload.dropboxPathLower,
-    name: payload.fileName,
+    id: job.dropboxFileId,
+    path_lower: job.dropboxPathLower ?? dropboxPathLower,
+    name: job.fileName || fileName || 'unknown-audio',
     size: job.sourceBytes,
     client_modified: job.clientModified,
     server_modified: job.serverModified,
   };
+
   try {
+    logEvent('info', 'callback phase started', { phase: 'persist_transcript', recordingId: job.recordingId });
     await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'transcribed', {
       transcript: payload.transcript,
       sourceDurationSec: payload.sourceDurationSec,
+      callbackStatus: 'received',
     });
     const persisted = await upsertInterviewFromTranscript(env, job.request, metadata, payload.transcript);
-    await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'persisted');
+
+    logEvent('info', 'callback phase started', { phase: 'update_status', recordingId: job.recordingId });
+    await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'persisted', {
+      transcript: payload.transcript,
+      sourceDurationSec: payload.sourceDurationSec,
+      callbackStatus: 'persisted',
+    });
+    logEvent('info', 'recording job status updated', {
+      recordingId: job.recordingId,
+      status: 'persisted',
+      callbackStatus: 'persisted',
+    });
+
     return {
       action: 'processed',
       reason: 'Python API callback persisted to Notion.',
@@ -154,13 +233,15 @@ export async function persistTranscriptionCallback(env: Env, payload: RecordingJ
       record: persisted.record,
     };
   } catch (error) {
-    await markJobFailed(env, { recordingId: job.recordingId }, error instanceof Error ? error.message : 'callback failed');
+    await markJobFailed(env, { recordingId: job.recordingId }, error instanceof Error ? error.message : 'callback failed', { callbackStatus: 'failed' });
     logEvent('error', 'callback failed', {
+      phase: error instanceof HttpError ? 'persist_transcript' : 'update_status',
       recordingId: job.recordingId,
       fileName: job.fileName,
       dropboxFileId: job.dropboxFileId,
       dropboxPathLower: job.dropboxPathLower,
       details: error instanceof HttpError ? error.details : error,
+      stack: error instanceof Error ? error.stack : undefined,
     });
     throw error;
   }
