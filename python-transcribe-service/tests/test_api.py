@@ -34,7 +34,7 @@ def test_auth_guard_rejects_invalid_token(monkeypatch):
     monkeypatch.delenv('API_TOKEN', raising=False)
 
 
-def test_transcribe_job_maps_external_error_to_502(monkeypatch):
+def test_transcribe_job_success_and_processing_seconds(monkeypatch):
     import main
 
     class FakeDropbox:
@@ -60,6 +60,7 @@ def test_transcribe_job_maps_external_error_to_502(monkeypatch):
 
     client = TestClient(main.app)
     import auth
+
     token = auth.SETTINGS.api_token or 'anything'
     response = client.post(
         '/jobs/transcribe',
@@ -73,11 +74,55 @@ def test_transcribe_job_maps_external_error_to_502(monkeypatch):
 
     assert response.status_code == 202
     assert response.json()['accepted'] is True
-    assert response.json()['status'] in {'queued', 'completed'}
+    assert 'processingSeconds' in response.json()
 
     status_response = client.get('/jobs/transcribe/rec-1', headers={'authorization': f'Bearer {token}'})
     assert status_response.status_code == 200
-    assert status_response.json()['status'] == 'completed'
+    body = status_response.json()
+    assert body['status'] == 'completed'
+    assert body['callbackSucceeded'] is True
+    assert isinstance(body['processingSeconds'], float)
+
+
+def test_transcribe_job_callback_failure_keeps_completed(monkeypatch):
+    import main
+
+    class FakeDropbox:
+        def download_file(self, dropbox_file_id, dropbox_path_lower):
+            return b'audio-bytes'
+
+    class SuccessPayload:
+        recordingId = 'rec-cb-fail'
+
+    class SuccessService:
+        def process(self, job, source_bytes):
+            return SuccessPayload()
+
+    class InlineExecutor:
+        def submit(self, fn, *args, **kwargs):
+            fn(*args, **kwargs)
+
+    monkeypatch.setattr(main, 'dropbox', FakeDropbox())
+    monkeypatch.setattr(main, 'service', SuccessService())
+    monkeypatch.setattr(main, 'send_callback', lambda payload, callback_url=None: False)
+    monkeypatch.setattr(main, 'executor', InlineExecutor())
+    main.job_states.clear()
+
+    client = TestClient(main.app)
+    import auth
+
+    token = auth.SETTINGS.api_token or 'anything'
+    client.post(
+        '/jobs/transcribe',
+        headers={'authorization': f'Bearer {token}'},
+        json={'recordingId': 'rec-cb-fail', 'dropboxFileId': 'id:123', 'fileName': 'audio.m4a'},
+    )
+
+    status_response = client.get('/jobs/transcribe/rec-cb-fail', headers={'authorization': f'Bearer {token}'})
+    assert status_response.status_code == 200
+    body = status_response.json()
+    assert body['status'] == 'completed'
+    assert body['callbackSucceeded'] is False
 
 
 def test_transcribe_job_deduplicates_running_job(monkeypatch):
@@ -93,6 +138,7 @@ def test_transcribe_job_deduplicates_running_job(monkeypatch):
 
     client = TestClient(main.app)
     import auth
+
     token = auth.SETTINGS.api_token or 'anything'
     response = client.post(
         '/jobs/transcribe',

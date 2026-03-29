@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
+from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +11,7 @@ from openai import OpenAI
 
 from config import SETTINGS
 from ffmpeg_utils import ChunkPlanEntry, build_chunk_plan, ffprobe_metadata, run_ffmpeg_chunk, validate_chunk
-from logging_utils import get_logger, log_event
+from logging_utils import get_logger, log_event, preview_text
 from models import TranscriptResult, TranscriptSegment, TranscriptionJobRequest, WorkersCallbackPayload
 
 logger = get_logger()
@@ -39,71 +41,99 @@ def should_fallback(status_code: int, error_text: str) -> bool:
     return SETTINGS.enable_audio_fallback and 400 <= status_code < 500 and any(token in text for token in ('corrupted', 'unsupported', 'file'))
 
 
+def _coerce_ms(value: Any, *, is_ms: bool) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if not trimmed:
+            return None
+        value = trimmed
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return int(round(numeric if is_ms else numeric * 1000))
+
+
+def _as_mapping(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, 'model_dump'):
+        dumped = value.model_dump()
+        if isinstance(dumped, dict):
+            return dumped
+    if hasattr(value, '__dict__'):
+        as_dict = vars(value)
+        if isinstance(as_dict, dict):
+            return as_dict
+    return None
+
+
 def parse_transcript_response(payload: dict[str, Any]) -> TranscriptResult:
     if not isinstance(payload, dict):
-        log_event(logger, 'warning', 'unexpected transcription response container', responseType=type(payload).__name__, rawResponse=repr(payload))
+        log_event(
+            logger,
+            'warning',
+            'unexpected transcription response container',
+            responseType=type(payload).__name__,
+            payloadPreview=preview_text(payload),
+        )
         payload = {'raw': payload}
 
-    segments_raw = payload.get('diarized_segments') or payload.get('segments') or []
+    segments_raw = payload.get('segments') or payload.get('diarized_segments') or []
     if not isinstance(segments_raw, list):
         log_event(
             logger,
             'warning',
             'unexpected transcription segments format',
             responseType=type(segments_raw).__name__,
-            rawResponse=repr(payload),
+            payloadPreview=preview_text(payload),
         )
         segments_raw = []
 
     segments: list[TranscriptSegment] = []
     for seg in segments_raw:
-        if not isinstance(seg, dict):
-            log_event(logger, 'warning', 'unexpected segment entry format', segmentType=type(seg).__name__, rawSegment=repr(seg))
+        mapped = _as_mapping(seg)
+        if not mapped:
+            log_event(logger, 'warning', 'unexpected segment entry format', segmentType=type(seg).__name__, rawSegment=preview_text(seg))
             continue
-        text = (seg.get('text') or '').strip()
+        text = str(mapped.get('text') or '').strip()
         if not text:
             continue
-        start_value = seg.get('start_ms') if seg.get('start_ms') is not None else seg.get('start')
-        end_value = seg.get('end_ms') if seg.get('end_ms') is not None else seg.get('end')
-        start_ms = int(start_value if seg.get('start_ms') is not None else float(start_value or 0) * 1000) if start_value is not None else None
-        end_ms = int(end_value if seg.get('end_ms') is not None else float(end_value or 0) * 1000) if end_value is not None else None
-        segments.append(TranscriptSegment(
-            speaker=str(seg.get('speaker') or seg.get('speaker_label') or seg.get('speaker_id') or 'speaker_unknown'),
-            startMs=start_ms,
-            endMs=end_ms,
-            text=text,
-        ))
-    full_text = (payload.get('text') or payload.get('transcript') or '').strip() or '\n'.join(f'[{seg.speaker}] {seg.text}' for seg in segments)
+        start_ms = _coerce_ms(mapped.get('start_ms'), is_ms=True)
+        if start_ms is None:
+            start_ms = _coerce_ms(mapped.get('start'), is_ms=False)
+        end_ms = _coerce_ms(mapped.get('end_ms'), is_ms=True)
+        if end_ms is None:
+            end_ms = _coerce_ms(mapped.get('end'), is_ms=False)
+
+        segments.append(
+            TranscriptSegment(
+                speaker=str(mapped.get('speaker') or mapped.get('speaker_label') or mapped.get('speaker_id') or 'speaker_unknown'),
+                startMs=start_ms,
+                endMs=end_ms,
+                text=text,
+            )
+        )
+
+    full_text = str(payload.get('text') or payload.get('transcript') or '').strip()
+    if not full_text:
+        full_text = '\n'.join(f'[{seg.speaker}] {seg.text}' for seg in segments)
     return TranscriptResult(fullText=full_text, segments=segments, raw=payload)
 
 
 def normalize_transcription_response(response: Any) -> dict[str, Any]:
     if isinstance(response, dict):
-        log_event(
-            logger,
-            'debug',
-            'normalizing transcription response',
-            responseType=type(response).__name__,
-            hasModelDump=hasattr(response, 'model_dump'),
-            dumpedType=type(response).__name__,
-            dumpedPreview=repr(response)[:1000],
-        )
         return response
 
-    has_model_dump = hasattr(response, 'model_dump')
-    dumped = response.model_dump() if has_model_dump else response
-    log_event(
-        logger,
-        'debug',
-        'normalizing transcription response',
-        responseType=type(response).__name__,
-        hasModelDump=has_model_dump,
-        dumpedType=type(dumped).__name__,
-        dumpedPreview=repr(dumped)[:1000],
-    )
-
+    dumped = response.model_dump() if hasattr(response, 'model_dump') else response
     if isinstance(dumped, dict):
         return dumped
+
+    mapped = _as_mapping(dumped)
+    if mapped:
+        return mapped
 
     if isinstance(dumped, str):
         try:
@@ -131,18 +161,43 @@ def merge_results(results: list[tuple[ChunkPlanEntry, TranscriptResult]]) -> Tra
     merged_segments: list[TranscriptSegment] = []
     raw_parts: list[Any] = []
     for chunk, result in ordered:
-        full_texts.append(result.fullText)
+        normalized_text = re.sub(r'\n{3,}', '\n\n', result.fullText.strip())
+        if normalized_text:
+            full_texts.append(normalized_text)
         raw_parts.append(result.raw)
+
         for seg in result.segments:
+            start_ms = (seg.startMs + chunk.start_offset_ms) if seg.startMs is not None else None
+            end_ms = (seg.endMs + chunk.start_offset_ms) if seg.endMs is not None else None
+            if start_ms is not None and start_ms < 0:
+                log_event(logger, 'warning', 'merged segment had negative start timestamp', chunkIndex=chunk.chunk_index, startMs=start_ms)
+                start_ms = 0
+            if end_ms is not None and end_ms < 0:
+                log_event(logger, 'warning', 'merged segment had negative end timestamp', chunkIndex=chunk.chunk_index, endMs=end_ms)
+                end_ms = 0
+            if start_ms is not None and end_ms is not None and end_ms < start_ms:
+                log_event(
+                    logger,
+                    'warning',
+                    'merged segment had inverted timestamps; correcting end to start',
+                    chunkIndex=chunk.chunk_index,
+                    startMs=start_ms,
+                    endMs=end_ms,
+                )
+                end_ms = start_ms
+
             merged_segments.append(
                 TranscriptSegment(
                     speaker=seg.speaker,
-                    startMs=(seg.startMs + chunk.start_offset_ms) if seg.startMs is not None else None,
-                    endMs=(seg.endMs + chunk.start_offset_ms) if seg.endMs is not None else None,
+                    startMs=start_ms,
+                    endMs=end_ms,
                     text=seg.text,
                 )
             )
-    return TranscriptResult(fullText='\n\n'.join(t.strip() for t in full_texts if t.strip()), segments=merged_segments, raw=raw_parts)
+
+    merged = TranscriptResult(fullText='\n\n'.join(full_texts), segments=merged_segments, raw=raw_parts)
+    log_event(logger, 'info', 'transcript merge completed', mergedSegments=len(merged.segments), mergedFullTextLength=len(merged.fullText))
+    return merged
 
 
 class TranscriptionService:
@@ -160,8 +215,26 @@ class TranscriptionService:
 
     def transcribe_file(self, file_path: Path, language_hint: str | None, chunk_index: int, audio_format: str) -> TranscriptResult:
         chunking_strategy = self._get_diarization_chunking_strategy()
+        chunk_meta = ffprobe_metadata(file_path)
+        log_event(
+            logger,
+            'info',
+            'openai transcription request',
+            model=DIARIZATION_MODEL,
+            response_format=DIARIZED_RESPONSE_FORMAT,
+            chunking_strategy=chunking_strategy,
+            languageHint=language_hint,
+            chunkIndex=chunk_index,
+            fileName=file_path.name,
+            audioFormat=audio_format,
+            chunkFileSize=file_path.stat().st_size,
+            chunkDurationSec=chunk_meta.duration_sec,
+        )
+
         try:
             with file_path.open('rb') as handle:
+                # diarized_json is required to obtain speaker-separated segments from gpt-4o-transcribe-diarize.
+                # normalize_transcription_response keeps processing stable across SDK response-shape differences.
                 response = self.openai.audio.transcriptions.create(
                     model=DIARIZATION_MODEL,
                     file=handle,
@@ -172,10 +245,12 @@ class TranscriptionService:
         except Exception as exc:  # noqa: BLE001
             status_code = getattr(exc, 'status_code', None)
             error_text = str(exc)
+            fallback_candidate = should_fallback(status_code or 500, error_text)
             log_event(
                 logger,
                 'error',
                 'openai transcription failed',
+                exceptionClass=type(exc).__name__,
                 model=DIARIZATION_MODEL,
                 response_format=DIARIZED_RESPONSE_FORMAT,
                 chunking_strategy=chunking_strategy,
@@ -183,7 +258,8 @@ class TranscriptionService:
                 fileName=file_path.name,
                 audioFormat=audio_format,
                 responseStatus=status_code,
-                responseText=error_text,
+                responseTextPreview=preview_text(error_text),
+                fallbackCandidate=fallback_candidate,
             )
             raise TranscriptionProcessingError(
                 f'Transcription request failed for chunk {chunk_index}: {error_text}',
@@ -199,25 +275,37 @@ class TranscriptionService:
                 },
             ) from exc
 
-        has_model_dump = hasattr(response, 'model_dump')
-        dumped = response.model_dump() if has_model_dump else response
-        log_event(
-            logger,
-            'debug',
-            'openai transcription response received',
-            model=DIARIZATION_MODEL,
-            response_format=DIARIZED_RESPONSE_FORMAT,
-            chunking_strategy=chunking_strategy,
-            chunkIndex=chunk_index,
-            responseType=type(response).__name__,
-            hasModelDump=has_model_dump,
-            dumpedType=type(dumped).__name__,
-            dumpedPreview=repr(dumped)[:1000],
-        )
         try:
             payload = normalize_transcription_response(response)
         except RuntimeError as exc:
             raise TranscriptionProcessingError(str(exc), source='openai_response', chunk_index=chunk_index) from exc
+
+        response_status = getattr(response, 'status_code', None)
+        if response_status is None and hasattr(response, 'response'):
+            response_status = getattr(getattr(response, 'response'), 'status_code', None)
+        if response_status is None:
+            raw_status = payload.get('status_code') or payload.get('status')
+            if isinstance(raw_status, int):
+                response_status = raw_status
+            elif isinstance(raw_status, str) and raw_status.isdigit():
+                response_status = int(raw_status)
+            elif isinstance(raw_status, str) and raw_status in HTTPStatus.__members__:
+                response_status = HTTPStatus[raw_status].value
+
+        segments_raw = payload.get('segments') or payload.get('diarized_segments') or []
+        full_text = str(payload.get('text') or payload.get('transcript') or '').strip()
+        log_event(
+            logger,
+            'info',
+            'openai transcription response normalized',
+            chunkIndex=chunk_index,
+            responseStatus=response_status,
+            topLevelKeys=sorted(payload.keys()),
+            segmentsCount=len(segments_raw) if isinstance(segments_raw, list) else 0,
+            fullTextLength=len(full_text),
+            hasUsage=payload.get('usage') is not None,
+            payloadPreview=preview_text(payload),
+        )
         return parse_transcript_response(payload)
 
     def process(self, job: TranscriptionJobRequest, source_bytes: bytes) -> WorkersCallbackPayload:
@@ -241,6 +329,7 @@ class TranscriptionService:
                     chunkCount=chunk.chunk_count,
                     startOffsetMs=chunk.start_offset_ms,
                     endOffsetMs=chunk.end_offset_ms,
+                    audioFormat=SETTINGS.primary_audio_format,
                 )
                 formats = [SETTINGS.primary_audio_format]
                 if SETTINGS.enable_audio_fallback and SETTINGS.fallback_audio_format != SETTINGS.primary_audio_format:
@@ -258,12 +347,21 @@ class TranscriptionService:
                         'chunk prepared',
                         recordingId=job.recordingId,
                         chunkIndex=chunk.chunk_index,
+                        chunkCount=chunk.chunk_count,
+                        startOffsetMs=chunk.start_offset_ms,
+                        endOffsetMs=chunk.end_offset_ms,
                         model=DIARIZATION_MODEL,
                         response_format=DIARIZED_RESPONSE_FORMAT,
                         chunking_strategy=SETTINGS.diarization_chunking_strategy,
                         audioFormat=ext,
+                        ffprobe={
+                            'duration': details.get('duration'),
+                            'codec': details.get('codec'),
+                            'sample_rate': details.get('sample_rate'),
+                            'channels': details.get('channels'),
+                            'mime_type': details.get('mime_type'),
+                        },
                         validationPassed=ok,
-                        details=details,
                     )
                     if not ok:
                         raise TranscriptionProcessingError(
@@ -279,6 +377,7 @@ class TranscriptionService:
                         transcribed = True
                         break
                     except TranscriptionProcessingError as exc:
+                        fallback_candidate = should_fallback(exc.external_status_code or 500, str(exc))
                         log_event(
                             logger,
                             'error',
@@ -290,8 +389,10 @@ class TranscriptionService:
                             chunking_strategy=SETTINGS.diarization_chunking_strategy,
                             error=str(exc),
                             errorSource=exc.source,
+                            responseStatus=exc.external_status_code,
+                            fallbackCandidate=fallback_candidate,
                         )
-                        if index == 0 and fmt == 'm4a' and should_fallback(exc.external_status_code or 500, str(exc)):
+                        if index == 0 and fmt == 'm4a' and fallback_candidate:
                             continue
                         raise
 
