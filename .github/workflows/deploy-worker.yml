@@ -22,6 +22,49 @@ jobs:
       - name: Install Wrangler
         run: npm install --no-save wrangler@4.76.0
 
+      - name: Fail fast if placeholder config exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "[Preflight] Scanning repository for placeholder values that must never be deployed"
+          if rg -n --hidden \
+            --glob '!.git/**' \
+            --glob '!node_modules/**' \
+            --glob '!.wrangler/**' \
+            --glob '!.github/workflows/deploy-worker.yml' \
+            'replace-with-your-recording-job-kv-id|replace-with-your-[A-Za-z0-9_-]+' .; then
+            echo "❌ Placeholder configuration value detected. Replace it before deploy."
+            exit 1
+          fi
+          echo "✅ No placeholder configuration values found."
+
+      - name: Show Wrangler config source for deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "[Preflight] Wrangler deploy config file: wrangler.toml"
+          echo "[Preflight] RECORDING_JOB_KV binding from wrangler.toml:"
+          awk '
+            /^\[\[kv_namespaces\]\]$/ { in_block=1; binding=""; id=""; next }
+            in_block && /^\[\[/ {
+              if (binding == "RECORDING_JOB_KV") {
+                printf("  - binding=%s, id=%s\n", binding, id)
+              }
+              in_block=0
+            }
+            in_block && /^binding[[:space:]]*=/ {
+              line=$0; sub(/^[^=]*=[[:space:]]*"/, "", line); sub(/".*$/, "", line); binding=line
+            }
+            in_block && /^id[[:space:]]*=/ {
+              line=$0; sub(/^[^=]*=[[:space:]]*"/, "", line); sub(/".*$/, "", line); id=line
+            }
+            END {
+              if (in_block && binding == "RECORDING_JOB_KV") {
+                printf("  - binding=%s, id=%s\n", binding, id)
+              }
+            }
+          ' wrangler.toml
+
       - name: Deploy worker code
         shell: bash
         env:
