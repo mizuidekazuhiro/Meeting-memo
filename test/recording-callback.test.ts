@@ -66,13 +66,18 @@ function transcriptPayload(overrides: Record<string, unknown> = {}) {
 function installNotionFetchMock() {
   const originalFetch = global.fetch;
   let calls = 0;
+  const pagePayloads: any[] = [];
   global.fetch = (async (input: string, init?: RequestInit) => {
     calls += 1;
     const url = typeof input === 'string' ? input : input.toString();
+    if (url.includes('/v1/responses')) {
+      return new Response(JSON.stringify({ output_text: JSON.stringify({ summary: '要約', myTasks: ['自分タスク'], otherTasks: ['相手タスク'], ambiguities: [] }) }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
     if (url.includes('/databases/') && url.endsWith('/query')) {
       return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     if (url.endsWith('/pages')) {
+      if (init?.body && typeof init.body === 'string') pagePayloads.push(JSON.parse(init.body));
       return new Response(JSON.stringify({ id: 'page_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') {
@@ -82,6 +87,7 @@ function installNotionFetchMock() {
   }) as any;
   return {
     getCalls: () => calls,
+    getPagePayloads: () => pagePayloads,
     restore: () => {
       global.fetch = originalFetch;
     },
@@ -182,6 +188,49 @@ test('duplicate callback is idempotent after persisted status', async () => {
   assert.equal(first.action, 'processed');
   assert.match(second.reason, /Duplicate callback ignored/);
   assert.equal(fetchMock.getCalls(), notionCallsAfterFirst);
+});
+
+test('callback path writes Summary/My Tasks/Other Tasks in Notion payload', async () => {
+  const kv = new MockKv();
+  const env = makeEnv(kv, { OPENAI_API_KEY: 'test' });
+  const job = createRecordingJob({ request: { fileName: 'summary.m4a' }, dropboxFileId: 'id:summary', dropboxPathLower: '/apps/meetingmemo/inbox/summary.m4a', fileName: 'summary.m4a' });
+  await upsertRecordingJob(env, job);
+
+  const fetchMock = installNotionFetchMock();
+  await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId, dropboxFileId: job.dropboxFileId, dropboxPathLower: job.dropboxPathLower }));
+  fetchMock.restore();
+
+  const pagePayload = fetchMock.getPagePayloads()[0];
+  assert.ok(pagePayload.properties.Summary.rich_text[0].text.content.includes('要約'));
+  assert.ok(pagePayload.properties['My Tasks'].rich_text[0].text.content.includes('自分タスク'));
+  assert.ok(pagePayload.properties['Other Tasks'].rich_text[0].text.content.includes('相手タスク'));
+});
+
+test('summary generation failure still persists transcript in callback path', async () => {
+  const kv = new MockKv();
+  const env = makeEnv(kv, { OPENAI_API_KEY: 'test' });
+  const job = createRecordingJob({ request: { fileName: 'summary-fail.m4a' }, dropboxFileId: 'id:summary-fail', dropboxPathLower: '/apps/meetingmemo/inbox/summary-fail.m4a', fileName: 'summary-fail.m4a' });
+  await upsertRecordingJob(env, job);
+
+  const originalFetch = global.fetch;
+  global.fetch = (async (input: string, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url.includes('/v1/responses')) {
+      return new Response(JSON.stringify({ error: 'summary down' }), { status: 500, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/databases/') && url.endsWith('/query')) return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.endsWith('/pages')) return new Response(JSON.stringify({ id: 'page_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+
+  const result = await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
+  global.fetch = originalFetch;
+
+  const updated = await getRecordingJob(env, { recordingId: job.recordingId });
+  assert.equal(result.action, 'processed');
+  assert.equal(updated?.status, 'persisted');
+  assert.match(updated?.errorMessage ?? '', /Summary generation failed/);
 });
 
 test('upsert uses persistent KV abstraction for writes', async () => {

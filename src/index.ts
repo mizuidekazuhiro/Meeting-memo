@@ -9,7 +9,7 @@ import {
 } from './lib/dropbox';
 import { HttpError, jsonResponse, parseJson } from './lib/http';
 import { processInterviewFromMetadata } from './lib/interviews';
-import { createRecordingJob, getRecordingJob, getRecordingJobStorageMeta, normalizeDropboxPath, upsertRecordingJob } from './lib/jobs';
+import { createRecordingJob, findRecordingJobWithSource, getRecordingJob, getRecordingJobStorageMeta, normalizeDropboxPath, shouldSkipProcessingForExistingJob, upsertRecordingJob } from './lib/jobs';
 import { logEvent } from './lib/logger';
 import { persistTranscriptionCallback, processUploadedInterview } from './lib/processing';
 import { requireWebhookSecret } from './lib/security';
@@ -182,7 +182,22 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       recordedAt: intake.recordedAt ?? metadata.client_modified ?? metadata.server_modified,
     };
     const seededJob = createRecordingJob({ request: requestWithDropbox, dropboxFileId: metadata.id ?? '', dropboxPathLower: metadata.path_lower, fileName: metadata.name, sourceBytes: metadata.size ?? intake.fileSizeBytes, clientModified: metadata.client_modified, serverModified: metadata.server_modified });
+    const dedupeLookup = {
+      recordingId: seededJob.recordingId,
+      dropboxFileId: seededJob.dropboxFileId,
+      dropboxPathLower: seededJob.dropboxPathLower,
+    };
+    const existingLookup = await findRecordingJobWithSource(env, dedupeLookup);
+    logEvent('info', 'upload dedupe lookup', {
+      requestId,
+      dedupeLookupKey: dedupeLookup,
+      foundExistingJob: Boolean(existingLookup.job),
+      existingStatus: existingLookup.job?.status ?? null,
+      foundBy: existingLookup.source ?? null,
+    });
+
     const { job, created } = await upsertRecordingJob(env, seededJob);
+    const duplicateGate = existingLookup.job ? shouldSkipProcessingForExistingJob(existingLookup.job) : { shouldSkip: false };
     const normalizedDropboxPathLower = normalizeDropboxPath(metadata.path_lower);
     logEvent('info', 'recording job created', {
       event: 'recording job created',
@@ -198,9 +213,23 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       indexKeyDropboxPathLower: normalizedDropboxPathLower ? `recordingJob:index:dropboxPathLower:${normalizedDropboxPathLower}` : null,
       normalizedDropboxPathLower,
       created,
+      dispatchExecuted: !duplicateGate.shouldSkip,
+      dispatchSkippedReason: duplicateGate.reason ?? null,
     });
+    if (duplicateGate.shouldSkip) {
+      logEvent('info', 'upload dispatch skipped', {
+        requestId,
+        recordingId: job.recordingId,
+        dedupeLookupKey: dedupeLookup,
+        existingStatus: existingLookup.job?.status,
+        skipReason: duplicateGate.reason,
+        dispatchExecuted: false,
+      });
+      return jsonResponse({ ok: true, action: 'skipped', reason: `Duplicate upload skipped: ${duplicateGate.reason}.`, dropboxFileId: metadata.id, dropboxPathLower: metadata.path_lower, storedFileName: metadata.name, fileSizeBytes: metadata.size, recordingId: job.recordingId, jobStatus: job.status, createdJob: created });
+    }
+
     const result = await processUploadedInterview(env, requestWithDropbox, metadata, job, { dryRun });
-    return jsonResponse({ ok: result.action === 'processed', action: result.action, reason: result.reason, pageId: result.pageId, created: result.created, dropboxFileId: metadata.id, dropboxPathLower: metadata.path_lower, storedFileName: metadata.name, fileSizeBytes: metadata.size, recordingId: job.recordingId, jobStatus: job.status, createdJob: created, dedupCandidates: result.dedupCandidates, errorMessage: result.record?.errorMessage });
+    return jsonResponse({ ok: result.action !== 'error', action: result.action, reason: result.reason, pageId: result.pageId, created: result.created, dropboxFileId: metadata.id, dropboxPathLower: metadata.path_lower, storedFileName: metadata.name, fileSizeBytes: metadata.size, recordingId: job.recordingId, jobStatus: job.status, createdJob: created, dedupCandidates: result.dedupCandidates, errorMessage: result.record?.errorMessage });
   } catch (error) {
     logEvent('error', 'job creation failed', {
       requestId,
@@ -235,7 +264,7 @@ async function handleTranscriptionCallback(request: Request, env: Env): Promise<
   });
   try {
     const result = await persistTranscriptionCallback(env, payload);
-    return jsonResponse({ ok: result.action === 'processed', action: result.action, reason: result.reason, pageId: result.pageId, created: result.created });
+    return jsonResponse({ ok: result.action !== 'error', action: result.action, reason: result.reason, pageId: result.pageId, created: result.created });
   } catch (error) {
     logEvent('error', 'transcription callback failed', {
       phase: error instanceof HttpError ? ((error.details as { phase?: string } | undefined)?.phase ?? 'unknown') : 'unknown',

@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 
 import { createRecordingJob, getRecordingJob, upsertRecordingJob } from '../src/lib/jobs';
+import { shouldSkipProcessingForExistingJob } from '../src/lib/jobs';
 import { mergeTranscriptResultsInOrder } from '../src/lib/transcript-merge';
 import { shouldAttemptDirectWorkerTranscription } from '../src/lib/processing';
 
@@ -46,6 +47,20 @@ test('dropboxFileId deduplicates repeated uploads before any scan', async () => 
   assert.equal(inserted.created, true);
   assert.equal(deduped.created, false);
   assert.equal(deduped.job.dropboxFileId, 'id:dup');
+});
+
+test('duplicate upload is skipped for active/completed statuses and re-runnable only when failed', () => {
+  const active = createRecordingJob({ request: { fileName: 'dup-active.m4a' }, dropboxFileId: 'id:dup-active', fileName: 'dup-active.m4a' });
+  active.status = 'transcribing';
+  assert.equal(shouldSkipProcessingForExistingJob(active).shouldSkip, true);
+
+  const completed = createRecordingJob({ request: { fileName: 'dup-completed.m4a' }, dropboxFileId: 'id:dup-completed', fileName: 'dup-completed.m4a' });
+  completed.status = 'persisted';
+  assert.equal(shouldSkipProcessingForExistingJob(completed).shouldSkip, true);
+
+  const failed = createRecordingJob({ request: { fileName: 'dup-failed.m4a' }, dropboxFileId: 'id:dup-failed', fileName: 'dup-failed.m4a' });
+  failed.status = 'failed';
+  assert.equal(shouldSkipProcessingForExistingJob(failed).shouldSkip, false);
 });
 
 test('short duration files stay in Workers direct path', () => {

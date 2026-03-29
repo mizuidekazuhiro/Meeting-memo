@@ -2,10 +2,10 @@ import type { DropboxFileMetadata, Env, IntakeRequest, ProcessInterviewResult, R
 import { buildDedupCandidates } from './dedup';
 import { downloadDropboxFile } from './dropbox';
 import { HttpError } from './http';
-import { findRecordingJobWithSource, getRecordingJobStorageMeta, markJobFailed, normalizeDropboxPath, updateRecordingJobStatus } from './jobs';
+import { findRecordingJobWithSource, getRecordingJobStorageMeta, markJobFailed, normalizeDropboxPath, shouldSkipProcessingForExistingJob, updateRecordingJobStatus } from './jobs';
 import { logEvent } from './logger';
 import { upsertInterviewFromTranscript } from './notion';
-import { inspectAudioSource, MAX_TRANSCRIBE_DURATION_SEC, transcribeWithDiarization } from './openai';
+import { inspectAudioSource, MAX_TRANSCRIBE_DURATION_SEC, summarizeInterview, transcribeWithDiarization } from './openai';
 
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
@@ -107,6 +107,19 @@ export async function dispatchLongAudioJob(env: Env, job: RecordingJob, metadata
 
 export async function processUploadedInterview(env: Env, request: IntakeRequest, metadata: DropboxFileMetadata, job: RecordingJob, options: { dryRun?: boolean } = {}): Promise<ProcessInterviewResult> {
   const dedupCandidates = buildDedupCandidates(request, metadata);
+  const duplicateGate = shouldSkipProcessingForExistingJob(job);
+  if (duplicateGate.shouldSkip) {
+    logEvent('info', 'upload processing skipped', {
+      recordingId: job.recordingId,
+      dropboxFileId: job.dropboxFileId,
+      dropboxPathLower: job.dropboxPathLower,
+      existingStatus: job.status,
+      skipReason: duplicateGate.reason,
+      dispatchExecuted: false,
+    });
+    return { action: 'skipped', reason: `Duplicate upload skipped: ${duplicateGate.reason}.`, dedupCandidates };
+  }
+
   if (options.dryRun) {
     return { action: 'processed', reason: 'Dry run: job created from Dropbox upload metadata.', dedupCandidates, record: undefined };
   }
@@ -127,11 +140,24 @@ export async function processUploadedInterview(env: Env, request: IntakeRequest,
         dropboxPathLower: job.dropboxPathLower,
       });
       await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'transcribed', { transcript });
-      const persisted = await upsertInterviewFromTranscript(env, request, metadata, transcript);
-      await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'persisted');
+      let insights;
+      let summaryError: string | undefined;
+      try {
+        insights = await summarizeInterview(env, transcript);
+      } catch (error) {
+        summaryError = error instanceof Error ? error.message : 'summary generation failed';
+        logEvent('error', 'summary generation failed', {
+          recordingId: job.recordingId,
+          dropboxFileId: job.dropboxFileId,
+          dropboxPathLower: job.dropboxPathLower,
+          details: error instanceof HttpError ? error.details : error,
+        });
+      }
+      const persisted = await upsertInterviewFromTranscript(env, request, metadata, transcript, insights);
+      await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'persisted', { errorMessage: summaryError });
       return {
         action: 'processed',
-        reason: 'Processed in Workers and persisted to Notion.',
+        reason: summaryError ? 'Processed in Workers, transcript persisted to Notion, summary failed.' : 'Processed in Workers and persisted to Notion.',
         pageId: persisted.pageId,
         created: persisted.created,
         dedupCandidates,
@@ -275,6 +301,7 @@ export async function persistTranscriptionCallback(env: Env, payload: RecordingJ
       status: job.status,
       storageType: storageMeta.storageType,
       storageModeDecision: storageMeta.storageModeDecision,
+      callbackPersistedOrSkipped: 'skipped',
     });
     return {
       action: 'processed',
@@ -312,7 +339,22 @@ export async function persistTranscriptionCallback(env: Env, payload: RecordingJ
       sourceDurationSec: payload.sourceDurationSec,
       callbackStatus: 'received',
     });
-    const persisted = await upsertInterviewFromTranscript(env, job.request, metadata, payload.transcript);
+    let insights;
+    let summaryError: string | undefined;
+    try {
+      insights = await summarizeInterview(env, payload.transcript);
+    } catch (error) {
+      summaryError = error instanceof Error ? error.message : 'summary generation failed';
+      logEvent('error', 'summary generation failed', {
+        recordingId: job.recordingId,
+        fileName: job.fileName,
+        requestId: payload.requestId ?? null,
+        dropboxFileId: job.dropboxFileId,
+        dropboxPathLower: job.dropboxPathLower,
+        details: error instanceof HttpError ? error.details : error,
+      });
+    }
+    const persisted = await upsertInterviewFromTranscript(env, job.request, metadata, payload.transcript, insights);
 
     logEvent('info', 'callback phase started', {
       phase: 'update_status',
@@ -328,6 +370,7 @@ export async function persistTranscriptionCallback(env: Env, payload: RecordingJ
       transcript: payload.transcript,
       sourceDurationSec: payload.sourceDurationSec,
       callbackStatus: 'persisted',
+      errorMessage: summaryError,
     });
     logEvent('info', 'recording job status updated', {
       recordingId: job.recordingId,
@@ -343,7 +386,7 @@ export async function persistTranscriptionCallback(env: Env, payload: RecordingJ
 
     return {
       action: 'processed',
-      reason: 'Python API callback persisted to Notion.',
+      reason: summaryError ? 'Python API callback transcript persisted to Notion, summary failed.' : 'Python API callback persisted to Notion.',
       pageId: persisted.pageId,
       created: persisted.created,
       dedupCandidates: buildDedupCandidates(job.request, metadata),
