@@ -14,4 +14,4 @@ DROPBOX_UPLOAD_FOLDER = "/Apps/MeetingMemo/inbox"
 
 [[kv_namespaces]]
 binding = "RECORDING_JOB_KV"
-id = "replace-with-your-recording-job-kv-id"
+id = "a6760676704e4a1fac83ddff1b16222d"
