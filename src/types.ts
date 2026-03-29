@@ -23,6 +23,10 @@ export interface Env {
   PYTHON_TRANSCRIBE_API_TOKEN?: string;
   WORKERS_CALLBACK_BASE_URL?: string;
   RECORDING_JOB_KV?: RecordingJobKvStore;
+  ALLOW_IN_MEMORY_RECORDING_JOB_STORE?: string;
+  CALLBACK_JOB_LOOKUP_MAX_ATTEMPTS?: string;
+  CALLBACK_JOB_LOOKUP_BASE_DELAY_MS?: string;
+  CALLBACK_JOB_LOOKUP_MAX_DELAY_MS?: string;
 }
 
 export interface IntakeRequest {
@@ -154,5 +158,6 @@ export interface RecordingJobCallbackPayload {
   dropboxPathLower?: string;
   fileName?: string;
   sourceDurationSec?: number;
+  requestId?: string;
   transcript: TranscriptResult;
 }

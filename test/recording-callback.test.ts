@@ -4,7 +4,8 @@ import * as assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { createRecordingJob, getRecordingJob, upsertRecordingJob } from '../src/lib/jobs';
+import { HttpError } from '../src/lib/http';
+import { createRecordingJob, getRecordingJob, normalizeDropboxPath, upsertRecordingJob } from '../src/lib/jobs';
 import { persistTranscriptionCallback } from '../src/lib/processing';
 
 class MockKv {
@@ -24,12 +25,30 @@ class MockKv {
   }
 }
 
-function makeEnv(kv: MockKv) {
+class EventuallyConsistentMockKv extends MockKv {
+  missesRemainingByKey = new Map<string, number>();
+
+  setMisses(key: string, misses: number) {
+    this.missesRemainingByKey.set(key, misses);
+  }
+
+  async get(key: string, type?: 'text' | 'json') {
+    const missesRemaining = this.missesRemainingByKey.get(key) ?? 0;
+    if (missesRemaining > 0) {
+      this.missesRemainingByKey.set(key, missesRemaining - 1);
+      return null;
+    }
+    return super.get(key, type);
+  }
+}
+
+function makeEnv(kv: MockKv, overrides: Record<string, unknown> = {}) {
   return {
     APP_ENV: 'test',
     NOTION_TOKEN: 'token',
     INBOX_DB_ID: 'db',
     RECORDING_JOB_KV: kv,
+    ...overrides,
   } as any;
 }
 
@@ -85,43 +104,66 @@ test('callback lookup finds job by recordingId', async () => {
   assert.equal(updated?.callbackStatus, 'persisted');
 });
 
-test('callback lookup falls back to dropboxFileId', async () => {
-  const kv = new MockKv();
-  const env = makeEnv(kv);
-  const job = createRecordingJob({ request: { fileName: 'b.m4a' }, dropboxFileId: 'id:2', dropboxPathLower: '/apps/meetingmemo/inbox/b.m4a', fileName: 'b.m4a' });
+test('callback lookup retries and succeeds when KV index visibility is delayed', async () => {
+  const kv = new EventuallyConsistentMockKv();
+  const env = makeEnv(kv, {
+    CALLBACK_JOB_LOOKUP_MAX_ATTEMPTS: '6',
+    CALLBACK_JOB_LOOKUP_BASE_DELAY_MS: '1',
+    CALLBACK_JOB_LOOKUP_MAX_DELAY_MS: '2',
+  });
+  const job = createRecordingJob({ request: { fileName: 'late-index.m4a' }, dropboxFileId: 'id:late', dropboxPathLower: '/apps/meetingmemo/inbox/late-index.m4a', fileName: 'late-index.m4a' });
   await upsertRecordingJob(env, job);
 
+  kv.setMisses(`recordingJob:index:dropboxFileId:${job.dropboxFileId}`, 2);
+
   const fetchMock = installNotionFetchMock();
-  const result = await persistTranscriptionCallback(env, transcriptPayload({ recordingId: 'wrong-recording-id', dropboxFileId: 'id:2', dropboxPathLower: '/wrong' }));
+  const result = await persistTranscriptionCallback(
+    env,
+    transcriptPayload({ recordingId: 'unknown-recording-id', dropboxFileId: job.dropboxFileId, dropboxPathLower: '/different' }),
+  );
   fetchMock.restore();
 
   assert.equal(result.action, 'processed');
 });
 
-test('callback lookup falls back to dropboxPathLower', async () => {
+test('callback lookup falls back to dropboxPathLower with normalized path', async () => {
   const kv = new MockKv();
   const env = makeEnv(kv);
-  const job = createRecordingJob({ request: { fileName: 'c.m4a' }, dropboxFileId: 'id:3', dropboxPathLower: '/apps/meetingmemo/inbox/c.m4a', fileName: 'c.m4a' });
+  const job = createRecordingJob({ request: { fileName: 'c.m4a' }, dropboxFileId: 'id:3', dropboxPathLower: ' /apps/meetingmemo/inbox/c.m4a ', fileName: 'c.m4a' });
   await upsertRecordingJob(env, job);
 
   const fetchMock = installNotionFetchMock();
-  const result = await persistTranscriptionCallback(env, transcriptPayload({
-    recordingId: 'wrong-recording-id',
-    dropboxFileId: 'wrong-dropbox-id',
-    dropboxPathLower: '/apps/meetingmemo/inbox/c.m4a',
-  }));
+  const result = await persistTranscriptionCallback(
+    env,
+    transcriptPayload({
+      recordingId: 'wrong-recording-id',
+      dropboxFileId: 'wrong-dropbox-id',
+      dropboxPathLower: '/APPS/MEETINGMEMO/INBOX/C.M4A',
+    }),
+  );
   fetchMock.restore();
 
   assert.equal(result.action, 'processed');
 });
 
-test('callback returns not found when no lookup key resolves', async () => {
+test('callback returns not found with retry details when no lookup key resolves', async () => {
   const kv = new MockKv();
-  const env = makeEnv(kv);
+  const env = makeEnv(kv, {
+    CALLBACK_JOB_LOOKUP_MAX_ATTEMPTS: '3',
+    CALLBACK_JOB_LOOKUP_BASE_DELAY_MS: '1',
+    CALLBACK_JOB_LOOKUP_MAX_DELAY_MS: '1',
+  });
 
   await assert.rejects(
     () => persistTranscriptionCallback(env, transcriptPayload({ recordingId: 'missing', dropboxFileId: 'missing', dropboxPathLower: '/missing' })),
-    /Recording job not found for callback/,
+    (error: unknown) => {
+      assert.ok(error instanceof HttpError);
+      assert.equal(error.status, 404);
+      assert.equal((error.details as any).phase, 'lookup_job');
+      assert.equal((error.details as any).attempts, 3);
+      assert.equal((error.details as any).totalWaitMs, 2);
+      return true;
+    },
   );
 });
 
@@ -151,6 +193,19 @@ test('upsert uses persistent KV abstraction for writes', async () => {
   assert.ok(kv.puts.some((key) => key.startsWith('recordingJob:recordingId:')));
   assert.ok(kv.puts.some((key) => key.startsWith('recordingJob:index:dropboxFileId:')));
   assert.ok(kv.puts.some((key) => key.startsWith('recordingJob:index:dropboxPathLower:')));
+});
+
+test('dropboxPathLower normalization is consistent across upload/save/lookup', async () => {
+  const kv = new MockKv();
+  const env = makeEnv(kv);
+  const rawPath = ' /Apps/MeetingMemo/Inbox/Normalize.M4A ';
+  const job = createRecordingJob({ request: { fileName: 'normalize.m4a' }, dropboxFileId: 'id:norm', dropboxPathLower: rawPath, fileName: 'normalize.m4a' });
+  await upsertRecordingJob(env, job);
+
+  const found = await getRecordingJob(env, { dropboxPathLower: '/apps/meetingmemo/inbox/normalize.m4a' });
+
+  assert.equal(normalizeDropboxPath(rawPath), '/apps/meetingmemo/inbox/normalize.m4a');
+  assert.equal(found?.dropboxPathLower, '/apps/meetingmemo/inbox/normalize.m4a');
 });
 
 test('upload flow persists job before transcription dispatch path is invoked', async () => {

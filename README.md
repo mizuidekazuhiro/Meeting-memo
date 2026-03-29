@@ -84,22 +84,29 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 
 - `PYTHON_TRANSCRIBE_API_URL`（ベースURL）
 - `PYTHON_TRANSCRIBE_API_TOKEN`
-- `RECORDING_JOB_KV`（recording job 永続化用 KV バインディング）
+- `RECORDING_JOB_KV`（**本番必須**。recording job 永続化用 KV バインディング）
+- `ALLOW_IN_MEMORY_RECORDING_JOB_STORE`（テスト専用。`true` の時だけ in-memory fallback を許可）
+- `CALLBACK_JOB_LOOKUP_MAX_ATTEMPTS`（callback lookup 最大試行回数。既定: `6`）
+- `CALLBACK_JOB_LOOKUP_BASE_DELAY_MS`（指数 backoff の基準遅延。既定: `200`）
+- `CALLBACK_JOB_LOOKUP_MAX_DELAY_MS`（指数 backoff の最大遅延。既定: `1600`）
 - 既存 Dropbox / OpenAI / Notion 関連 env
+
+> 重要: 本番/preview/deployed Workers runtime では fallback store を使いません。`RECORDING_JOB_KV` 未設定時は 500 を返します。
 
 ## Recording callback の lookup 仕様
 
 - job 保存は `recordingId` を主キーに KV 永続化
 - secondary index:
   - `dropboxFileId -> recordingId`
-  - `dropboxPathLower -> recordingId`
+  - `dropboxPathLower -> recordingId`（trim + lower-case 正規化）
 - callback lookup 順序:
   1. `recordingId`
   2. `dropboxFileId`
   3. `dropboxPathLower`
+- callback lookup は bounded retry（既定6回, short backoff）を実装し、KV 即時可視化不足に耐える設計
 
-lookup 失敗時は `Recording job not found for callback.` を返しつつ、
-Worker ログに lookup 条件と transcript preview（長さ制限あり）を出力します。
+全 retry 後も lookup miss の場合のみ `Recording job not found for callback.` を返し、
+`attempts` / `totalWaitMs` / lookup key 群を 404 details とログへ出力します。
 
 ### Python API 側
 

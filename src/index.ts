@@ -9,7 +9,7 @@ import {
 } from './lib/dropbox';
 import { HttpError, jsonResponse, parseJson } from './lib/http';
 import { processInterviewFromMetadata } from './lib/interviews';
-import { createRecordingJob, getRecordingJob, upsertRecordingJob } from './lib/jobs';
+import { createRecordingJob, getRecordingJob, getRecordingJobStorageMeta, normalizeDropboxPath, upsertRecordingJob } from './lib/jobs';
 import { logEvent } from './lib/logger';
 import { persistTranscriptionCallback, processUploadedInterview } from './lib/processing';
 import { requireWebhookSecret } from './lib/security';
@@ -149,7 +149,19 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
 
   const intake = buildUploadRequest(form, audioField);
   const dryRun = asString(form.get('dryRun')) === 'true' || parseJsonField<boolean>(form.get('dryRunJson'), 'dryRunJson') === true;
-  logEvent('info', 'interviews.upload.received', { fileName: intake.fileName, mimeType: intake.mimeType, bytes: audioField.size, recordedAt: intake.recordedAt, initiatedBy: intake.initiatedBy, dryRun });
+  const requestId = request.headers.get('cf-ray') ?? request.headers.get('x-request-id') ?? crypto.randomUUID();
+  const storageMeta = getRecordingJobStorageMeta(env);
+  logEvent('info', 'interviews.upload.received', {
+    requestId,
+    fileName: intake.fileName,
+    mimeType: intake.mimeType,
+    bytes: audioField.size,
+    recordedAt: intake.recordedAt,
+    initiatedBy: intake.initiatedBy,
+    dryRun,
+    storageType: storageMeta.storageType,
+    storageModeDecision: storageMeta.storageModeDecision,
+  });
 
   let metadata;
   try {
@@ -171,20 +183,34 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     };
     const seededJob = createRecordingJob({ request: requestWithDropbox, dropboxFileId: metadata.id ?? '', dropboxPathLower: metadata.path_lower, fileName: metadata.name, sourceBytes: metadata.size ?? intake.fileSizeBytes, clientModified: metadata.client_modified, serverModified: metadata.server_modified });
     const { job, created } = await upsertRecordingJob(env, seededJob);
+    const normalizedDropboxPathLower = normalizeDropboxPath(metadata.path_lower);
     logEvent('info', 'recording job created', {
       event: 'recording job created',
+      requestId,
       recordingId: job.recordingId,
       dropboxFileId: job.dropboxFileId,
       dropboxPathLower: job.dropboxPathLower,
       fileName: job.fileName,
-      storageType: env.RECORDING_JOB_KV ? 'cloudflare-kv' : 'fallback',
+      storageType: storageMeta.storageType,
+      storageModeDecision: storageMeta.storageModeDecision,
       internalKey: `recordingJob:recordingId:${job.recordingId}`,
+      indexKeyDropboxFileId: `recordingJob:index:dropboxFileId:${job.dropboxFileId}`,
+      indexKeyDropboxPathLower: normalizedDropboxPathLower ? `recordingJob:index:dropboxPathLower:${normalizedDropboxPathLower}` : null,
+      normalizedDropboxPathLower,
       created,
     });
     const result = await processUploadedInterview(env, requestWithDropbox, metadata, job, { dryRun });
     return jsonResponse({ ok: result.action === 'processed', action: result.action, reason: result.reason, pageId: result.pageId, created: result.created, dropboxFileId: metadata.id, dropboxPathLower: metadata.path_lower, storedFileName: metadata.name, fileSizeBytes: metadata.size, recordingId: job.recordingId, jobStatus: job.status, createdJob: created, dedupCandidates: result.dedupCandidates, errorMessage: result.record?.errorMessage });
   } catch (error) {
-    logEvent('error', 'job creation failed', { fileName: metadata.name, dropboxFileId: metadata.id, dropboxPathLower: metadata.path_lower, details: error instanceof HttpError ? error.details : error });
+    logEvent('error', 'job creation failed', {
+      requestId,
+      fileName: metadata.name,
+      dropboxFileId: metadata.id,
+      dropboxPathLower: metadata.path_lower,
+      storageType: storageMeta.storageType,
+      storageModeDecision: storageMeta.storageModeDecision,
+      details: error instanceof HttpError ? error.details : error,
+    });
     throw error;
   }
 }
