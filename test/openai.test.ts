@@ -21,6 +21,18 @@ function makeTestWav(durationSec: number, sampleRate = 1, channels = 1): Blob {
   return new Blob([buffer], { type: 'audio/wav' });
 }
 
+function makeFtypM4aBlob(mimeType: string): Blob {
+  const bytes = new Uint8Array([
+    0x00, 0x00, 0x00, 0x18, // box size
+    0x66, 0x74, 0x79, 0x70, // ftyp
+    0x4d, 0x34, 0x41, 0x20, // major brand M4A
+    0x00, 0x00, 0x00, 0x00,
+    0x69, 0x73, 0x6f, 0x6d,
+    0x6d, 0x70, 0x34, 0x32,
+  ]);
+  return new Blob([bytes], { type: mimeType });
+}
+
 test('sourceDurationSec below threshold does not split', () => {
   const plan = createChunkPlan(600, 1024);
   assert.equal(plan.requiresSplit, false);
@@ -42,8 +54,8 @@ test('chunk plan start/end offsets are ordered correctly', () => {
   ]);
 });
 
-test('invalid empty chunk is rejected by validation', () => {
-  const chunk = validateChunk({
+test('invalid empty chunk is rejected by validation', async () => {
+  const chunk = await validateChunk({
     blob: new Blob([]), fileName: 'a.part-001.wav', extension: '.wav', mimeType: 'audio/wav', bytes: 0,
     codec: 'pcm_s16le', container: 'wav', estimatedDurationSec: 0, actualDurationSec: 0,
     strategy: 'fallback-pcm-wav', validationPassed: false, validationErrors: [], chunkIndex: 0, chunkCount: 1, startOffsetMs: 0, endOffsetMs: 0,
@@ -52,9 +64,9 @@ test('invalid empty chunk is rejected by validation', () => {
   assert.ok(chunk.validationErrors.length >= 2);
 });
 
-test('m4a/mp4 mime variations are normalized and accepted by validation', () => {
+test('m4a/mp4 mime variations are normalized and accepted by validation', async () => {
   for (const mimeType of ['audio/mp4', 'audio/m4a', 'audio/x-m4a', 'video/mp4']) {
-    const chunk = validateChunk({
+    const chunk = await validateChunk({
       blob: new Blob([new Uint8Array([1])], { type: mimeType }),
       fileName: 'short.part-001.m4a',
       extension: '.m4a',
@@ -77,9 +89,9 @@ test('m4a/mp4 mime variations are normalized and accepted by validation', () => 
   }
 });
 
-test('wav mime variations are normalized and accepted by validation', () => {
+test('wav mime variations are normalized and accepted by validation', async () => {
   for (const mimeType of ['audio/wav', 'audio/x-wav']) {
-    const chunk = validateChunk({
+    const chunk = await validateChunk({
       blob: new Blob([new Uint8Array([1])], { type: mimeType }),
       fileName: 'short.part-001.wav',
       extension: '.wav',
@@ -102,8 +114,8 @@ test('wav mime variations are normalized and accepted by validation', () => {
   }
 });
 
-test('m4a + audio/wav is rejected by validation', () => {
-  const chunk = validateChunk({
+test('m4a + audio/wav is rejected by validation', async () => {
+  const chunk = await validateChunk({
     blob: new Blob([new Uint8Array([1])], { type: 'audio/wav' }),
     fileName: 'short.part-001.m4a',
     extension: '.m4a',
@@ -125,8 +137,8 @@ test('m4a + audio/wav is rejected by validation', () => {
   assert.ok(chunk.validationErrors.includes('extension and mimeType mismatch'));
 });
 
-test('wav + audio/mp4 is rejected by validation', () => {
-  const chunk = validateChunk({
+test('wav + audio/mp4 is rejected by validation', async () => {
+  const chunk = await validateChunk({
     blob: new Blob([new Uint8Array([1])], { type: 'audio/mp4' }),
     fileName: 'short.part-001.wav',
     extension: '.wav',
@@ -152,6 +164,112 @@ test('normalizeAudioMimeType helper normalizes known extensions', () => {
   assert.equal(normalizeAudioMimeType('a.m4a', 'audio/x-m4a'), 'audio/mp4');
   assert.equal(normalizeAudioMimeType('a.wav', 'audio/x-wav'), 'audio/wav');
   assert.equal(normalizeAudioMimeType('a.m4a', 'audio/wav'), 'audio/wav');
+});
+
+test('m4a + application/octet-stream is accepted with mime fallback', async () => {
+  const chunk = await validateChunk({
+    blob: makeFtypM4aBlob('application/octet-stream'),
+    fileName: 'short.part-001.m4a',
+    extension: '.m4a',
+    mimeType: 'application/octet-stream',
+    bytes: 24,
+    codec: 'aac-lc',
+    container: 'm4a',
+    estimatedDurationSec: 1,
+    actualDurationSec: 1,
+    strategy: 'single-original',
+    validationPassed: false,
+    validationErrors: [],
+    chunkIndex: 0,
+    chunkCount: 1,
+    startOffsetMs: 0,
+    endOffsetMs: 1000,
+  });
+  assert.equal(chunk.validationPassed, true);
+  assert.equal(chunk.mimeType, 'audio/mp4');
+});
+
+test('m4a + empty mime is accepted with mime fallback', async () => {
+  const chunk = await validateChunk({
+    blob: makeFtypM4aBlob(''),
+    fileName: 'short.part-001.m4a',
+    extension: '.m4a',
+    mimeType: '',
+    bytes: 24,
+    codec: 'aac-lc',
+    container: 'm4a',
+    estimatedDurationSec: 1,
+    actualDurationSec: 1,
+    strategy: 'single-original',
+    validationPassed: false,
+    validationErrors: [],
+    chunkIndex: 0,
+    chunkCount: 1,
+    startOffsetMs: 0,
+    endOffsetMs: 1000,
+  });
+  assert.equal(chunk.validationPassed, true);
+  assert.equal(chunk.mimeType, 'audio/mp4');
+});
+
+test('m4a + octet-stream with invalid signature is rejected', async () => {
+  const chunk = await validateChunk({
+    blob: new Blob([new Uint8Array([1, 2, 3, 4, 5])], { type: 'application/octet-stream' }),
+    fileName: 'short.part-001.m4a',
+    extension: '.m4a',
+    mimeType: 'application/octet-stream',
+    bytes: 5,
+    codec: 'aac-lc',
+    container: 'm4a',
+    estimatedDurationSec: 1,
+    actualDurationSec: 1,
+    strategy: 'single-original',
+    validationPassed: false,
+    validationErrors: [],
+    chunkIndex: 0,
+    chunkCount: 1,
+    startOffsetMs: 0,
+    endOffsetMs: 1000,
+  });
+  assert.equal(chunk.validationPassed, false);
+  assert.ok(chunk.validationErrors.includes('m4a signature check failed'));
+});
+
+test('mime fallback logging includes fallback metadata', async () => {
+  const originalLog = console.log;
+  const calls: Array<{ message: unknown; payload: Record<string, unknown> }> = [];
+  console.log = ((message: unknown, payload: Record<string, unknown>) => {
+    calls.push({ message, payload });
+  }) as typeof console.log;
+
+  await validateChunk({
+    blob: makeFtypM4aBlob('application/octet-stream'),
+    fileName: 'logged.part-001.m4a',
+    extension: '.m4a',
+    mimeType: 'application/octet-stream',
+    bytes: 24,
+    codec: 'aac-lc',
+    container: 'm4a',
+    estimatedDurationSec: 1,
+    actualDurationSec: 1,
+    strategy: 'single-original',
+    validationPassed: false,
+    validationErrors: [],
+    chunkIndex: 0,
+    chunkCount: 1,
+    startOffsetMs: 0,
+    endOffsetMs: 1000,
+  });
+  console.log = originalLog;
+
+  const event = calls.find((entry) => entry.message === 'mime normalized from extension');
+  assert.ok(event);
+  assert.equal(event?.payload.fileName, 'logged.part-001.m4a');
+  assert.equal(event?.payload.originalMimeType, 'application/octet-stream');
+  assert.equal(event?.payload.normalizedMimeType, 'audio/mp4');
+  assert.equal(event?.payload.extension, '.m4a');
+  assert.equal(event?.payload.usedFallback, true);
+  assert.equal(event?.payload.usedSignatureCheck, true);
 });
 
 test('m4a failure triggers one wav fallback and succeeds', async () => {
