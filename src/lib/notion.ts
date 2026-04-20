@@ -53,21 +53,24 @@ async function notionFetch<T>(env: Env, path: string, init: RequestInit): Promis
   return (await response.json()) as T;
 }
 
+async function findPageByDedupKey(env: Env, dedupKey: string): Promise<NotionPageMatch | null> {
+  const response = await notionFetch<{ results: Array<{ id: string; properties: Record<string, unknown> }> }>(env, `/databases/${env.INBOX_DB_ID}/query`, {
+    method: 'POST',
+    body: JSON.stringify({
+      filter: {
+        property: 'Dedup Key',
+        rich_text: { equals: dedupKey },
+      },
+      page_size: 1,
+    }),
+  });
+  return response.results[0] ?? null;
+}
+
 export async function findExistingInterview(env: Env, dedupCandidates: string[]): Promise<NotionPageMatch | null> {
   for (const candidate of dedupCandidates) {
-    const response = await notionFetch<{ results: Array<{ id: string; properties: Record<string, unknown> }> }>(env, `/databases/${env.INBOX_DB_ID}/query`, {
-      method: 'POST',
-      body: JSON.stringify({
-        filter: {
-          property: 'Dedup Key',
-          rich_text: { equals: candidate },
-        },
-        page_size: 1,
-      }),
-    });
-    if (response.results[0]) {
-      return response.results[0];
-    }
+    const found = await findPageByDedupKey(env, candidate);
+    if (found) return found;
   }
   return null;
 }
@@ -332,4 +335,98 @@ export async function upsertInterviewPage(env: Env, record: InterviewRecord, exi
   });
   await appendTranscriptBlocks(env, response.id, record);
   return { pageId: response.id, created: true };
+}
+
+function splitTaskCandidatesFromText(value: string): string[] {
+  return value
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/^[\s\-*・\d.)]+/, '').trim())
+    .filter(Boolean);
+}
+
+function normalizeTaskText(value: string): string {
+  return value.trim().replace(/\s+/g, ' ');
+}
+
+function dedupeTaskTextsInRecording(values: string[]): string[] {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const value of values) {
+    const normalized = normalizeTaskText(value);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    deduped.push(normalized);
+  }
+  return deduped;
+}
+
+function normalizeMyTasksInput(myTasks: unknown): string[] {
+  if (Array.isArray(myTasks)) {
+    const expanded = myTasks.flatMap((item) => (typeof item === 'string' ? splitTaskCandidatesFromText(item) : []));
+    return dedupeTaskTextsInRecording(expanded);
+  }
+  if (typeof myTasks === 'string') {
+    return dedupeTaskTextsInRecording(splitTaskCandidatesFromText(myTasks));
+  }
+  return [];
+}
+
+async function sha256Hex(content: string): Promise<string> {
+  const encoded = new TextEncoder().encode(content);
+  const digest = await crypto.subtle.digest('SHA-256', encoded);
+  const bytes = new Uint8Array(digest);
+  return Array.from(bytes)
+    .map((value) => value.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+function notionPageUrl(pageId: string): string {
+  return `https://www.notion.so/${pageId.replace(/-/g, '')}`;
+}
+
+export interface ImportMyTasksInput {
+  recordingId: string;
+  sourceInterviewPageId: string;
+  myTasks: unknown;
+}
+
+export async function importMyTasksToInbox(
+  env: Env,
+  input: ImportMyTasksInput,
+): Promise<{ importedCount: number; skippedDuplicates: number; normalizedTasks: string[]; sourceInterviewUrl: string }> {
+  const normalizedTasks = normalizeMyTasksInput(input.myTasks);
+  const sourceInterviewUrl = notionPageUrl(input.sourceInterviewPageId);
+  let importedCount = 0;
+  let skippedDuplicates = 0;
+
+  for (const taskText of normalizedTasks) {
+    const taskHash = await sha256Hex(taskText);
+    const dedupKey = `meeting-task:${input.recordingId}:${taskHash}`;
+    const existing = await findPageByDedupKey(env, dedupKey);
+    if (existing) {
+      skippedDuplicates += 1;
+      continue;
+    }
+
+    await notionFetch(env, '/pages', {
+      method: 'POST',
+      body: JSON.stringify({
+        parent: { database_id: env.INBOX_DB_ID },
+        properties: cleanProperties({
+          Name: { title: titleText(taskText) },
+          Source: { rich_text: richText('meeting_memo') },
+          'Record Type': { select: { name: 'Task' } },
+          'Source Recording ID': { rich_text: richText(input.recordingId) },
+          'Source Interview Page ID': { rich_text: richText(input.sourceInterviewPageId) },
+          'Source Interview URL': { url: sourceInterviewUrl },
+          'Imported At': { date: { start: new Date().toISOString() } },
+          'Dedup Key': { rich_text: richText(dedupKey) },
+        }),
+      }),
+    });
+    importedCount += 1;
+  }
+
+  return { importedCount, skippedDuplicates, normalizedTasks, sourceInterviewUrl };
 }

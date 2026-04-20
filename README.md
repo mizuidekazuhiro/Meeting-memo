@@ -46,7 +46,9 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 6. Python API が `gpt-4o-transcribe-diarize` へ `chunking_strategy` を指定して chunkIndex 順に送信
 7. Python API が transcript を chunkIndex 順で結合して Workers callback
 8. Workers が transcript 完了後に要約（summary / tasks）を生成
-9. Workers が Notion に保存（本文ブロック + Summary/My Tasks/Other Tasks）
+9. Workers が Notion に保存（Interview Memo 本体。`Record Type=Interview Memo`）
+10. Workers が `My Tasks` のみを同一 DB（`INBOX_DB_ID`）へ 1件ずつ追加（`Record Type=Task`）
+11. Workers が Gmail API（OAuth refresh token）で完了通知メール送信
 
 ### 重複防止ポリシー
 
@@ -54,6 +56,8 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 - 既存 job が `queued` / `transcoding` / `transcribing` / `transcribed` / `persisted` の場合は再処理しない
 - `failed` のみ再実行を許可
 - upload / callback の両経路で重複反映を防ぐ（skip reason をログ出力）
+- task dedupe key: `meeting-task:${recordingId}:${sha256(normalizedTaskText)}`
+- completion email は `notificationSentAt` を job に保存し、同一 recordingId で再送しない
 
 ---
 
@@ -97,6 +101,12 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 - `CALLBACK_JOB_LOOKUP_MAX_ATTEMPTS`（callback lookup 最大試行回数。既定: `6`）
 - `CALLBACK_JOB_LOOKUP_BASE_DELAY_MS`（指数 backoff の基準遅延。既定: `200`）
 - `CALLBACK_JOB_LOOKUP_MAX_DELAY_MS`（指数 backoff の最大遅延。既定: `1600`）
+- `GMAIL_NOTIFY_ENABLED`（`true` の時だけ通知）
+- `GMAIL_TO`
+- `GMAIL_FROM`
+- `GMAIL_OAUTH_CLIENT_ID`
+- `GMAIL_OAUTH_CLIENT_SECRET`
+- `GMAIL_OAUTH_REFRESH_TOKEN`
 - 既存 Dropbox / OpenAI / Notion 関連 env
 
 > 重要: 本番/preview/deployed Workers runtime では fallback store を使いません。`RECORDING_JOB_KV` 未設定時は 500 を返します。

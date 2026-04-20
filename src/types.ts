@@ -27,6 +27,12 @@ export interface Env {
   CALLBACK_JOB_LOOKUP_MAX_ATTEMPTS?: string;
   CALLBACK_JOB_LOOKUP_BASE_DELAY_MS?: string;
   CALLBACK_JOB_LOOKUP_MAX_DELAY_MS?: string;
+  GMAIL_NOTIFY_ENABLED?: string;
+  GMAIL_TO?: string;
+  GMAIL_FROM?: string;
+  GMAIL_OAUTH_CLIENT_ID?: string;
+  GMAIL_OAUTH_CLIENT_SECRET?: string;
+  GMAIL_OAUTH_REFRESH_TOKEN?: string;
 }
 
 export interface IntakeRequest {
@@ -153,6 +159,7 @@ export interface RecordingJob {
   transcriptionRequestMetadata?: Record<string, unknown>;
   transcript?: TranscriptResult;
   errorMessage?: string;
+  notificationSentAt?: string;
 }
 
 export interface RecordingJobCallbackPayload {
