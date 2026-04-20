@@ -1,10 +1,11 @@
 import type { DropboxFileMetadata, Env, IntakeRequest, ProcessInterviewResult, RecordingJob, RecordingJobCallbackPayload } from '../types';
 import { buildDedupCandidates } from './dedup';
 import { downloadDropboxFile } from './dropbox';
+import { sendCompletionEmail, shouldSendCompletionEmail } from './gmail';
 import { HttpError } from './http';
-import { findRecordingJobWithSource, getRecordingJobStorageMeta, markJobFailed, normalizeDropboxPath, shouldSkipProcessingForExistingJob, updateRecordingJobStatus } from './jobs';
+import { findRecordingJobWithSource, getRecordingJob, getRecordingJobStorageMeta, markJobFailed, normalizeDropboxPath, shouldSkipProcessingForExistingJob, updateRecordingJobStatus } from './jobs';
 import { logEvent } from './logger';
-import { upsertInterviewFromTranscript } from './notion';
+import { importMyTasksToInbox, upsertInterviewFromTranscript } from './notion';
 import { inspectAudioSource, MAX_TRANSCRIBE_DURATION_SEC, summarizeInterview, transcribeWithDiarization } from './openai';
 
 
@@ -31,6 +32,89 @@ function getRetryDelayMs(attempt: number, config: { baseDelayMs: number; maxDela
 async function waitMs(delayMs: number): Promise<void> {
   if (delayMs <= 0) return;
   await new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+function buildNotionPageUrl(pageId: string): string {
+  return `https://www.notion.so/${pageId.replace(/-/g, '')}`;
+}
+
+async function runPostPersistTasksAndEmail(
+  env: Env,
+  params: {
+    job: RecordingJob;
+    persisted: Awaited<ReturnType<typeof upsertInterviewFromTranscript>>;
+    transcriptFullText?: string;
+    summary?: string;
+  },
+): Promise<void> {
+  if (!params.persisted.pageId) return;
+
+  logEvent('info', 'my task import started', {
+    recordingId: params.job.recordingId,
+    pageId: params.persisted.pageId,
+  });
+  const imported = await importMyTasksToInbox(env, {
+    recordingId: params.job.recordingId,
+    sourceInterviewPageId: params.persisted.pageId,
+    myTasks: params.persisted.record.insights?.myTasks,
+  });
+  if (imported.importedCount > 0) {
+    logEvent('info', 'my task import page created', {
+      recordingId: params.job.recordingId,
+      pageId: params.persisted.pageId,
+      importedCount: imported.importedCount,
+    });
+  }
+  if (imported.skippedDuplicates > 0) {
+    logEvent('info', 'my task import skipped duplicate', {
+      recordingId: params.job.recordingId,
+      pageId: params.persisted.pageId,
+      skippedDuplicates: imported.skippedDuplicates,
+    });
+  }
+
+  if (!shouldSendCompletionEmail(env)) {
+    return;
+  }
+
+  const latestJob = await getRecordingJob(env, { recordingId: params.job.recordingId });
+  if (latestJob?.notificationSentAt) {
+    logEvent('info', 'completion email skipped already sent', {
+      recordingId: params.job.recordingId,
+      notificationSentAt: latestJob.notificationSentAt,
+    });
+    return;
+  }
+
+  logEvent('info', 'completion email send started', {
+    recordingId: params.job.recordingId,
+    pageId: params.persisted.pageId,
+  });
+  try {
+    await sendCompletionEmail(env, {
+      subject: `Interview Memo 完了: ${params.job.fileName}`,
+      notionPageUrl: buildNotionPageUrl(params.persisted.pageId),
+      summary: params.summary ?? '',
+      transcript: params.transcriptFullText ?? '',
+      myTasks: imported.normalizedTasks,
+      fileName: params.job.fileName,
+      recordingId: params.job.recordingId,
+      completedAt: new Date().toISOString(),
+    });
+    await updateRecordingJobStatus(env, { recordingId: params.job.recordingId }, 'persisted', {
+      notificationSentAt: new Date().toISOString(),
+    });
+    logEvent('info', 'completion email sent', {
+      recordingId: params.job.recordingId,
+      pageId: params.persisted.pageId,
+    });
+  } catch (error) {
+    logEvent('warn', 'completion email failed', {
+      recordingId: params.job.recordingId,
+      pageId: params.persisted.pageId,
+      details: error instanceof HttpError ? error.details : error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 export function shouldAttemptDirectWorkerTranscription(metadata: DropboxFileMetadata, durationSec: number | undefined): boolean {
@@ -178,6 +262,12 @@ export async function processUploadedInterview(env: Env, request: IntakeRequest,
         });
         throw error;
       }
+      await runPostPersistTasksAndEmail(env, {
+        job,
+        persisted,
+        transcriptFullText: transcript.fullText,
+        summary: insights?.summary,
+      });
       await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'persisted', { errorMessage: summaryError });
       return {
         action: 'processed',
@@ -410,6 +500,13 @@ export async function persistTranscriptionCallback(env: Env, payload: RecordingJ
     });
     throw error;
   }
+
+  await runPostPersistTasksAndEmail(env, {
+    job,
+    persisted,
+    transcriptFullText: payload.transcript.fullText,
+    summary: insights?.summary,
+  });
 
   logEvent('info', 'callback phase started', {
     phase: 'update_status',

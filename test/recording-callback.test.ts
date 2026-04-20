@@ -206,6 +206,36 @@ test('callback path writes Summary/My Tasks/Other Tasks in Notion payload', asyn
   assert.ok(pagePayload.properties['Other Tasks'].rich_text[0].text.content.includes('相手タスク'));
 });
 
+test('callback imports only My Tasks into inbox task pages', async () => {
+  const kv = new MockKv();
+  const env = makeEnv(kv, { OPENAI_API_KEY: 'test' });
+  const job = createRecordingJob({ request: { fileName: 'tasks-only.m4a' }, dropboxFileId: 'id:tasks-only', dropboxPathLower: '/apps/meetingmemo/inbox/tasks-only.m4a', fileName: 'tasks-only.m4a' });
+  await upsertRecordingJob(env, job);
+
+  const originalFetch = global.fetch;
+  const pagePayloads: any[] = [];
+  global.fetch = (async (input: string, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url.includes('/v1/responses')) {
+      return new Response(JSON.stringify({ output_text: JSON.stringify({ summary: 'ok', myTasks: ['私タスク1'], otherTasks: ['他者タスク1'], ambiguities: [] }) }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/databases/') && url.endsWith('/query')) return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.endsWith('/pages')) {
+      if (typeof init?.body === 'string') pagePayloads.push(JSON.parse(init.body));
+      return new Response(JSON.stringify({ id: `page_${pagePayloads.length}` }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+
+  await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
+  global.fetch = originalFetch;
+
+  const taskPages = pagePayloads.filter((payload) => payload.properties?.['Record Type']?.select?.name === 'Task');
+  assert.equal(taskPages.length, 1);
+  assert.equal(taskPages[0].properties.Name.title[0].text.content, '私タスク1');
+});
+
 test('summary generation failure still persists transcript in callback path', async () => {
   const kv = new MockKv();
   const env = makeEnv(kv, { OPENAI_API_KEY: 'test' });
@@ -275,6 +305,40 @@ test('callback returns partial success when status update fails after Notion per
   assert.equal(result.action, 'processed');
   assert.match(result.reason, /status update failed after Notion persistence/);
   assert.equal(result.pageId, 'page_1');
+});
+
+test('gmail send failure does not fail callback persistence', async () => {
+  const kv = new MockKv();
+  const env = makeEnv(kv, {
+    OPENAI_API_KEY: 'test',
+    GMAIL_NOTIFY_ENABLED: 'true',
+    GMAIL_TO: 'to@example.com',
+    GMAIL_FROM: 'from@example.com',
+    GMAIL_OAUTH_CLIENT_ID: 'cid',
+    GMAIL_OAUTH_CLIENT_SECRET: 'secret',
+    GMAIL_OAUTH_REFRESH_TOKEN: 'refresh',
+  });
+  const job = createRecordingJob({ request: { fileName: 'gmail-fail.m4a' }, dropboxFileId: 'id:gmail-fail', dropboxPathLower: '/apps/meetingmemo/inbox/gmail-fail.m4a', fileName: 'gmail-fail.m4a' });
+  await upsertRecordingJob(env, job);
+
+  const originalFetch = global.fetch;
+  global.fetch = (async (input: string, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url.includes('/v1/responses')) return new Response(JSON.stringify({ output_text: JSON.stringify({ summary: 'ok', myTasks: ['task a'], otherTasks: ['other'], ambiguities: [] }) }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/databases/') && url.endsWith('/query')) return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.endsWith('/pages')) return new Response(JSON.stringify({ id: 'page_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('oauth2.googleapis.com/token')) return new Response(JSON.stringify({ access_token: 'access-token' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/gmail/v1/users/me/messages/send')) return new Response(JSON.stringify({ error: 'send failed' }), { status: 500, headers: { 'content-type': 'application/json' } });
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+
+  const result = await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
+  global.fetch = originalFetch;
+
+  const updated = await getRecordingJob(env, { recordingId: job.recordingId });
+  assert.equal(result.action, 'processed');
+  assert.equal(updated?.status, 'persisted');
 });
 
 test('upsert uses persistent KV abstraction for writes', async () => {
