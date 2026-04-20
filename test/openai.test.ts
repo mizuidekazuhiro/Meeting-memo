@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import { Blob } from 'node:buffer';
 
-import { createChunkPlan, validateChunk, transcribeWithDiarization, buildChunkLogMeta, summarizeInterview } from '../src/lib/openai';
+import { createChunkPlan, validateChunk, transcribeWithDiarization, buildChunkLogMeta, summarizeInterview, normalizeAudioMimeType } from '../src/lib/openai';
 import { HttpError } from '../src/lib/http';
 
 const env = { OPENAI_API_KEY: 'test' } as any;
@@ -50,6 +50,108 @@ test('invalid empty chunk is rejected by validation', () => {
   });
   assert.equal(chunk.validationPassed, false);
   assert.ok(chunk.validationErrors.length >= 2);
+});
+
+test('m4a/mp4 mime variations are normalized and accepted by validation', () => {
+  for (const mimeType of ['audio/mp4', 'audio/m4a', 'audio/x-m4a', 'video/mp4']) {
+    const chunk = validateChunk({
+      blob: new Blob([new Uint8Array([1])], { type: mimeType }),
+      fileName: 'short.part-001.m4a',
+      extension: '.m4a',
+      mimeType,
+      bytes: 1,
+      codec: 'aac-lc',
+      container: 'm4a',
+      estimatedDurationSec: 1,
+      actualDurationSec: 1,
+      strategy: 'single-original',
+      validationPassed: false,
+      validationErrors: [],
+      chunkIndex: 0,
+      chunkCount: 1,
+      startOffsetMs: 0,
+      endOffsetMs: 1000,
+    });
+    assert.equal(chunk.validationPassed, true);
+    assert.equal(chunk.mimeType, 'audio/mp4');
+  }
+});
+
+test('wav mime variations are normalized and accepted by validation', () => {
+  for (const mimeType of ['audio/wav', 'audio/x-wav']) {
+    const chunk = validateChunk({
+      blob: new Blob([new Uint8Array([1])], { type: mimeType }),
+      fileName: 'short.part-001.wav',
+      extension: '.wav',
+      mimeType,
+      bytes: 1,
+      codec: 'pcm_s16le',
+      container: 'wav',
+      estimatedDurationSec: 1,
+      actualDurationSec: 1,
+      strategy: 'single-original',
+      validationPassed: false,
+      validationErrors: [],
+      chunkIndex: 0,
+      chunkCount: 1,
+      startOffsetMs: 0,
+      endOffsetMs: 1000,
+    });
+    assert.equal(chunk.validationPassed, true);
+    assert.equal(chunk.mimeType, 'audio/wav');
+  }
+});
+
+test('m4a + audio/wav is rejected by validation', () => {
+  const chunk = validateChunk({
+    blob: new Blob([new Uint8Array([1])], { type: 'audio/wav' }),
+    fileName: 'short.part-001.m4a',
+    extension: '.m4a',
+    mimeType: 'audio/wav',
+    bytes: 1,
+    codec: 'aac-lc',
+    container: 'm4a',
+    estimatedDurationSec: 1,
+    actualDurationSec: 1,
+    strategy: 'single-original',
+    validationPassed: false,
+    validationErrors: [],
+    chunkIndex: 0,
+    chunkCount: 1,
+    startOffsetMs: 0,
+    endOffsetMs: 1000,
+  });
+  assert.equal(chunk.validationPassed, false);
+  assert.ok(chunk.validationErrors.includes('extension and mimeType mismatch'));
+});
+
+test('wav + audio/mp4 is rejected by validation', () => {
+  const chunk = validateChunk({
+    blob: new Blob([new Uint8Array([1])], { type: 'audio/mp4' }),
+    fileName: 'short.part-001.wav',
+    extension: '.wav',
+    mimeType: 'audio/mp4',
+    bytes: 1,
+    codec: 'pcm_s16le',
+    container: 'wav',
+    estimatedDurationSec: 1,
+    actualDurationSec: 1,
+    strategy: 'single-original',
+    validationPassed: false,
+    validationErrors: [],
+    chunkIndex: 0,
+    chunkCount: 1,
+    startOffsetMs: 0,
+    endOffsetMs: 1000,
+  });
+  assert.equal(chunk.validationPassed, false);
+  assert.ok(chunk.validationErrors.includes('extension and mimeType mismatch'));
+});
+
+test('normalizeAudioMimeType helper normalizes known extensions', () => {
+  assert.equal(normalizeAudioMimeType('a.m4a', 'audio/x-m4a'), 'audio/mp4');
+  assert.equal(normalizeAudioMimeType('a.wav', 'audio/x-wav'), 'audio/wav');
+  assert.equal(normalizeAudioMimeType('a.m4a', 'audio/wav'), 'audio/wav');
 });
 
 test('m4a failure triggers one wav fallback and succeeds', async () => {

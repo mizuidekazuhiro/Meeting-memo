@@ -44,6 +44,7 @@ type SourceAudioMetadata = {
   fileName: string;
   extension: string;
   mimeType: string;
+  originalMimeType?: string;
   bytes: number;
   container: AudioContainer;
   codec: AudioCodec;
@@ -70,6 +71,7 @@ export type PreparedTranscriptionChunk = {
   fileName: string;
   extension: string;
   mimeType: string;
+  originalMimeType?: string;
   bytes: number;
   codec: AudioCodec;
   container: AudioContainer;
@@ -138,6 +140,33 @@ function extensionForFileName(fileName: string): string {
 
 function mimeTypeForFormat(format: AudioFormat): string {
   return format === 'm4a' ? 'audio/mp4' : 'audio/wav';
+}
+
+function normalizeMimeValue(mimeType: string): string {
+  return mimeType.trim().toLowerCase();
+}
+
+function normalizeAudioMimeTypeForExtension(extension: string, mimeType: string): string {
+  const normalized = normalizeMimeValue(mimeType);
+  if (extension === '.m4a' || extension === '.mp4') {
+    if (normalized === 'audio/mp4' || normalized === 'audio/m4a' || normalized === 'audio/x-m4a' || normalized === 'video/mp4') return 'audio/mp4';
+    return normalized;
+  }
+  if (extension === '.wav') {
+    if (normalized === 'audio/wav' || normalized === 'audio/x-wav') return 'audio/wav';
+    return normalized;
+  }
+  return normalized;
+}
+
+export function normalizeAudioMimeType(fileName: string, mimeType: string): string {
+  return normalizeAudioMimeTypeForExtension(extensionForFileName(fileName), mimeType);
+}
+
+export function isAcceptedMimeTypeForExtension(extension: string, mimeType: string): boolean {
+  if (extension === '.m4a' || extension === '.mp4') return normalizeAudioMimeTypeForExtension(extension, mimeType) === 'audio/mp4';
+  if (extension === '.wav') return normalizeAudioMimeTypeForExtension(extension, mimeType) === 'audio/wav';
+  return true;
 }
 
 function containerForFormat(format: AudioFormat): AudioContainer { return format; }
@@ -250,12 +279,19 @@ export async function inspectAudioSource(audio: Blob, fileName: string): Promise
   const bytes = new Uint8Array(await audio.arrayBuffer());
   const extension = extensionForFileName(fileName);
   const wav = inspectWav(bytes);
-  if (wav) return { fileName, extension: '.wav', mimeType: audio.type || 'audio/wav', bytes: audio.size, ...wav };
+  if (wav) {
+    const originalMimeType = audio.type || 'audio/wav';
+    const normalizedMimeType = normalizeAudioMimeTypeForExtension('.wav', originalMimeType);
+    return { fileName, extension: '.wav', mimeType: normalizedMimeType, originalMimeType, bytes: audio.size, ...wav };
+  }
   const durationSec = readMp4DurationSeconds(fileName, bytes);
+  const originalMimeType = audio.type || (extension === '.m4a' || extension === '.mp4' ? 'audio/mp4' : 'application/octet-stream');
+  const normalizedMimeType = normalizeAudioMimeTypeForExtension(extension, originalMimeType);
   return {
     fileName,
     extension,
-    mimeType: audio.type || (extension === '.m4a' || extension === '.mp4' ? 'audio/mp4' : 'application/octet-stream'),
+    mimeType: normalizedMimeType,
+    originalMimeType,
     bytes: audio.size,
     container: extension === '.m4a' || extension === '.mp4' ? 'm4a' : 'unknown',
     codec: extension === '.m4a' || extension === '.mp4' ? 'aac-lc' : 'unknown',
@@ -340,13 +376,15 @@ const defaultChunkGenerator: AudioChunkGenerator = async (source, sourceMeta, pl
 
 export function validateChunk(chunk: PreparedTranscriptionChunk): PreparedTranscriptionChunk {
   const errors: string[] = [];
+  const originalMimeType = chunk.originalMimeType ?? chunk.mimeType;
+  const normalizedMimeType = normalizeAudioMimeTypeForExtension(chunk.extension || extensionForFileName(chunk.fileName), originalMimeType);
   if (chunk.bytes <= 0) errors.push('bytes must be > 0');
   const duration = chunk.actualDurationSec ?? chunk.estimatedDurationSec;
   if (!duration || duration <= 0) errors.push('duration must be > 0');
-  if ((chunk.extension === '.wav' && chunk.mimeType !== 'audio/wav') || (chunk.extension === '.m4a' && chunk.mimeType !== 'audio/mp4')) errors.push('extension and mimeType mismatch');
+  if (!isAcceptedMimeTypeForExtension(chunk.extension, originalMimeType)) errors.push('extension and mimeType mismatch');
   if (chunk.codec === 'unknown' || chunk.container === 'unknown') errors.push('codec/container metadata missing');
   if (chunk.blob.size <= 0) errors.push('chunk blob is empty');
-  return { ...chunk, validationPassed: errors.length === 0, validationErrors: errors };
+  return { ...chunk, mimeType: normalizedMimeType, originalMimeType, validationPassed: errors.length === 0, validationErrors: errors };
 }
 
 function getChunkDurationMs(result: TranscriptResult, fallbackDurationSec: number): number {
@@ -405,7 +443,10 @@ async function uploadPreparedChunk(env: Env, chunk: PreparedTranscriptionChunk, 
 
 async function transcribeChunkWithFallback(env: Env, source: Blob, sourceMeta: SourceAudioMetadata, plan: ChunkPlanEntry, languageHint: string | undefined, chunkGenerator: AudioChunkGenerator, uploadChunk: UploadChunkFn, context: Record<string, unknown>): Promise<TranscriptResult> {
   let chunk = validateChunk(await chunkGenerator(source, sourceMeta, plan, { preferredFormat: PRIMARY_AUDIO_FORMAT }));
-  if (!chunk.validationPassed) throw new HttpError('chunk validation failed', 500, { fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, strategy: chunk.strategy, format: chunk.extension, validationErrors: chunk.validationErrors });
+  if (!chunk.validationPassed) {
+    logEvent('error', 'chunk validation failed', { ...context, fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, strategy: chunk.strategy, extension: chunk.extension, originalMimeType: chunk.originalMimeType, normalizedMimeType: chunk.mimeType, validationErrors: chunk.validationErrors });
+    throw new HttpError('chunk validation failed', 500, { fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, strategy: chunk.strategy, extension: chunk.extension, format: chunk.extension, originalMimeType: chunk.originalMimeType, normalizedMimeType: chunk.mimeType, validationErrors: chunk.validationErrors });
+  }
   logEvent('info', 'openai.transcription.chunk', { ...context, ...buildChunkLogMeta(sourceMeta, chunk) });
   try {
     return await uploadChunk(env, chunk, languageHint);
@@ -413,7 +454,10 @@ async function transcribeChunkWithFallback(env: Env, source: Blob, sourceMeta: S
     if (!shouldFallbackToWav(error) || chunk.extension === '.wav') throw error;
     logEvent('warn', 'chunk upload failed with m4a, fallback to wav', { ...context, fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, details: error instanceof HttpError ? error.details : error });
     const fallbackChunk = validateChunk(await chunkGenerator(source, sourceMeta, plan, { preferredFormat: FALLBACK_AUDIO_FORMAT }));
-    if (!fallbackChunk.validationPassed) throw new HttpError('chunk validation failed', 500, { fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, strategy: fallbackChunk.strategy, format: fallbackChunk.extension, validationErrors: fallbackChunk.validationErrors });
+    if (!fallbackChunk.validationPassed) {
+      logEvent('error', 'chunk validation failed', { ...context, fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, strategy: fallbackChunk.strategy, extension: fallbackChunk.extension, originalMimeType: fallbackChunk.originalMimeType, normalizedMimeType: fallbackChunk.mimeType, validationErrors: fallbackChunk.validationErrors });
+      throw new HttpError('chunk validation failed', 500, { fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, strategy: fallbackChunk.strategy, extension: fallbackChunk.extension, format: fallbackChunk.extension, originalMimeType: fallbackChunk.originalMimeType, normalizedMimeType: fallbackChunk.mimeType, validationErrors: fallbackChunk.validationErrors });
+    }
     logEvent('info', 'fallback wav upload started', { ...context, ...buildChunkLogMeta(sourceMeta, fallbackChunk) });
     try {
       const result = await uploadChunk(env, fallbackChunk, languageHint);
@@ -438,6 +482,7 @@ export function buildChunkLogMeta(sourceMeta: SourceAudioMetadata, chunk: Prepar
     bytes: chunk.bytes,
     extension: chunk.extension,
     mimeType: chunk.mimeType,
+    originalMimeType: chunk.originalMimeType,
     codec: chunk.codec,
     container: chunk.container,
     sampleRate: chunk.sampleRate,
@@ -471,8 +516,11 @@ export async function transcribeWithDiarization(env: Env, audio: Blob, fileName:
   logEvent('info', 'openai.transcription.plan', { ...context, sourceDurationSec: sourceMeta.durationSec, sourceBytes: sourceMeta.bytes, chunkCount: plan.entries.length, targetChunkDurationSec: TARGET_CHUNK_DURATION_SEC, maxModelDurationSec: MAX_TRANSCRIBE_DURATION_SEC, primaryAudioFormat: PRIMARY_AUDIO_FORMAT, fallbackAudioFormat: FALLBACK_AUDIO_FORMAT });
 
   if (!plan.requiresSplit) {
-    const chunk = validateChunk({ blob: audio, fileName, extension: sourceMeta.extension || extensionForFileName(fileName), mimeType: sourceMeta.mimeType, bytes: sourceMeta.bytes, codec: sourceMeta.codec, container: sourceMeta.container, sampleRate: sourceMeta.sampleRate, channels: sourceMeta.channels, estimatedDurationSec: sourceMeta.durationSec ?? 0, actualDurationSec: sourceMeta.durationSec, strategy: 'single-original', validationPassed: false, validationErrors: [], chunkIndex: 0, chunkCount: 1, startOffsetMs: 0, endOffsetMs: Math.round((sourceMeta.durationSec ?? 0) * 1000) });
-    if (!chunk.validationPassed) throw new HttpError('chunk validation failed', 500, { fileName, chunkIndex: 1, chunkCount: 1, strategy: chunk.strategy, format: chunk.extension, validationErrors: chunk.validationErrors });
+    const chunk = validateChunk({ blob: audio, fileName, extension: sourceMeta.extension || extensionForFileName(fileName), mimeType: sourceMeta.mimeType, originalMimeType: sourceMeta.originalMimeType ?? sourceMeta.mimeType, bytes: sourceMeta.bytes, codec: sourceMeta.codec, container: sourceMeta.container, sampleRate: sourceMeta.sampleRate, channels: sourceMeta.channels, estimatedDurationSec: sourceMeta.durationSec ?? 0, actualDurationSec: sourceMeta.durationSec, strategy: 'single-original', validationPassed: false, validationErrors: [], chunkIndex: 0, chunkCount: 1, startOffsetMs: 0, endOffsetMs: Math.round((sourceMeta.durationSec ?? 0) * 1000) });
+    if (!chunk.validationPassed) {
+      logEvent('error', 'chunk validation failed', { ...context, chunkIndex: 1, chunkCount: 1, strategy: chunk.strategy, extension: chunk.extension, originalMimeType: chunk.originalMimeType, normalizedMimeType: chunk.mimeType, validationErrors: chunk.validationErrors });
+      throw new HttpError('chunk validation failed', 500, { fileName, chunkIndex: 1, chunkCount: 1, strategy: chunk.strategy, extension: chunk.extension, format: chunk.extension, originalMimeType: chunk.originalMimeType, normalizedMimeType: chunk.mimeType, validationErrors: chunk.validationErrors });
+    }
     logEvent('info', 'openai.transcription.chunk', { ...context, ...buildChunkLogMeta(sourceMeta, chunk) });
     return uploadChunk(env, chunk, languageHint);
   }
