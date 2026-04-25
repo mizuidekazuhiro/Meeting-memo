@@ -13,6 +13,7 @@ class Settings:
     dropbox_app_key: str = os.getenv('DROPBOX_APP_KEY', '')
     dropbox_app_secret: str = os.getenv('DROPBOX_APP_SECRET', '')
     workers_callback_url: str = os.getenv('WORKERS_CALLBACK_URL', '')
+    workers_finalize_url: str = os.getenv('WORKERS_FINALIZE_URL', '')
     workers_callback_token: str = os.getenv('WORKERS_CALLBACK_TOKEN', '')
     target_chunk_duration_sec: int = int(os.getenv('TARGET_CHUNK_DURATION_SEC', '720'))
     max_transcribe_duration_sec: int = int(os.getenv('MAX_TRANSCRIBE_DURATION_SEC', '1400'))

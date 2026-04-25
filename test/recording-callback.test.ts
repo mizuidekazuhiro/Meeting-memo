@@ -162,7 +162,7 @@ function installFinalizeFetchMock() {
   return { stats, restore: () => { global.fetch = originalFetch; } };
 }
 
-test('callback endpoint returns 202, stores callback state, and schedules finalize via waitUntil', async () => {
+test('callback endpoint returns 202, stores callback state, and does not schedule finalize via waitUntil', async () => {
   const { workerMod, jobsMod, processingMod, loggerMod } = await loadDeps();
   const worker = workerMod.default;
   const { createRecordingJob, upsertRecordingJob, getRecordingJob } = jobsMod;
@@ -172,14 +172,8 @@ test('callback endpoint returns 202, stores callback state, and schedules finali
   const job = createRecordingJob({ request: { fileName: 'a.m4a' }, dropboxFileId: 'id:1', dropboxPathLower: '/apps/meetingmemo/inbox/a.m4a', fileName: 'a.m4a' });
   await upsertRecordingJob(env, job);
 
-  const waitUntilPromises: Promise<unknown>[] = [];
   const calls: string[] = [];
-  const originalFinalize = processingMod.finalizeInterviewJob;
   const originalLogEvent = loggerMod.logEvent;
-  processingMod.finalizeInterviewJob = async () => {
-    calls.push('finalize-called');
-    return { ok: true, status: 'completed' };
-  };
   loggerMod.logEvent = ((_: string, message: string) => calls.push(message)) as any;
 
   const request = new Request('https://example.com/api/interviews/transcription-callback', {
@@ -187,19 +181,18 @@ test('callback endpoint returns 202, stores callback state, and schedules finali
     headers: { 'content-type': 'application/json', 'x-webhook-secret': env.INTERVIEW_WEBHOOK_SECRET },
     body: JSON.stringify(transcriptPayload({ recordingId: job.recordingId, dropboxFileId: job.dropboxFileId, dropboxPathLower: job.dropboxPathLower })),
   });
-  const response = await worker.fetch(request, env, { waitUntil: (p: Promise<unknown>) => waitUntilPromises.push(p) });
-  await Promise.all(waitUntilPromises);
+  const response = await worker.fetch(request, env, { waitUntil: () => undefined });
 
-  processingMod.finalizeInterviewJob = originalFinalize;
   loggerMod.logEvent = originalLogEvent;
 
   const updated = await getRecordingJob(env, { recordingId: job.recordingId });
   assert.equal(response.status, 202);
   assert.equal(updated?.status, 'callback_received');
   assert.equal(updated?.callbackStatus, 'received');
-  assert.equal(waitUntilPromises.length, 1);
+  const body = await response.json();
+  assert.equal(body.reason, 'Callback accepted and persisted. Finalization must be triggered separately.');
   assert.ok(calls.includes('callback_ack_returned'));
-  assert.ok(calls.includes('finalize-called'));
+  assert.ok(!calls.includes('finalize-called'));
 });
 
 test('callback persistence path stores transcript payload and remains lightweight', async () => {
@@ -218,6 +211,32 @@ test('callback persistence path stores transcript payload and remains lightweigh
   assert.equal(updated?.status, 'callback_received');
   assert.equal(updated?.transcript?.fullText, 'hello world');
   assert.equal(updated?.finalizeStatus, 'pending');
+});
+
+test('finalize endpoint forwards recordingId to finalizeInterviewJob', async () => {
+  const { workerMod, processingMod } = await loadDeps();
+  const worker = workerMod.default;
+  const kv = new MockKv();
+  const env = makeEnv(kv);
+
+  const calls: Array<{ recordingId: string; force: boolean }> = [];
+  const originalFinalize = processingMod.finalizeInterviewJob;
+  processingMod.finalizeInterviewJob = (async (_env: any, recordingId: string, options: { force?: boolean }) => {
+    calls.push({ recordingId, force: options.force === true });
+    return { ok: true, status: 'completed' };
+  }) as any;
+
+  const response = await worker.fetch(new Request('https://example.com/api/interviews/finalize', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-webhook-secret': env.INTERVIEW_WEBHOOK_SECRET },
+    body: JSON.stringify({ recordingId: 'rec-finalize', force: false }),
+  }), env, { waitUntil: () => undefined });
+  processingMod.finalizeInterviewJob = originalFinalize;
+
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.ok, true);
+  assert.deepEqual(calls, [{ recordingId: 'rec-finalize', force: false }]);
 });
 
 test('finalizeInterviewJob executes transcript -> summary -> email and marks completed', async () => {
@@ -425,6 +444,37 @@ test('finalizeInterviewJob continues when final my task import fails', async () 
   const updated = await getRecordingJob(env, { recordingId: job.recordingId });
   assert.equal(updated?.status, 'completed');
   assert.equal(updated?.finalizeStatus, 'completed');
+});
+
+test('finalizeInterviewJob marks failed when summary generation fails', async () => {
+  const { jobsMod, processingMod } = await loadDeps();
+  const { createRecordingJob, upsertRecordingJob, getRecordingJob } = jobsMod;
+  const { persistTranscriptionCallback, finalizeInterviewJob } = processingMod;
+
+  const kv = new MockKv();
+  const env = makeEnv(kv);
+  const job = createRecordingJob({ request: { fileName: 'summary-fail.m4a' }, dropboxFileId: 'id:8', dropboxPathLower: '/apps/meetingmemo/inbox/summary-fail.m4a', fileName: 'summary-fail.m4a' });
+  await upsertRecordingJob(env, job);
+  await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
+
+  const originalFetch = global.fetch;
+  global.fetch = (async (input: string, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url.includes('/v1/responses')) {
+      return new Response(JSON.stringify({ error: { message: 'summary crashed' } }), { status: 500, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.endsWith('/pages') && init?.method === 'POST') return new Response(JSON.stringify({ id: 'page_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+
+  await assert.rejects(() => finalizeInterviewJob(env, job.recordingId));
+  global.fetch = originalFetch;
+
+  const updated = await getRecordingJob(env, { recordingId: job.recordingId });
+  assert.equal(updated?.status, 'failed');
+  assert.equal(updated?.finalizeStatus, 'failed');
+  assert.ok((updated?.lastError ?? '').length > 0);
 });
 
 test('callback not found still returns lookup error', async () => {

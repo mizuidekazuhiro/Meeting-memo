@@ -259,8 +259,11 @@ Python API 実行環境には `ffmpeg` と `ffprobe` が必要です。
 ### 新しい設計
 
 - `/api/interviews/transcription-callback` は **軽量受信専用**（認証・payload検証・job state保存・`202 Accepted` 返却）
-- Notion追記 / Summary / 2次レビュー / メール送信は `finalizeInterviewJob` で非同期実行
-- callback受信後は `ctx.waitUntil(finalizeInterviewJob(...))` で後続処理を起動
+- callback受信では `ctx.waitUntil(finalizeInterviewJob(...))` を起動しない
+- Summary / 2次レビュー / Notion反映 / メール送信 / My Tasks登録は `POST /api/interviews/finalize` が担当
+- Python(Railway) は callback 成功後に `POST /api/interviews/finalize` を実行して完了させる
+- callback 成功は最終完了ではない（`overallStatus=completed` にはならない）
+- `finalizeStatus=succeeded`（Python）および Workers 側 `finalizeStatus=completed` のときのみ全体完了
 - 手動復旧API:
   - `POST /api/interviews/finalize` `{ "recordingId": "...", "force": false }`
   - `POST /api/interviews/resend-email` `{ "recordingId": "...", "force": true }`
@@ -310,5 +313,6 @@ Python API 実行環境には `ffmpeg` と `ffprobe` が必要です。
 
 - `CALLBACK_CONNECT_TIMEOUT_SEC`（既定: 10秒）
 - `CALLBACK_READ_TIMEOUT_SEC`（既定: 60秒）
+- `WORKERS_FINALIZE_URL`（任意。未設定時は `WORKERS_CALLBACK_URL` またはリクエスト `callbackUrl` から `/api/interviews/finalize` を導出）
 - callback送信は `0s -> 10s -> 30s -> 60s` の指数バックオフで再試行
 - 全失敗時は completed 扱いにせず、`transcribed_callback_failed` 状態で保持
