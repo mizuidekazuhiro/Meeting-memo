@@ -12,6 +12,11 @@ DROPBOX_INTERVIEW_SCAN_RECURSIVE = "false"
 INTERVIEW_SCAN_MAX_FILES = "20"
 DROPBOX_UPLOAD_FOLDER = "/Apps/MeetingMemo/inbox"
 
+GMAIL_NOTIFY_ENABLED = "true"
+MAIL_SUBJECT_PREFIX = "Interview Memo 完了"
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = "587"
+
 [[kv_namespaces]]
 binding = "RECORDING_JOB_KV"
 id = "a6760676704e4a1fac83ddff1b16222d"
