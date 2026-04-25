@@ -5,7 +5,7 @@ import { getCompletionEmailConfig, sendCompletionEmail, shouldSendCompletionEmai
 import { HttpError } from './http';
 import { findRecordingJobWithSource, getRecordingJob, getRecordingJobStorageMeta, markJobFailed, normalizeDropboxPath, shouldSkipProcessingForExistingJob, updateRecordingJobStatus } from './jobs';
 import { logEvent } from './logger';
-import { importMyTasksToInbox, upsertInterviewFromTranscript } from './notion';
+import { buildInboxTriageChooseUrl, importMyTasksToInbox, signInboxPageId, upsertInterviewFromTranscript } from './notion';
 import { inspectAudioSource, MAX_TRANSCRIBE_DURATION_SEC, summarizeInterview, transcribeWithDiarization } from './openai';
 
 
@@ -112,6 +112,11 @@ async function runPostPersistTasksAndEmail(
   }
 
   const emailTasks = imported.importedTaskItems.length ? imported.importedTaskItems : fallbackTasks;
+  const hasInboxTriageBaseUrl = Boolean(env.INBOX_TRIAGE_BASE_URL?.trim());
+  const hasInboxTriageActionSecret = Boolean(env.INBOX_TRIAGE_ACTION_SECRET?.trim());
+  const inboxTriageActionSecret = env.INBOX_TRIAGE_ACTION_SECRET?.trim();
+  const memoSignature = inboxTriageActionSecret ? await signInboxPageId(params.persisted.pageId, inboxTriageActionSecret) : undefined;
+  const memoChooseUrl = memoSignature ? buildInboxTriageChooseUrl(env.INBOX_TRIAGE_BASE_URL, params.persisted.pageId, memoSignature) : undefined;
   const completedAt = new Date().toISOString();
   const completionMailConfig = getCompletionEmailConfig(env);
 
@@ -124,11 +129,17 @@ async function runPostPersistTasksAndEmail(
     toCount: completionMailConfig.to.length,
     ccCount: completionMailConfig.cc.length,
     bccCount: completionMailConfig.bcc.length,
+    hasMemoChooseUrl: Boolean(memoChooseUrl),
+    hasInboxTriageBaseUrl,
+    hasInboxTriageActionSecret,
+    emailTasksCount: emailTasks.length,
+    emailTasksWithChooseUrlCount: emailTasks.filter((task) => Boolean(task.chooseUrl)).length,
   });
   try {
     await sendCompletionEmail(env, {
       subject: env.MAIL_SUBJECT_PREFIX ?? 'Interview Memo 完了通知',
       notionPageUrl: buildNotionPageUrl(params.persisted.pageId),
+      memoChooseUrl,
       summary: params.summary ?? '',
       transcript: params.transcriptFullText ?? '',
       myTasks: emailTasks,

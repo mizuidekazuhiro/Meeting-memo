@@ -42,6 +42,45 @@ test('completion email body contains notion link/summary/transcript/my tasks', (
   assert.ok(!message.includes('/action/move'));
 });
 
+test('completion email body contains memo choose button when memoChooseUrl exists', () => {
+  const memoChooseUrl = 'https://triage.example.com/move/choose?inbox_page_id=memo123&sig=beadfeed';
+  const message = buildCompletionEmailMessage({
+    to: ['to@example.com'],
+    from: 'from@example.com',
+    subject: 'Interview completed',
+    notionPageUrl: 'https://www.notion.so/example',
+    memoChooseUrl,
+    summary: 'summary text',
+    transcript: 'transcript text',
+    myTasks: [],
+    fileName: 'meeting.m4a',
+    recordingId: 'rec-1',
+    completedAt: '2026-04-20T00:00:00.000Z',
+  });
+
+  assert.ok(message.includes('この面談メモを処理する'));
+  assert.ok(message.includes('href="https://triage.example.com/move/choose?inbox_page_id=memo123&amp;sig=beadfeed"'));
+});
+
+test('completion email body omits memo choose button when memoChooseUrl is missing', () => {
+  const message = buildCompletionEmailMessage({
+    to: ['to@example.com'],
+    from: 'from@example.com',
+    subject: 'Interview completed',
+    notionPageUrl: 'https://www.notion.so/example',
+    summary: 'summary text',
+    transcript: 'transcript text',
+    myTasks: [],
+    fileName: 'meeting.m4a',
+    recordingId: 'rec-1',
+    completedAt: '2026-04-20T00:00:00.000Z',
+  });
+
+  assert.ok(!message.includes('この面談メモを処理する'));
+  assert.ok(message.includes('Notion ページを開く'));
+  assert.ok(message.includes('Summary'));
+});
+
 test('shouldSendCompletionEmail is true only when enabled and all required envs exist', () => {
   const baseEnv = {
     GMAIL_NOTIFY_ENABLED: 'true',

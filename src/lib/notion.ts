@@ -391,7 +391,7 @@ export interface ImportMyTasksInput {
   myTasks: unknown;
 }
 
-async function signInboxPageId(pageId: string, secret: string): Promise<string> {
+export async function signInboxPageId(pageId: string, secret: string): Promise<string> {
   const secretBytes = new TextEncoder().encode(secret);
   const data = new TextEncoder().encode(pageId);
   const key = await crypto.subtle.importKey(
@@ -407,7 +407,7 @@ async function signInboxPageId(pageId: string, secret: string): Promise<string> 
     .join('');
 }
 
-function buildInboxTriageChooseUrl(baseUrl: string | undefined, inboxPageId: string, signature: string): string | undefined {
+export function buildInboxTriageChooseUrl(baseUrl: string | undefined, inboxPageId: string, signature: string): string | undefined {
   const normalizedBaseUrl = baseUrl?.trim().replace(/\/$/, '');
   if (!normalizedBaseUrl) return undefined;
   const query = new URLSearchParams({
