@@ -20,7 +20,8 @@ async function loadDeps() {
   const processingMod = await importFirst(['../src/lib/processing.js', '../.tmp-test/src/lib/processing.js']);
   const loggerMod = await importFirst(['../src/lib/logger.js', '../.tmp-test/src/lib/logger.js']);
   const gmailMod = await importFirst(['../src/lib/gmail.js', '../.tmp-test/src/lib/gmail.js']);
-  return { workerMod, httpMod, jobsMod, processingMod, loggerMod, gmailMod };
+  const notionMod = await importFirst(['../src/lib/notion.js', '../.tmp-test/src/lib/notion.js']);
+  return { workerMod, httpMod, jobsMod, processingMod, loggerMod, gmailMod, notionMod };
 }
 
 class MockKv {
@@ -70,20 +71,79 @@ function installFinalizeFetchMock() {
     notionPagePatchCalls: 0,
     summaryCalls: 0,
     summaryPayloads: [] as any[],
+    reviewCalls: 0,
+    createdInboxTaskTitles: [] as string[],
   };
+  const inboxPagesByDedupKey = new Map<string, string>();
+  let nextInboxPageId = 1;
 
   global.fetch = (async (input: string, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();
     if (url.includes('/v1/responses')) {
-      stats.summaryCalls += 1;
+      const parsedBody = typeof init?.body === 'string' ? JSON.parse(init.body) : {};
+      const formatName = parsedBody?.text?.format?.name;
+      if (formatName === 'interview_insights') {
+        stats.summaryCalls += 1;
+        return new Response(
+          JSON.stringify({ output_text: JSON.stringify({ summary: '要約です', myTasks: ['task1'], otherTasks: ['task2'], ambiguities: [] }) }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      stats.reviewCalls += 1;
       return new Response(
-        JSON.stringify({ output_text: JSON.stringify({ summary: '要約です', myTasks: ['task1'], otherTasks: ['task2'], ambiguities: [] }) }),
+        JSON.stringify({
+          output_text: JSON.stringify({
+            finalMemoMarkdown: 'final memo',
+            correctedTermsMarkdown: '',
+            summaryForEmail: 'email summary',
+            uncertainItemsMarkdown: '',
+            nextActionsMarkdown: '- review-next-action',
+            humanCheckRequired: false,
+            humanCheckReason: '',
+            myTasks: ['review-task-1', 'review-task-2'],
+            otherTasks: [],
+            sourceUrls: [],
+          }),
+        }),
         { status: 200, headers: { 'content-type': 'application/json' } },
       );
     }
-    if (url.includes('/databases/') && url.endsWith('/query')) return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/databases/db') && init?.method === 'GET') {
+      return new Response(JSON.stringify({
+        properties: {
+          Name: {},
+          Source: {},
+          'Record Type': {},
+          'Source Recording ID': {},
+          'Source Interview Page ID': {},
+          'Source Interview URL': {},
+          'Imported At': {},
+          'Dedup Key': {},
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/databases/') && url.endsWith('/query')) {
+      const parsedBody = typeof init?.body === 'string' ? JSON.parse(init.body) : undefined;
+      const dedupKey = parsedBody?.filter?.property === 'Dedup Key'
+        ? parsedBody?.filter?.rich_text?.equals
+        : parsedBody?.filter?.and?.find?.((item: any) => item?.property === 'Dedup Key')?.rich_text?.equals;
+      if (typeof dedupKey === 'string' && inboxPagesByDedupKey.has(dedupKey)) {
+        return new Response(JSON.stringify({ results: [{ id: inboxPagesByDedupKey.get(dedupKey) }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
     if (url.endsWith('/pages') && init?.method === 'POST') {
+      const parsedBody = typeof init?.body === 'string' ? JSON.parse(init.body) : {};
       stats.notionPageCreateCalls += 1;
+      const isInboxTask = parsedBody?.parent?.database_id === 'db' && parsedBody?.properties?.['Record Type']?.select?.name === 'Task';
+      if (isInboxTask) {
+        const taskTitle = parsedBody?.properties?.Name?.title?.[0]?.text?.content ?? '';
+        const dedupKey = parsedBody?.properties?.['Dedup Key']?.rich_text?.[0]?.text?.content;
+        const pageId = `inbox_${nextInboxPageId++}`;
+        if (typeof taskTitle === 'string' && taskTitle) stats.createdInboxTaskTitles.push(taskTitle);
+        if (typeof dedupKey === 'string' && dedupKey) inboxPagesByDedupKey.set(dedupKey, pageId);
+        return new Response(JSON.stringify({ id: pageId }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
       return new Response(JSON.stringify({ id: 'page_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     if (url.includes('/pages/') && init?.method === 'PATCH') {
@@ -166,7 +226,7 @@ test('finalizeInterviewJob executes transcript -> summary -> email and marks com
   const { persistTranscriptionCallback, finalizeInterviewJob } = processingMod;
 
   const kv = new MockKv();
-  const env = makeEnv(kv, { GMAIL_NOTIFY_ENABLED: 'true', MAIL_TO: 'to@example.com', MAIL_FROM: 'from@example.com', MAIL_PASSWORD: 'password' });
+  const env = makeEnv(kv, { GMAIL_NOTIFY_ENABLED: 'true', MAIL_TO: 'to@example.com', MAIL_FROM: 'from@example.com', MAIL_PASSWORD: 'password', INTERVIEW_REVIEW_ENABLED: 'true' });
   const job = createRecordingJob({ request: { fileName: 'finalize.m4a' }, dropboxFileId: 'id:3', dropboxPathLower: '/apps/meetingmemo/inbox/finalize.m4a', fileName: 'finalize.m4a' });
   await upsertRecordingJob(env, job);
   await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
@@ -189,8 +249,10 @@ test('finalizeInterviewJob executes transcript -> summary -> email and marks com
   assert.ok(updated?.emailSentAt);
   assert.ok(fetchMock.stats.notionTranscriptAppendCalls >= 1);
   assert.ok(fetchMock.stats.summaryCalls >= 1);
+  assert.ok(fetchMock.stats.reviewCalls >= 1);
   assert.ok(fetchMock.stats.notionPagePatchCalls >= 1);
   assert.equal(emailCalls.length, 1);
+  assert.deepEqual(fetchMock.stats.createdInboxTaskTitles, ['review-task-1', 'review-task-2']);
 });
 
 test('finalize resumes from partial state and skips transcript append when transcriptWrittenAt exists', async () => {
@@ -235,7 +297,7 @@ test('finalize idempotency skips duplicate heavy work unless force=true', async 
   const { persistTranscriptionCallback, finalizeInterviewJob } = processingMod;
 
   const kv = new MockKv();
-  const env = makeEnv(kv, { GMAIL_NOTIFY_ENABLED: 'true', MAIL_TO: 'to@example.com', MAIL_FROM: 'from@example.com', MAIL_PASSWORD: 'password' });
+  const env = makeEnv(kv, { GMAIL_NOTIFY_ENABLED: 'true', MAIL_TO: 'to@example.com', MAIL_FROM: 'from@example.com', MAIL_PASSWORD: 'password', INTERVIEW_REVIEW_ENABLED: 'true' });
   const job = createRecordingJob({ request: { fileName: 'idempotent.m4a' }, dropboxFileId: 'id:5', dropboxPathLower: '/apps/meetingmemo/inbox/idempotent.m4a', fileName: 'idempotent.m4a' });
   await upsertRecordingJob(env, job);
   await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
@@ -258,9 +320,111 @@ test('finalize idempotency skips duplicate heavy work unless force=true', async 
   assert.ok(fetchMock.stats.notionTranscriptAppendCalls > first.notion);
   assert.ok(fetchMock.stats.summaryCalls > first.summary);
   assert.ok(emailCount > first.email);
+  assert.equal(fetchMock.stats.createdInboxTaskTitles.filter((task) => task === 'review-task-1').length, 1);
+  assert.equal(fetchMock.stats.createdInboxTaskTitles.filter((task) => task === 'review-task-2').length, 1);
 
   gmailMod.sendCompletionEmail = originalSendEmail;
   fetchMock.restore();
+});
+
+test('finalizeInterviewJob uses review.nextActionsMarkdown when review.myTasks is empty', async () => {
+  const { jobsMod, processingMod, gmailMod } = await loadDeps();
+  const { createRecordingJob, upsertRecordingJob } = jobsMod;
+  const { persistTranscriptionCallback, finalizeInterviewJob } = processingMod;
+
+  const kv = new MockKv();
+  const env = makeEnv(kv, { GMAIL_NOTIFY_ENABLED: 'true', MAIL_TO: 'to@example.com', MAIL_FROM: 'from@example.com', MAIL_PASSWORD: 'password', INTERVIEW_REVIEW_ENABLED: 'true' });
+  const job = createRecordingJob({ request: { fileName: 'review-next-actions.m4a' }, dropboxFileId: 'id:6', dropboxPathLower: '/apps/meetingmemo/inbox/review-next-actions.m4a', fileName: 'review-next-actions.m4a' });
+  await upsertRecordingJob(env, job);
+  await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
+
+  const originalFetch = global.fetch;
+  const createdInboxTaskTitles: string[] = [];
+  global.fetch = (async (input: string, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url.includes('/v1/responses')) {
+      const body = typeof init?.body === 'string' ? JSON.parse(init.body) : {};
+      const formatName = body?.text?.format?.name;
+      if (formatName === 'interview_insights') {
+        return new Response(JSON.stringify({ output_text: JSON.stringify({ summary: '要約です', myTasks: ['primary-task'], otherTasks: [], ambiguities: [] }) }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({
+        output_text: JSON.stringify({
+          finalMemoMarkdown: 'final',
+          correctedTermsMarkdown: '',
+          summaryForEmail: '',
+          uncertainItemsMarkdown: '',
+          nextActionsMarkdown: '- fallback-from-next-actions',
+          humanCheckRequired: false,
+          humanCheckReason: '',
+          myTasks: [],
+          otherTasks: [],
+          sourceUrls: [],
+        }),
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/databases/db') && init?.method === 'GET') {
+      return new Response(JSON.stringify({
+        properties: { Name: {}, Source: {}, 'Record Type': {}, 'Source Recording ID': {}, 'Source Interview Page ID': {}, 'Source Interview URL': {}, 'Imported At': {}, 'Dedup Key': {} },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/databases/') && url.endsWith('/query')) return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.endsWith('/pages') && init?.method === 'POST') {
+      const parsedBody = typeof init?.body === 'string' ? JSON.parse(init.body) : {};
+      const isInboxTask = parsedBody?.properties?.['Record Type']?.select?.name === 'Task';
+      if (isInboxTask) {
+        createdInboxTaskTitles.push(parsedBody?.properties?.Name?.title?.[0]?.text?.content ?? '');
+        return new Response(JSON.stringify({ id: `inbox_${createdInboxTaskTitles.length}` }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ id: 'page_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/pages/') && init?.method === 'PATCH') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/children?')) return new Response(JSON.stringify({ results: [], has_more: false, next_cursor: null }), { status: 200, headers: { 'content-type': 'application/json' } });
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+
+  const originalSendEmail = gmailMod.sendCompletionEmail;
+  gmailMod.sendCompletionEmail = (async () => undefined) as any;
+  await finalizeInterviewJob(env, job.recordingId);
+  gmailMod.sendCompletionEmail = originalSendEmail;
+  global.fetch = originalFetch;
+
+  assert.deepEqual(createdInboxTaskTitles, ['fallback-from-next-actions']);
+});
+
+test('finalizeInterviewJob continues when final my task import fails', async () => {
+  const { jobsMod, processingMod, gmailMod } = await loadDeps();
+  const { createRecordingJob, upsertRecordingJob, getRecordingJob } = jobsMod;
+  const { persistTranscriptionCallback, finalizeInterviewJob } = processingMod;
+
+  const kv = new MockKv();
+  const env = makeEnv(kv, { GMAIL_NOTIFY_ENABLED: 'true', MAIL_TO: 'to@example.com', MAIL_FROM: 'from@example.com', MAIL_PASSWORD: 'password', INTERVIEW_REVIEW_ENABLED: 'true' });
+  const job = createRecordingJob({ request: { fileName: 'import-fail.m4a' }, dropboxFileId: 'id:7', dropboxPathLower: '/apps/meetingmemo/inbox/import-fail.m4a', fileName: 'import-fail.m4a' });
+  await upsertRecordingJob(env, job);
+  await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
+
+  const fetchMock = installFinalizeFetchMock();
+  const originalFetch = global.fetch;
+  global.fetch = (async (input: string, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url.includes('/databases/db') && init?.method === 'GET') {
+      return new Response(JSON.stringify({ message: 'simulated failure' }), { status: 500, headers: { 'content-type': 'application/json' } });
+    }
+    return originalFetch(input as any, init);
+  }) as any;
+  const originalSendEmail = gmailMod.sendCompletionEmail;
+  gmailMod.sendCompletionEmail = (async () => undefined) as any;
+
+  await finalizeInterviewJob(env, job.recordingId);
+
+  global.fetch = originalFetch;
+  gmailMod.sendCompletionEmail = originalSendEmail;
+  fetchMock.restore();
+
+  const updated = await getRecordingJob(env, { recordingId: job.recordingId });
+  assert.equal(updated?.status, 'completed');
+  assert.equal(updated?.finalizeStatus, 'completed');
 });
 
 test('callback not found still returns lookup error', async () => {
