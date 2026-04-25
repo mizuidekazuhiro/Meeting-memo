@@ -227,10 +227,12 @@ async function createSmtpClient(hostname: string, port: number): Promise<SmtpCli
 
   const startTls = async (): Promise<void> => {
     await sendCommand('STARTTLS', [220]);
-    const secureSocket = socket.startTls();
-    await writer.close();
+
     reader.releaseLock();
     writer.releaseLock();
+
+    const secureSocket = socket.startTls();
+
     socket = secureSocket;
     reader = socket.readable.getReader();
     writer = socket.writable.getWriter();
@@ -240,14 +242,24 @@ async function createSmtpClient(hostname: string, port: number): Promise<SmtpCli
   const close = async (): Promise<void> => {
     try {
       await sendCommand('QUIT', [221]);
+    } catch {
+      // no-op
     } finally {
       try {
         await writer.close();
       } catch {
         // no-op
       }
-      reader.releaseLock();
-      writer.releaseLock();
+      try {
+        reader.releaseLock();
+      } catch {
+        // no-op
+      }
+      try {
+        writer.releaseLock();
+      } catch {
+        // no-op
+      }
       socket.close();
     }
   };
