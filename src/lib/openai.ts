@@ -594,7 +594,22 @@ export async function summarizeInterview(env: Env, transcript: TranscriptResult)
     response = await fetch(`${OPENAI_API}/responses`, {
       method: 'POST',
       headers: { authorization: `Bearer ${env.OPENAI_API_KEY}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ model: env.OPENAI_MODEL_SUMMARIZE ?? 'gpt-4.1-mini', input: [{ role: 'system', content: [{ type: 'input_text', text: ['あなたは会議メモ作成アシスタントです。', '文字起こしに基づいてのみ、日本語で簡潔に要点を要約してください。', '誇張や推測は禁止です。', 'JSONは summary, myTasks, otherTasks, ambiguities の4キーだけを返してください。', 'myTasks と otherTasks は文字列配列にしてください。', '担当不明なタスクは推測せず ambiguities に書いてください。'].join(' ') }] }, { role: 'user', content: [{ type: 'input_text', text: transcript.fullText }] }], text: { format: { type: 'json_schema', name: 'interview_insights', schema: { type: 'object', additionalProperties: false, required: ['summary', 'myTasks', 'otherTasks', 'ambiguities'], properties: { summary: { type: 'string' }, myTasks: { type: 'array', items: { type: 'string' } }, otherTasks: { type: 'array', items: { type: 'string' } }, ambiguities: { type: 'array', items: { type: 'string' } } } } } } }),
+      body: JSON.stringify({ model: env.OPENAI_MODEL_SUMMARIZE ?? 'gpt-4.1-mini', input: [{ role: 'system', content: [{ type: 'input_text', text: [
+            'あなたは面談メモ作成アシスタントです。',
+            '回答は文字起こし(transcript)に含まれる情報のみを根拠にし、事実と未確認事項を明確に分けてください。',
+            'JSONは summary, myTasks, otherTasks, ambiguities の4キーだけを返してください。',
+            'myTasks と otherTasks は既存仕様どおり文字列配列で作成し、担当不明なタスクは推測せず ambiguities に書いてください。',
+            'summary は単なる説明文ではなく、面談後にそのまま使える業務用の「面談メモ」形式で日本語出力してください。',
+            'summary の先頭は必ず「【面談メモ｜{面談テーマを短く推定}】」とし、続けて次の見出しをこの順番・表記で必ず含めてください: 「■ 面談テーマ」「■ 確認できた内容」「■ 重要な発言・示唆」「■ 未確認事項」「■ 次アクション」。',
+            '「会話では〜について話されています」のような説明文は禁止です。',
+            '「〜と思われます」「〜かもしれません」の多用は禁止です。根拠のない断定も禁止です。',
+            '確認できた内容は箇条書きで、工程・部署・製品・設備・論点などの単位で整理してください。',
+            '未確認事項には会話だけでは断定できない点を列挙し、判断材料がなければ「不明」と明記してください。',
+            '次アクションは確認・調査・整理など具体的な動詞で記述してください。',
+            'transcript にない内容を補完しないでください。',
+            '人名・会社名・設備名・数値が出てきた場合は、可能な限り落とさず summary に含めてください。',
+            'summary 全体の分量は800〜1,500字程度にしてください。',
+          ].join(' ') }] }, { role: 'user', content: [{ type: 'input_text', text: transcript.fullText }] }], text: { format: { type: 'json_schema', name: 'interview_insights', schema: { type: 'object', additionalProperties: false, required: ['summary', 'myTasks', 'otherTasks', 'ambiguities'], properties: { summary: { type: 'string' }, myTasks: { type: 'array', items: { type: 'string' } }, otherTasks: { type: 'array', items: { type: 'string' } }, ambiguities: { type: 'array', items: { type: 'string' } } } } } } }),
     });
   } catch (error) {
     logEvent('error', 'summary request failed', { details: error instanceof Error ? error.message : error });
