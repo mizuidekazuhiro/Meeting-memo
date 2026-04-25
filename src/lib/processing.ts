@@ -123,7 +123,7 @@ async function runPostPersistTasksAndEmail(
   });
   try {
     await sendCompletionEmail(env, {
-      subject: `${env.MAIL_SUBJECT_PREFIX ?? 'Interview Memo 完了'}: ${params.job.fileName}`,
+      subject: env.MAIL_SUBJECT_PREFIX ?? 'Interview Memo 完了通知',
       notionPageUrl: buildNotionPageUrl(params.persisted.pageId),
       summary: params.summary ?? '',
       transcript: params.transcriptFullText ?? '',

@@ -108,17 +108,19 @@ function buildCompletionEmailHtml(input: CompletionEmailInput): string {
   const myTasksHtml = input.myTasks.length
     ? `<ul>${input.myTasks.map((task) => `<li>${escapeHtml(task)}</li>`).join('')}</ul>`
     : '<p>なし</p>';
+  const notionPageUrl = escapeHtml(input.notionPageUrl);
 
   return `<!DOCTYPE html>
 <html lang="ja">
-  <body style="margin:0;padding:0;background:#f5f7fb;font-family:-apple-system,BlinkMacSystemFont,'Hiragino Kaku Gothic ProN','Yu Gothic UI',sans-serif;color:#1f2937;">
+  <body style="margin:0;padding:0;background:#f5f7fb;font-family:'Yu Gothic UI','Yu Gothic','YuGothic','Hiragino Kaku Gothic ProN','Meiryo',Arial,sans-serif;color:#1f2937;">
     <div style="max-width:680px;margin:0 auto;padding:16px;">
       <div style="background:#ffffff;border-radius:12px;padding:20px;line-height:1.7;">
         <h2 style="margin:0 0 12px 0;font-size:20px;">Interview Memo 完了通知</h2>
-        <p style="margin:0 0 12px 0;">Notion ページ: <a href="${escapeHtml(input.notionPageUrl)}">${escapeHtml(input.notionPageUrl)}</a></p>
-        <p style="margin:0;"><strong>fileName:</strong> ${escapeHtml(input.fileName)}</p>
-        <p style="margin:0;"><strong>recordingId:</strong> ${escapeHtml(input.recordingId)}</p>
-        <p style="margin:0 0 12px 0;"><strong>completedAt:</strong> ${escapeHtml(input.completedAt)}</p>
+        <p style="margin:0 0 12px 0;">Interview Memo の文字起こしと要約が完了しました。</p>
+        <p style="margin:0 0 12px 0;">
+          Notion ページ：
+          <a href="${notionPageUrl}" target="_blank" rel="noopener noreferrer">Notion ページを開く</a>
+        </p>
         <h3 style="margin:16px 0 8px 0;font-size:16px;">Summary</h3>
         <p style="white-space:pre-wrap;margin:0;">${escapeHtml(input.summary || 'なし')}</p>
         <h3 style="margin:16px 0 8px 0;font-size:16px;">My Tasks</h3>

@@ -5,12 +5,13 @@ import * as assert from 'node:assert/strict';
 import { buildCompletionEmailMessage, shouldSendCompletionEmail } from '../src/lib/gmail';
 
 test('completion email body contains notion link/summary/transcript/my tasks', () => {
+  const notionPageUrl = 'https://www.notion.so/example';
   const message = buildCompletionEmailMessage({
     to: ['to@example.com'],
     cc: ['cc@example.com'],
     from: 'from@example.com',
     subject: 'Interview completed',
-    notionPageUrl: 'https://www.notion.so/example',
+    notionPageUrl,
     summary: 'summary text',
     transcript: 'transcript text',
     myTasks: ['task 1', 'task 2'],
@@ -21,7 +22,13 @@ test('completion email body contains notion link/summary/transcript/my tasks', (
 
   assert.ok(message.includes('To: to@example.com'));
   assert.ok(message.includes('Cc: cc@example.com'));
-  assert.ok(message.includes('https://www.notion.so/example'));
+  assert.ok(message.includes(`href="${notionPageUrl}"`));
+  assert.ok(message.includes('Notion ページを開く'));
+  assert.ok(!message.includes(`>${notionPageUrl}</a>`));
+  assert.ok(!message.includes('<strong>fileName:</strong>'));
+  assert.ok(!message.includes('<strong>recordingId:</strong>'));
+  assert.ok(!message.includes('<strong>completedAt:</strong>'));
+  assert.ok(message.includes("font-family:'Yu Gothic UI'"));
   assert.ok(message.includes('summary text'));
   assert.ok(message.includes('transcript text'));
   assert.ok(message.includes('task 1'));
