@@ -123,6 +123,8 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 - `MAIL_SUBJECT_PREFIX`（任意。既定: `Interview Memo 完了`）
 - `SMTP_HOST`（任意。既定: `smtp.gmail.com`）
 - `SMTP_PORT`（任意。既定: `587`）
+- `INBOX_TRIAGE_BASE_URL`（任意。例: `https://notion-inbox-triage.example.com`）
+- `INBOX_TRIAGE_ACTION_SECRET`（任意。`notion-inbox-triage` 側の `ACTION_SECRET` と同じ値）
 - 旧方式（非推奨 / 互換メモ）: `GMAIL_OAUTH_CLIENT_ID`, `GMAIL_OAUTH_CLIENT_SECRET`, `GMAIL_OAUTH_REFRESH_TOKEN`
 - 既存 Dropbox / OpenAI / Notion 関連 env
 
@@ -148,6 +150,8 @@ Workers に下記 env を設定します。
 - `MAIL_SUBJECT_PREFIX=Interview Memo 完了`
 - `SMTP_HOST=smtp.gmail.com`
 - `SMTP_PORT=587`
+- `INBOX_TRIAGE_BASE_URL=https://notion-inbox-triage.example.com`
+- `INBOX_TRIAGE_ACTION_SECRET=<same-as-notion-inbox-triage-ACTION_SECRET>`
 
 重要:
 
@@ -160,6 +164,7 @@ Workers に下記 env を設定します。
 
 - 同一 `recordingId` ですでに `notificationSentAt` が保存済みの場合、完了通知メールは再送しません。
 - `My Tasks` 取込が失敗しても、Interview Memo 本体が Notion 保存済みならメール送信は継続します（warning ログのみ）。
+- `INBOX_TRIAGE_BASE_URL` と `INBOX_TRIAGE_ACTION_SECRET` が設定されている場合、完了通知メールの My Tasks 各項目に `/move/choose` への「タスク処理を選ぶ」ボタンを表示します。
 
 ## Recording callback の lookup 仕様
 

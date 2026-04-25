@@ -391,6 +391,32 @@ export interface ImportMyTasksInput {
   myTasks: unknown;
 }
 
+async function signInboxPageId(pageId: string, secret: string): Promise<string> {
+  const secretBytes = new TextEncoder().encode(secret);
+  const data = new TextEncoder().encode(pageId);
+  const key = await crypto.subtle.importKey(
+    'raw',
+    secretBytes,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const signature = await crypto.subtle.sign('HMAC', key, data);
+  return Array.from(new Uint8Array(signature))
+    .map((value) => value.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+function buildInboxTriageChooseUrl(baseUrl: string | undefined, inboxPageId: string, signature: string): string | undefined {
+  const normalizedBaseUrl = baseUrl?.trim().replace(/\/$/, '');
+  if (!normalizedBaseUrl) return undefined;
+  const query = new URLSearchParams({
+    inbox_page_id: inboxPageId,
+    sig: signature,
+  });
+  return `${normalizedBaseUrl}/move/choose?${query.toString()}`;
+}
+
 async function getInboxDatabasePropertyNames(env: Env): Promise<Set<string>> {
   const response = await notionFetch<{ properties?: Record<string, unknown> }>(env, `/databases/${env.INBOX_DB_ID}`, {
     method: 'GET',
@@ -408,6 +434,12 @@ export async function importMyTasksToInbox(
   missingProperties: string[];
   normalizedTasks: string[];
   sourceInterviewUrl: string;
+  importedTaskItems: Array<{
+    taskText: string;
+    inboxPageId: string;
+    chooseUrl?: string;
+    skippedDuplicate?: boolean;
+  }>;
 }> {
   const normalizedTasks = normalizeMyTasksInput(input.myTasks);
   const sourceInterviewUrl = notionPageUrl(input.sourceInterviewPageId);
@@ -423,6 +455,13 @@ export async function importMyTasksToInbox(
   let importedCount = 0;
   let skippedDuplicates = 0;
   let skippedBecauseMissingProperties = 0;
+  const importedTaskItems: Array<{
+    taskText: string;
+    inboxPageId: string;
+    chooseUrl?: string;
+    skippedDuplicate?: boolean;
+  }> = [];
+  const actionSecret = env.INBOX_TRIAGE_ACTION_SECRET?.trim();
 
   for (const taskText of normalizedTasks) {
     const taskHash = await sha256Hex(taskText);
@@ -430,10 +469,17 @@ export async function importMyTasksToInbox(
     const existing = await findPageByDedupKey(env, dedupKey);
     if (existing) {
       skippedDuplicates += 1;
+      const signature = actionSecret ? await signInboxPageId(existing.id, actionSecret) : undefined;
+      importedTaskItems.push({
+        taskText,
+        inboxPageId: existing.id,
+        chooseUrl: signature ? buildInboxTriageChooseUrl(env.INBOX_TRIAGE_BASE_URL, existing.id, signature) : undefined,
+        skippedDuplicate: true,
+      });
       continue;
     }
 
-    await notionFetch(env, '/pages', {
+    const created = await notionFetch<{ id: string }>(env, '/pages', {
       method: 'POST',
       body: JSON.stringify({
         parent: { database_id: env.INBOX_DB_ID },
@@ -449,7 +495,14 @@ export async function importMyTasksToInbox(
     });
     importedCount += 1;
     skippedBecauseMissingProperties += missingProperties.length;
+    const createdSignature = actionSecret ? await signInboxPageId(created.id, actionSecret) : undefined;
+    importedTaskItems.push({
+      taskText,
+      inboxPageId: created.id,
+      chooseUrl: createdSignature ? buildInboxTriageChooseUrl(env.INBOX_TRIAGE_BASE_URL, created.id, createdSignature) : undefined,
+      skippedDuplicate: false,
+    });
   }
 
-  return { importedCount, skippedDuplicates, skippedBecauseMissingProperties, missingProperties, normalizedTasks, sourceInterviewUrl };
+  return { importedCount, skippedDuplicates, skippedBecauseMissingProperties, missingProperties, normalizedTasks, sourceInterviewUrl, importedTaskItems };
 }

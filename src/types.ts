@@ -41,6 +41,8 @@ export interface Env {
   GMAIL_OAUTH_CLIENT_ID?: string;
   GMAIL_OAUTH_CLIENT_SECRET?: string;
   GMAIL_OAUTH_REFRESH_TOKEN?: string;
+  INBOX_TRIAGE_BASE_URL?: string;
+  INBOX_TRIAGE_ACTION_SECRET?: string;
 }
 
 export interface IntakeRequest {

@@ -38,9 +38,12 @@ function buildNotionPageUrl(pageId: string): string {
   return `https://www.notion.so/${pageId.replace(/-/g, '')}`;
 }
 
-function normalizeEmailTasks(myTasks: string[] | undefined): string[] {
+function normalizeEmailTasks(myTasks: string[] | undefined): Array<{ taskText: string; chooseUrl?: string }> {
   if (!Array.isArray(myTasks)) return [];
-  return myTasks.map((task) => task.trim()).filter((task) => task.length > 0);
+  return myTasks
+    .map((task) => task.trim())
+    .filter((task) => task.length > 0)
+    .map((taskText) => ({ taskText }));
 }
 
 async function runPostPersistTasksAndEmail(
@@ -60,8 +63,9 @@ async function runPostPersistTasksAndEmail(
     skippedDuplicates: 0,
     skippedBecauseMissingProperties: 0,
     missingProperties: [] as string[],
-    normalizedTasks: fallbackTasks,
+    normalizedTasks: fallbackTasks.map((task) => task.taskText),
     sourceInterviewUrl: buildNotionPageUrl(params.persisted.pageId),
+    importedTaskItems: fallbackTasks,
   };
 
   logEvent('info', 'my task import started', {
@@ -107,7 +111,7 @@ async function runPostPersistTasksAndEmail(
     return;
   }
 
-  const emailTasks = imported.normalizedTasks.length ? imported.normalizedTasks : fallbackTasks;
+  const emailTasks = imported.importedTaskItems.length ? imported.importedTaskItems : fallbackTasks;
   const completedAt = new Date().toISOString();
   const completionMailConfig = getCompletionEmailConfig(env);
 

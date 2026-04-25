@@ -15,7 +15,7 @@ interface CompletionEmailInput {
   notionPageUrl: string;
   summary: string;
   transcript: string;
-  myTasks: string[];
+  myTasks: Array<{ taskText: string; chooseUrl?: string }>;
   fileName: string;
   recordingId: string;
   completedAt: string;
@@ -106,7 +106,12 @@ export function getCompletionEmailConfig(env: Env): MailConfig {
 
 function buildCompletionEmailHtml(input: CompletionEmailInput): string {
   const myTasksHtml = input.myTasks.length
-    ? `<ul>${input.myTasks.map((task) => `<li>${escapeHtml(task)}</li>`).join('')}</ul>`
+    ? `<ul style="padding-left:20px;margin:0;">${input.myTasks.map((task) => {
+      const buttonHtml = task.chooseUrl
+        ? `<div style="margin-top:8px;"><a href="${escapeHtml(task.chooseUrl)}" target="_blank" rel="noopener noreferrer" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;padding:8px 12px;border-radius:8px;font-size:13px;">タスク処理を選ぶ</a></div>`
+        : '';
+      return `<li style="margin-bottom:12px;"><div>${escapeHtml(task.taskText)}</div>${buttonHtml}</li>`;
+    }).join('')}</ul>`
     : '<p>なし</p>';
   const notionPageUrl = escapeHtml(input.notionPageUrl);
 
