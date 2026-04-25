@@ -312,11 +312,9 @@ test('gmail send failure does not fail callback persistence', async () => {
   const env = makeEnv(kv, {
     OPENAI_API_KEY: 'test',
     GMAIL_NOTIFY_ENABLED: 'true',
-    GMAIL_TO: 'to@example.com',
-    GMAIL_FROM: 'from@example.com',
-    GMAIL_OAUTH_CLIENT_ID: 'cid',
-    GMAIL_OAUTH_CLIENT_SECRET: 'secret',
-    GMAIL_OAUTH_REFRESH_TOKEN: 'refresh',
+    MAIL_TO: 'to@example.com',
+    MAIL_FROM: 'from@example.com',
+    MAIL_PASSWORD: 'app-password',
   });
   const job = createRecordingJob({ request: { fileName: 'gmail-fail.m4a' }, dropboxFileId: 'id:gmail-fail', dropboxPathLower: '/apps/meetingmemo/inbox/gmail-fail.m4a', fileName: 'gmail-fail.m4a' });
   await upsertRecordingJob(env, job);
@@ -328,8 +326,6 @@ test('gmail send failure does not fail callback persistence', async () => {
     if (url.includes('/databases/') && url.endsWith('/query')) return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
     if (url.endsWith('/pages')) return new Response(JSON.stringify({ id: 'page_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
     if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-    if (url.includes('oauth2.googleapis.com/token')) return new Response(JSON.stringify({ access_token: 'access-token' }), { status: 200, headers: { 'content-type': 'application/json' } });
-    if (url.includes('/gmail/v1/users/me/messages/send')) return new Response(JSON.stringify({ error: 'send failed' }), { status: 500, headers: { 'content-type': 'application/json' } });
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
   }) as any;
 

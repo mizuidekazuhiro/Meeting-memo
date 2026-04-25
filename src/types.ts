@@ -28,6 +28,14 @@ export interface Env {
   CALLBACK_JOB_LOOKUP_BASE_DELAY_MS?: string;
   CALLBACK_JOB_LOOKUP_MAX_DELAY_MS?: string;
   GMAIL_NOTIFY_ENABLED?: string;
+  MAIL_FROM?: string;
+  MAIL_PASSWORD?: string;
+  MAIL_TO?: string;
+  MAIL_CC?: string;
+  MAIL_BCC?: string;
+  MAIL_SUBJECT_PREFIX?: string;
+  SMTP_HOST?: string;
+  SMTP_PORT?: string;
   GMAIL_TO?: string;
   GMAIL_FROM?: string;
   GMAIL_OAUTH_CLIENT_ID?: string;
