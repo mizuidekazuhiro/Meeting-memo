@@ -16,6 +16,7 @@ GMAIL_NOTIFY_ENABLED = "true"
 MAIL_SUBJECT_PREFIX = "Meeting Memo作成完了 "
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = "587"
+INBOX_TRIAGE_BASE_URL = "https://notion-inbox-triage.kazuhiro-mizuide.workers.dev"
 
 [[kv_namespaces]]
 binding = "RECORDING_JOB_KV"
