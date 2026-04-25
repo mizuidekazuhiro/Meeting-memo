@@ -13,7 +13,7 @@ INTERVIEW_SCAN_MAX_FILES = "20"
 DROPBOX_UPLOAD_FOLDER = "/Apps/MeetingMemo/inbox"
 
 GMAIL_NOTIFY_ENABLED = "true"
-MAIL_SUBJECT_PREFIX = "Interview Memo 完了"
+MAIL_SUBJECT_PREFIX = "Meeting Memo作成完了 "
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = "587"
 
