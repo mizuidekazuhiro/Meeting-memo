@@ -13,6 +13,7 @@ interface MailConfig {
 
 interface CompletionEmailInput {
   notionPageUrl: string;
+  transcriptFileUrl?: string;
   summary: string;
   transcript: string;
   myTasks: Array<{ taskText: string; chooseUrl?: string }>;
@@ -141,6 +142,7 @@ function buildCompletionEmailHtml(input: CompletionEmailInput): string {
           Notion ページ：
           <a href="${notionPageUrl}" target="_blank" rel="noopener noreferrer">Notion ページを開く</a>
         </p>
+        ${input.transcriptFileUrl ? `<p style="margin:0 0 12px 0;">Transcript全文リンク：<a href="${escapeHtml(input.transcriptFileUrl)}" target="_blank" rel="noopener noreferrer">Transcript全文リンク</a></p>` : ''}
         <h3 style="margin:16px 0 8px 0;font-size:16px;">レビュー結果</h3>
         <p style="white-space:pre-wrap;margin:0;">${escapeHtml(reviewStatus)}</p>
         <h3 style="margin:16px 0 8px 0;font-size:16px;">Summary</h3>

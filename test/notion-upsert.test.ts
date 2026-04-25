@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 
-import { appendReviewedMemoToNotionPage, importMyTasksToInbox, upsertInterviewFromTranscript } from '../src/lib/notion';
+import { appendReviewedMemoToNotionPage, buildTranscriptBlocks, importMyTasksToInbox, saveTranscriptLinkToNotion, upsertInterviewFromTranscript } from '../src/lib/notion';
 
 test('upsertInterviewFromTranscript stores insights fields and transcript raw JSON', async () => {
   const originalFetch = global.fetch;
@@ -172,7 +172,7 @@ test('importMyTasksToInbox omits optional source properties that are not in DB s
   assert.equal(pageBodies[0].properties['Source Interview URL'], undefined);
 });
 
-test('appendReviewedMemoToNotionPage adds review sections and keeps Transcript', async () => {
+test('appendReviewedMemoToNotionPage adds review sections and does not re-append Transcript', async () => {
   const originalFetch = global.fetch;
   const appendedChildren: any[] = [];
   global.fetch = (async (input: string, init?: RequestInit) => {
@@ -221,14 +221,6 @@ test('appendReviewedMemoToNotionPage adds review sections and keeps Transcript',
       sourceUrls: ['https://example.com'],
       raw: {},
     },
-    {
-      title: 't',
-      dedupKey: 'd',
-      metadata: { name: 'm4a' },
-      request: {},
-      processingStatus: 'persisted',
-      transcript: { fullText: 'hello transcript', segments: [], raw: {} },
-    } as any,
   );
   global.fetch = originalFetch;
 
@@ -238,7 +230,7 @@ test('appendReviewedMemoToNotionPage adds review sections and keeps Transcript',
   assert.ok(headings.includes('固有名詞補正'));
   assert.ok(headings.includes('未確定事項'));
   assert.ok(headings.includes('次に取るべき行動'));
-  assert.ok(headings.includes('Transcript'));
+  assert.equal(headings.includes('Transcript'), false);
   const h1 = allChildren.find((block) => block.type === 'heading_1');
   assert.equal(h1.heading_1.rich_text[0].text.content, '面談メモ（二次レビュー）');
   const nestedH2 = allChildren.find((block) => block.type === 'heading_2' && block.heading_2.rich_text[0].text.content === '結論');
@@ -249,10 +241,49 @@ test('appendReviewedMemoToNotionPage adds review sections and keeps Transcript',
   const table = allChildren.find((block) => block.type === 'table');
   assert.ok(table);
   assert.equal(table.table.children[0].table_row.cells[0][0].text.content, '項目');
-  const transcriptParagraph = allChildren.find((block) => block.type === 'paragraph' && block.paragraph?.rich_text?.[0]?.text?.content === 'hello transcript');
-  assert.ok(transcriptParagraph);
+  const transcriptParagraph = allChildren.find((block) => block.type === 'paragraph' && String(block.paragraph?.rich_text?.[0]?.text?.content ?? '').includes('hello transcript'));
+  assert.equal(Boolean(transcriptParagraph), false);
   const plainTextDump = JSON.stringify(allChildren);
   assert.equal(plainTextDump.includes('|---|---|'), false);
   assert.equal(plainTextDump.includes('**四番線の電車は各駅停車で押上行き**'), false);
   assert.equal(plainTextDump.includes('## 結論'), false);
+});
+
+test('buildTranscriptBlocks does not expand full transcript into many notion blocks', () => {
+  const longText = 'a'.repeat(50000);
+  const blocks = buildTranscriptBlocks({
+    title: 't',
+    dedupKey: 'd',
+    metadata: { name: 'm4a' },
+    request: {},
+    processingStatus: 'persisted',
+    transcript: { fullText: longText, segments: [], raw: {} },
+  } as any, { excerptChars: 4000, transcriptFileUrl: 'https://dropbox.example.com/transcript' });
+  assert.ok(blocks.length <= 10);
+  const dumped = JSON.stringify(blocks);
+  assert.equal(dumped.includes(longText), false);
+  assert.ok(dumped.includes('Transcript全文リンク'));
+});
+
+test('saveTranscriptLinkToNotion falls back to body when Transcript Link property is missing', async () => {
+  const originalFetch = global.fetch;
+  const patchBodies: any[] = [];
+  global.fetch = (async (input: string, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url.includes('/pages/page_1') && init?.method === 'GET') {
+      return new Response(JSON.stringify({ properties: { Name: { type: 'title' } } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/blocks/page_1/children') && init?.method === 'PATCH') {
+      if (typeof init.body === 'string') patchBodies.push(JSON.parse(init.body));
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+
+  const result = await saveTranscriptLinkToNotion({ NOTION_TOKEN: 'token', INBOX_DB_ID: 'db' } as any, 'page_1', 'https://dropbox.example.com/txt');
+  global.fetch = originalFetch;
+
+  assert.equal(result.usedProperty, false);
+  assert.equal(result.fallbackToBody, true);
+  assert.ok(JSON.stringify(patchBodies).includes('Transcript全文リンク'));
 });

@@ -1,11 +1,11 @@
 import type { DropboxFileMetadata, Env, IntakeRequest, InterviewInsights, ProcessInterviewResult, RecordingJob, RecordingJobCallbackPayload, TranscriptResult } from '../types';
 import { buildDedupCandidates } from './dedup';
-import { downloadDropboxFile } from './dropbox';
+import { downloadDropboxFile, getOrCreateDropboxSharedLink, sanitizeDropboxFileName, sha256Hex, uploadTextFileToDropbox } from './dropbox';
 import { getCompletionEmailConfig, sendCompletionEmail, shouldSendCompletionEmail } from './gmail';
 import { HttpError } from './http';
 import { findRecordingJobWithSource, getRecordingJob, getRecordingJobStorageMeta, markJobFailed, normalizeDropboxPath, shouldSkipProcessingForExistingJob, updateRecordingJobStatus } from './jobs';
 import { logEvent } from './logger';
-import { appendInterviewReviewFailureToNotionPage, appendReviewedMemoToNotionPage, importMyTasksToInbox, updateInterviewRecordProperties, upsertInterviewFromTranscript } from './notion';
+import { appendInterviewReviewFailureToNotionPage, appendReviewedMemoToNotionPage, importMyTasksToInbox, saveTranscriptLinkToNotion, updateInterviewRecordProperties, upsertInterviewFromTranscript } from './notion';
 import { inspectAudioSource, MAX_TRANSCRIBE_DURATION_SEC, reviewInterviewWithWebSearch, summarizeInterview, transcribeWithDiarization } from './openai';
 import type { InterviewReviewResult } from '../types';
 
@@ -37,6 +37,43 @@ async function waitMs(delayMs: number): Promise<void> {
 
 function buildNotionPageUrl(pageId: string): string {
   return `https://www.notion.so/${pageId.replace(/-/g, '')}`;
+}
+
+function renderTranscriptText(transcript: TranscriptResult): string {
+  if (transcript.segments.length) {
+    return transcript.segments.map((segment) => `[${segment.speaker || 'speaker_unknown'}] ${segment.text ?? ''}`.trim()).join('\n');
+  }
+  return transcript.fullText;
+}
+
+async function writeTranscriptTextToDropbox(
+  env: Env,
+  job: RecordingJob,
+): Promise<{ transcriptFilePath: string; transcriptFileUrl: string; transcriptFileId?: string; transcriptFileLinkCreated: boolean; transcriptFullTextLength: number; transcriptSegmentCount: number }> {
+  if (!job.transcript) throw new HttpError('Transcript missing for transcript storage.', 500);
+  const safeBaseName = sanitizeDropboxFileName(job.fileName.replace(/\.[^.]+$/, '') || 'transcript');
+  const hash = (await sha256Hex(job.recordingId)).slice(0, 16);
+  const transcriptFilePath = `/Apps/MeetingMemo/transcripts/${safeBaseName}-${hash}.txt`;
+  const transcriptBody = [
+    `recordingId: ${job.recordingId}`,
+    `fileName: ${job.fileName}`,
+    `dropboxFileId: ${job.dropboxFileId}`,
+    `dropboxPathLower: ${job.dropboxPathLower ?? ''}`,
+    `generatedAt: ${new Date().toISOString()}`,
+    '',
+    'full transcript text:',
+    renderTranscriptText(job.transcript),
+  ].join('\n');
+  const uploaded = await uploadTextFileToDropbox(env, transcriptFilePath, transcriptBody);
+  const shared = await getOrCreateDropboxSharedLink(env, transcriptFilePath);
+  return {
+    transcriptFilePath,
+    transcriptFileUrl: shared.url,
+    transcriptFileId: uploaded.id,
+    transcriptFileLinkCreated: shared.created,
+    transcriptFullTextLength: job.transcript.fullText.length,
+    transcriptSegmentCount: job.transcript.segments.length,
+  };
 }
 
 function normalizeEmailTasks(myTasks: string[] | undefined): Array<{ taskText: string; chooseUrl?: string }> {
@@ -168,6 +205,7 @@ async function runPostPersistTasksAndEmail(
     await sendCompletionEmail(env, {
       subject: env.MAIL_SUBJECT_PREFIX ?? 'Interview Memo 完了通知',
       notionPageUrl: buildNotionPageUrl(params.persisted.pageId),
+      transcriptFileUrl: params.job.transcriptFileUrl,
       summary: params.summary ?? '',
       transcript: params.transcriptFullText ?? '',
       myTasks: emailTasks,
@@ -378,7 +416,7 @@ export async function processUploadedInterview(
           });
           if (persisted.pageId) {
             await updateInterviewRecordProperties(env, persisted.pageId, persisted.record);
-            await appendReviewedMemoToNotionPage(env, persisted.pageId, reviewResult, persisted.record);
+            await appendReviewedMemoToNotionPage(env, persisted.pageId, reviewResult);
           }
           persisted.record.insights = {
             summary: reviewResult.summaryForEmail || persisted.record.insights?.summary || '',
@@ -567,28 +605,45 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
 
     let mutable = current;
     let pageId = mutable.notionPageId;
+    let transcriptFileUrl = mutable.transcriptFileUrl;
 
     if (!mutable.transcriptWrittenAt || force) {
-    logEvent('info', 'notion_transcript_append_started', { recordingId, fileName: mutable.fileName });
-    const persisted = await upsertInterviewFromTranscript(env, mutable.request, {
-      id: mutable.dropboxFileId,
-      path_lower: mutable.dropboxPathLower,
-      name: mutable.fileName,
-      size: mutable.sourceBytes,
-      client_modified: mutable.clientModified,
-      server_modified: mutable.serverModified,
-    }, mutable.transcript);
-    pageId = persisted.pageId;
-    const now = new Date().toISOString();
-    await updateRecordingJobStatus(env, { recordingId }, 'transcribed', {
-      transcriptWrittenAt: now,
-      notionPageId: pageId,
-      notionPageUrl: pageId ? buildNotionPageUrl(pageId) : undefined,
-    });
-    logEvent('info', 'notion_transcript_append_completed', { recordingId, notionPageId: pageId ?? null, notionPageUrl: pageId ? buildNotionPageUrl(pageId) : null });
-    mutable = (await getRecordingJob(env, { recordingId }))!;
+      logEvent('info', 'notion_transcript_append_started', { recordingId, fileName: mutable.fileName });
+      const transcriptStorage = await writeTranscriptTextToDropbox(env, mutable);
+      transcriptFileUrl = transcriptStorage.transcriptFileUrl;
+      logEvent('info', 'transcript_txt_saved', {
+        recordingId,
+        transcriptFilePath: transcriptStorage.transcriptFilePath,
+        transcriptFileLinkCreated: transcriptStorage.transcriptFileLinkCreated,
+        transcriptFullTextLength: transcriptStorage.transcriptFullTextLength,
+        transcriptSegmentCount: transcriptStorage.transcriptSegmentCount,
+      });
+      const persisted = await upsertInterviewFromTranscript(env, { ...mutable.request, dropboxSharedLink: transcriptFileUrl }, {
+        id: mutable.dropboxFileId,
+        path_lower: mutable.dropboxPathLower,
+        name: mutable.fileName,
+        size: mutable.sourceBytes,
+        client_modified: mutable.clientModified,
+        server_modified: mutable.serverModified,
+      }, mutable.transcript);
+      pageId = persisted.pageId;
+      if (pageId) {
+        await saveTranscriptLinkToNotion(env, pageId, transcriptFileUrl);
+      }
+      const now = new Date().toISOString();
+      await updateRecordingJobStatus(env, { recordingId }, 'transcribed', {
+        transcriptWrittenAt: now,
+        notionPageId: pageId,
+        notionPageUrl: pageId ? buildNotionPageUrl(pageId) : undefined,
+        transcriptFilePath: transcriptStorage.transcriptFilePath,
+        transcriptFileUrl: transcriptStorage.transcriptFileUrl,
+        transcriptFileId: transcriptStorage.transcriptFileId,
+      });
+      logEvent('info', 'notion_transcript_append_completed', { recordingId, notionPageId: pageId ?? null, notionPageUrl: pageId ? buildNotionPageUrl(pageId) : null });
+      mutable = (await getRecordingJob(env, { recordingId }))!;
     } else {
       logEvent('info', 'notion_transcript_append_skipped_already_written', { recordingId, transcriptWrittenAt: mutable.transcriptWrittenAt });
+      transcriptFileUrl = mutable.transcriptFileUrl;
     }
 
     let insights: InterviewInsights | undefined;
@@ -622,7 +677,7 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
         const review = await reviewInterviewWithWebSearch(env, { transcript: mutable.transcript!, insights, title: mutable.fileName, fileName: mutable.fileName, notionPageUrl: pageId ? buildNotionPageUrl(pageId) : undefined });
         reviewResult = review;
         if (pageId) {
-          await appendReviewedMemoToNotionPage(env, pageId, review, ensureInterviewRecord(mutable, mutable.transcript!, insights));
+          await appendReviewedMemoToNotionPage(env, pageId, review);
         }
         await updateRecordingJobStatus(env, { recordingId }, 'transcribed', { reviewCompletedAt: new Date().toISOString() });
         mutable = (await getRecordingJob(env, { recordingId }))!;
@@ -715,11 +770,15 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
     if (!canSendEmail) {
       logEvent('warn', 'email_send_failed', { recordingId, reason: 'email configuration missing' });
     } else if (!mutable.emailSentAt || force || forceEmail) {
+      if (!transcriptFileUrl) {
+        throw new HttpError('Transcript link is required before sending completion email.', 500, { recordingId });
+      }
       logEvent('info', 'email_send_started', { recordingId, fileName: mutable.fileName, notionPageUrl: mutable.notionPageUrl ?? null });
       try {
         await sendCompletionEmail(env, {
           subject: env.MAIL_SUBJECT_PREFIX ?? 'Interview Memo 完了通知',
           notionPageUrl: mutable.notionPageUrl ?? (pageId ? buildNotionPageUrl(pageId) : ''),
+          transcriptFileUrl,
           summary: insights?.summary ?? '',
           transcript: mutable.transcript?.fullText ?? '',
           myTasks: [],

@@ -27,6 +27,8 @@ export interface Env {
   DROPBOX_INTERVIEW_SCAN_RECURSIVE?: string;
   INTERVIEW_SCAN_MAX_FILES?: string;
   DROPBOX_UPLOAD_FOLDER?: string;
+  TRANSCRIPT_STORAGE_MODE?: string;
+  NOTION_TRANSCRIPT_EXCERPT_CHARS?: string;
   OPENAI_API_KEY: string;
   OPENAI_MODEL_TRANSCRIBE?: string;
   OPENAI_MODEL_SUMMARIZE?: string;
@@ -218,6 +220,9 @@ export interface RecordingJob {
   finalizeSource?: 'callback' | 'manual' | 'retry';
   notionPageId?: string;
   notionPageUrl?: string;
+  transcriptFilePath?: string;
+  transcriptFileUrl?: string;
+  transcriptFileId?: string;
 }
 
 export interface RecordingJobCallbackPayload {

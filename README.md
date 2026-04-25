@@ -53,7 +53,7 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 - 使用モデル: `gpt-5.4-mini`（`OPENAI_MODEL_REVIEW`。未設定時は `OPENAI_MODEL_SUMMARIZE`、さらに未設定時は `gpt-5.4-mini`）
 - Notion DB プロパティの追加は不要です。既存プロパティ（`Summary` / `My Tasks` / `Other Tasks` / `Raw JSON` / `Error Message`）のみ更新します。
 - レビュー結果は Notion の**ページ本文**と完了通知メール本文の両方に出力されます。
-- `Transcript` セクションは削除しません。
+- 長い Transcript は Notion 本文へ全文展開せず、Dropbox `.txt` に保存し、Notion には抜粋と全文リンクのみを記録します。
 - Web検索結果は補助情報です。低確度/不明は人間確認が必要です。
 - `humanCheckRequired=true` の主な条件:
   - 低確度または不明項目が1つでもある
@@ -62,6 +62,7 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
   - Web検索結果と transcript が矛盾する可能性がある
   - 固有名詞補正をしているのに根拠URLが空
 - 二次レビューが失敗しても、一次要約 + Transcript 保存 + メール通知は継続します。
+- `wrangler.toml` の `[limits]`（`subrequests=50000`, `cpu_ms=300000`）は暫定対策です。根本対策は Notion への大量ブロック書き込み削減です。
 
 ### Notion My Tasks の任意プロパティ（別ページ化する場合）
 
@@ -135,6 +136,8 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 - `INTERVIEW_REVIEW_ENABLED`（未設定は有効。`false` の時のみ二次レビュー無効）
 - `INTERVIEW_REVIEW_WEB_SEARCH_ENABLED`（未設定は有効。`false` の時のみWeb検索無効）
 - `OPENAI_MODEL_REVIEW`（既定: `gpt-5.4-mini`）
+- `NOTION_TRANSCRIPT_EXCERPT_CHARS`（任意。既定: `4000`）
+- `TRANSCRIPT_STORAGE_MODE`（任意。`dropbox_txt` 推奨）
 - `MAIL_FROM`（送信元 Gmail アドレス）
 - `MAIL_PASSWORD`（Google アプリパスワード）
 - `MAIL_TO`（通知先。カンマ/セミコロン/改行区切り可）
