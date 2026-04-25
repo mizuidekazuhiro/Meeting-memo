@@ -46,6 +46,7 @@ function makeEnv(kv: MockKv, overrides: Record<string, unknown> = {}) {
     NOTION_TOKEN: 'token',
     INBOX_DB_ID: 'db',
     OPENAI_API_KEY: 'openai-test',
+    DROPBOX_ACCESS_TOKEN: 'dropbox-test-token',
     INTERVIEW_REVIEW_ENABLED: 'false',
     RECORDING_JOB_KV: kv,
     FINALIZE_QUEUE: { send: async () => undefined },
@@ -74,6 +75,8 @@ function installFinalizeFetchMock() {
     summaryPayloads: [] as any[],
     reviewCalls: 0,
     createdInboxTaskTitles: [] as string[],
+    transcriptUploads: 0,
+    transcriptSharedLinkCalls: 0,
   };
   const inboxPagesByDedupKey = new Map<string, string>();
   let nextInboxPageId = 1;
@@ -109,6 +112,17 @@ function installFinalizeFetchMock() {
         { status: 200, headers: { 'content-type': 'application/json' } },
       );
     }
+    if (url.includes('/2/files/upload')) {
+      stats.transcriptUploads += 1;
+      return new Response(JSON.stringify({ id: 'id:transcript', path_lower: '/apps/meetingmemo/transcripts/a.txt' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/2/sharing/list_shared_links')) {
+      return new Response(JSON.stringify({ links: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/2/sharing/create_shared_link_with_settings')) {
+      stats.transcriptSharedLinkCalls += 1;
+      return new Response(JSON.stringify({ url: 'https://dropbox.example.com/transcript' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
     if (url.includes('/databases/db') && init?.method === 'GET') {
       return new Response(JSON.stringify({
         properties: {
@@ -123,6 +137,9 @@ function installFinalizeFetchMock() {
         },
       }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
+    if (url.includes('/2/files/upload')) return new Response(JSON.stringify({ id: 'id:transcript' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/2/sharing/list_shared_links')) return new Response(JSON.stringify({ links: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/2/sharing/create_shared_link_with_settings')) return new Response(JSON.stringify({ url: 'https://dropbox.example.com/transcript' }), { status: 200, headers: { 'content-type': 'application/json' } });
     if (url.includes('/databases/') && url.endsWith('/query')) {
       const parsedBody = typeof init?.body === 'string' ? JSON.parse(init.body) : undefined;
       const dedupKey = parsedBody?.filter?.property === 'Dedup Key'
@@ -151,6 +168,9 @@ function installFinalizeFetchMock() {
       stats.notionPagePatchCalls += 1;
       if (typeof init?.body === 'string') stats.summaryPayloads.push(JSON.parse(init.body));
       return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/pages/') && init?.method === 'GET') {
+      return new Response(JSON.stringify({ properties: { 'Transcript Link': { type: 'url' } } }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') {
       stats.notionTranscriptAppendCalls += 1;
@@ -322,7 +342,9 @@ test('finalizeInterviewJob executes transcript -> summary -> email and marks com
   assert.ok(fetchMock.stats.reviewCalls >= 1);
   assert.ok(fetchMock.stats.notionPagePatchCalls >= 1);
   assert.equal(emailCalls.length, 1);
+  assert.equal(emailCalls[0].transcriptFileUrl, 'https://dropbox.example.com/transcript');
   assert.deepEqual(fetchMock.stats.createdInboxTaskTitles, ['review-task-1', 'review-task-2']);
+  assert.ok(fetchMock.stats.transcriptUploads >= 1);
 });
 
 test('finalize resumes from partial state and skips transcript append when transcriptWrittenAt exists', async () => {
@@ -338,6 +360,7 @@ test('finalize resumes from partial state and skips transcript append when trans
   await upsertRecordingJob(env, {
     ...(await getRecordingJob(env, { recordingId: job.recordingId }))!,
     transcriptWrittenAt: new Date().toISOString(),
+    transcriptFileUrl: 'https://dropbox.example.com/transcript-existing',
     notionPageId: 'page_existing',
     notionPageUrl: 'https://www.notion.so/pageexisting',
   } as any);
@@ -356,6 +379,7 @@ test('finalize resumes from partial state and skips transcript append when trans
 
   const updated = await getRecordingJob(env, { recordingId: job.recordingId });
   assert.equal(fetchMock.stats.notionTranscriptAppendCalls, 0);
+  assert.equal(fetchMock.stats.transcriptUploads, 0);
   assert.ok(fetchMock.stats.summaryCalls >= 1);
   assert.equal(emailCount, 1);
   assert.equal(updated?.status, 'completed');
@@ -380,7 +404,7 @@ test('finalize idempotency skips duplicate heavy work unless force=true', async 
   }) as any;
 
   await finalizeInterviewJob(env, job.recordingId);
-  const first = { notion: fetchMock.stats.notionTranscriptAppendCalls, summary: fetchMock.stats.summaryCalls, email: emailCount };
+  const first = { notion: fetchMock.stats.notionTranscriptAppendCalls, summary: fetchMock.stats.summaryCalls, email: emailCount, transcriptUploads: fetchMock.stats.transcriptUploads };
   await finalizeInterviewJob(env, job.recordingId);
   assert.equal(fetchMock.stats.notionTranscriptAppendCalls, first.notion);
   assert.equal(fetchMock.stats.summaryCalls, first.summary);
@@ -390,6 +414,7 @@ test('finalize idempotency skips duplicate heavy work unless force=true', async 
   assert.ok(fetchMock.stats.notionTranscriptAppendCalls > first.notion);
   assert.ok(fetchMock.stats.summaryCalls > first.summary);
   assert.ok(emailCount > first.email);
+  assert.ok(fetchMock.stats.transcriptUploads > first.transcriptUploads);
   assert.equal(fetchMock.stats.createdInboxTaskTitles.filter((task) => task === 'review-task-1').length, 1);
   assert.equal(fetchMock.stats.createdInboxTaskTitles.filter((task) => task === 'review-task-2').length, 1);
 
@@ -403,7 +428,7 @@ test('finalizeInterviewJob uses review.nextActionsMarkdown when review.myTasks i
   const { persistTranscriptionCallback, finalizeInterviewJob } = processingMod;
 
   const kv = new MockKv();
-  const env = makeEnv(kv, { GMAIL_NOTIFY_ENABLED: 'true', MAIL_TO: 'to@example.com', MAIL_FROM: 'from@example.com', MAIL_PASSWORD: 'password', INTERVIEW_REVIEW_ENABLED: 'true' });
+  const env = makeEnv(kv, { GMAIL_NOTIFY_ENABLED: 'false', MAIL_TO: 'to@example.com', MAIL_FROM: 'from@example.com', MAIL_PASSWORD: 'password', INTERVIEW_REVIEW_ENABLED: 'true' });
   const job = createRecordingJob({ request: { fileName: 'review-next-actions.m4a' }, dropboxFileId: 'id:6', dropboxPathLower: '/apps/meetingmemo/inbox/review-next-actions.m4a', fileName: 'review-next-actions.m4a' });
   await upsertRecordingJob(env, job);
   await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
@@ -449,6 +474,7 @@ test('finalizeInterviewJob uses review.nextActionsMarkdown when review.myTasks i
       return new Response(JSON.stringify({ id: 'page_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     if (url.includes('/pages/') && init?.method === 'PATCH') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/pages/') && init?.method === 'GET') return new Response(JSON.stringify({ properties: { 'Transcript Link': { type: 'url' } } }), { status: 200, headers: { 'content-type': 'application/json' } });
     if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
     if (url.includes('/children?')) return new Response(JSON.stringify({ results: [], has_more: false, next_cursor: null }), { status: 200, headers: { 'content-type': 'application/json' } });
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
@@ -526,6 +552,33 @@ test('finalizeInterviewJob marks failed when summary generation fails', async ()
   assert.equal(updated?.status, 'failed');
   assert.equal(updated?.finalizeStatus, 'failed');
   assert.ok((updated?.lastError ?? '').length > 0);
+});
+
+test('finalizeInterviewJob marks failed when transcript link cannot be created', async () => {
+  const { jobsMod, processingMod } = await loadDeps();
+  const { createRecordingJob, upsertRecordingJob, getRecordingJob } = jobsMod;
+  const { persistTranscriptionCallback, finalizeInterviewJob } = processingMod;
+
+  const kv = new MockKv();
+  const env = makeEnv(kv, { GMAIL_NOTIFY_ENABLED: 'true', MAIL_TO: 'to@example.com', MAIL_FROM: 'from@example.com', MAIL_PASSWORD: 'password' });
+  const job = createRecordingJob({ request: { fileName: 'link-fail.m4a' }, dropboxFileId: 'id:link-fail', dropboxPathLower: '/apps/meetingmemo/inbox/link-fail.m4a', fileName: 'link-fail.m4a' });
+  await upsertRecordingJob(env, job);
+  await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
+
+  const originalFetch = global.fetch;
+  global.fetch = (async (input: string, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url.includes('/2/files/upload')) return new Response(JSON.stringify({ id: 'id:transcript' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/2/sharing/list_shared_links')) return new Response(JSON.stringify({ links: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/2/sharing/create_shared_link_with_settings')) return new Response(JSON.stringify({ error: 'fail' }), { status: 500, headers: { 'content-type': 'application/json' } });
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+
+  await assert.rejects(() => finalizeInterviewJob(env, job.recordingId));
+  global.fetch = originalFetch;
+
+  const updated = await getRecordingJob(env, { recordingId: job.recordingId });
+  assert.equal(updated?.status, 'failed');
 });
 
 test('callback not found still returns lookup error', async () => {

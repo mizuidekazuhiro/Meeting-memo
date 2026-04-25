@@ -323,3 +323,48 @@ export async function uploadAudioToDropbox(env: Env, file: Blob, fileName: strin
     });
   }
 }
+
+export function sanitizeDropboxFileName(value: string): string {
+  const normalized = value.normalize('NFKC').trim();
+  const replaced = normalized.replace(/[<>:"/\\|?*\u0000-\u001f]+/g, '-').replace(/\s+/g, '-');
+  return replaced.replace(/-+/g, '-').replace(/^-|-$/g, '') || 'transcript';
+}
+
+export async function sha256Hex(value: string): Promise<string> {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((item) => item.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+export async function uploadTextFileToDropbox(
+  env: Env,
+  path: string,
+  text: string,
+): Promise<DropboxFileMetadata> {
+  const auth = await resolveDropboxAuth(env);
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  return await dropboxContentUpload<DropboxFileMetadata>(
+    env,
+    '/files/upload',
+    {
+      path,
+      mode: 'overwrite',
+      autorename: false,
+      mute: true,
+      strict_conflict: false,
+    },
+    blob,
+    auth,
+  );
+}
+
+export async function getOrCreateDropboxSharedLink(env: Env, path: string): Promise<{ url: string; created: boolean }> {
+  const auth = await resolveDropboxAuth(env);
+  const listed = await dropboxRpc<{ links?: Array<{ url: string }> }>(env, '/sharing/list_shared_links', { path, direct_only: true }, auth);
+  const existing = listed.links?.find((link) => typeof link.url === 'string' && link.url.length > 0);
+  if (existing) return { url: existing.url, created: false };
+  const created = await dropboxRpc<{ url: string }>(env, '/sharing/create_shared_link_with_settings', { path }, auth);
+  return { url: created.url, created: true };
+}

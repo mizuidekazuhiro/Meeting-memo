@@ -14,6 +14,7 @@ test('completion email body contains notion link/summary/transcript/my tasks', (
     from: 'from@example.com',
     subject: 'Interview completed',
     notionPageUrl,
+    transcriptFileUrl: 'https://dropbox.example.com/transcript.txt',
     summary: 'summary text',
     transcript: 'transcript text',
     myTasks: [{ taskText: 'task 1', chooseUrl: chooseUrl1 }, { taskText: 'task 2', chooseUrl: chooseUrl2 }],
@@ -32,6 +33,8 @@ test('completion email body contains notion link/summary/transcript/my tasks', (
   assert.ok(message.includes('Cc: cc@example.com'));
   assert.ok(message.includes(`href="${notionPageUrl}"`));
   assert.ok(message.includes('Notion ページを開く'));
+  assert.ok(message.includes('Transcript全文リンク'));
+  assert.ok(message.includes('href="https://dropbox.example.com/transcript.txt"'));
   assert.ok(!message.includes(`>${notionPageUrl}</a>`));
   assert.ok(!message.includes('<strong>fileName:</strong>'));
   assert.ok(!message.includes('<strong>recordingId:</strong>'));
@@ -48,6 +51,19 @@ test('completion email body contains notion link/summary/transcript/my tasks', (
   assert.ok(message.includes('href="https://triage.example.com/move/choose?inbox_page_id=abc123&amp;sig=deadbeef"'));
   assert.ok(message.includes('href="https://triage.example.com/move/choose?inbox_page_id=def456&amp;sig=cafebabe"'));
   assert.ok(!message.includes('/action/move'));
+});
+
+test('completion email omits transcript link section when link is not provided', () => {
+  const message = buildCompletionEmailMessage({
+    to: ['to@example.com'],
+    from: 'from@example.com',
+    subject: 'Interview completed',
+    notionPageUrl: 'https://www.notion.so/example',
+    summary: 'summary',
+    transcript: 'transcript',
+    myTasks: [],
+  });
+  assert.equal(message.includes('Transcript全文リンク：<a href=""'), false);
 });
 
 test('subject includes 要確認 prefix when humanCheckRequired=true', () => {

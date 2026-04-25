@@ -5,6 +5,7 @@ const NOTION_API = 'https://api.notion.com/v1';
 const NOTION_VERSION = '2022-06-28';
 const NOTION_TEXT_LIMIT = 1900;
 const TRANSCRIPT_BLOCK_TEXT_LIMIT = 1700;
+const DEFAULT_NOTION_TRANSCRIPT_EXCERPT_CHARS = 4000;
 const TRANSCRIPT_HEADING = 'Transcript';
 const REVIEW_SECTION_HEADINGS = [
   '面談メモ（完成版）',
@@ -253,17 +254,19 @@ function transcriptLineFromSegment(segment: TranscriptSegment): string {
   return `[${speaker}] ${text}`.trim();
 }
 
-function buildTranscriptParagraphs(record: InterviewRecord): string[] {
+function getTranscriptExcerptChars(env: Env): number {
+  const parsed = Number.parseInt(env.NOTION_TRANSCRIPT_EXCERPT_CHARS ?? '', 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_NOTION_TRANSCRIPT_EXCERPT_CHARS;
+  return parsed;
+}
+
+function buildTranscriptExcerpt(record: InterviewRecord, excerptChars: number): string {
   const transcript = record.transcript;
-  if (!transcript) {
-    return [];
-  }
-
-  if (transcript.segments.length) {
-    return transcript.segments.flatMap((segment) => splitIntoChunks(transcriptLineFromSegment(segment), TRANSCRIPT_BLOCK_TEXT_LIMIT));
-  }
-
-  return splitIntoChunks(transcript.fullText, TRANSCRIPT_BLOCK_TEXT_LIMIT);
+  if (!transcript) return '';
+  const fullText = transcript.segments.length
+    ? transcript.segments.map((segment) => transcriptLineFromSegment(segment)).join('\n')
+    : transcript.fullText;
+  return fullText.slice(0, excerptChars).trim();
 }
 
 function buildProperties(record: InterviewRecord) {
@@ -310,26 +313,29 @@ function cleanProperties(properties: Record<string, unknown>): Record<string, un
   return Object.fromEntries(Object.entries(properties).filter(([, value]) => value !== undefined));
 }
 
-export function buildTranscriptBlocks(record: InterviewRecord): NotionBlockInput[] {
-  const paragraphs = buildTranscriptParagraphs(record);
-  if (!paragraphs.length) {
-    return [];
-  }
+export function buildTranscriptBlocks(record: InterviewRecord, options: { excerptChars?: number; transcriptFileUrl?: string } = {}): NotionBlockInput[] {
+  const transcript = record.transcript;
+  if (!transcript) return [];
+
+  const excerptChars = options.excerptChars ?? DEFAULT_NOTION_TRANSCRIPT_EXCERPT_CHARS;
+  const excerpt = buildTranscriptExcerpt(record, excerptChars);
+  const transcriptLink = options.transcriptFileUrl?.trim();
+  const fullLength = transcript.fullText.length;
+  const segmentCount = transcript.segments.length;
+
+  const paragraphs = [
+    transcriptLink ? `Transcript全文リンク: ${transcriptLink}` : 'Transcript全文リンク: 未取得',
+    `Transcript fullText length: ${fullLength}`,
+    `Transcript segment count: ${segmentCount}`,
+    excerpt ? `Transcript抜粋 (${Math.min(excerpt.length, excerptChars)} chars):\n${excerpt}` : 'Transcript抜粋: なし',
+  ].flatMap((line) => splitIntoChunks(line, TRANSCRIPT_BLOCK_TEXT_LIMIT));
 
   return [
-    {
-      object: 'block',
-      type: 'heading_2',
-      heading_2: {
-        rich_text: titleText(TRANSCRIPT_HEADING),
-      },
-    },
+    { object: 'block', type: 'heading_2', heading_2: { rich_text: titleText(TRANSCRIPT_HEADING) } },
     ...paragraphs.map((content) => ({
       object: 'block' as const,
       type: 'paragraph' as const,
-      paragraph: {
-        rich_text: richText(content),
-      },
+      paragraph: { rich_text: richText(content) },
     })),
   ];
 }
@@ -600,41 +606,47 @@ function buildReviewedMemoBlocks(reviewResult: InterviewReviewResult): NotionBlo
   ]);
 }
 
-export async function appendTranscriptBlocks(env: Env, pageId: string, record: InterviewRecord): Promise<void> {
-  const blocks = buildTranscriptBlocks(record);
+export async function appendTranscriptBlocks(env: Env, pageId: string, record: InterviewRecord, transcriptFileUrl?: string): Promise<void> {
+  const blocks = buildTranscriptBlocks(record, { excerptChars: getTranscriptExcerptChars(env), transcriptFileUrl });
   if (!blocks.length) {
     return;
   }
   await appendBlockChildren(env, pageId, blocks);
 }
 
-export async function replaceTranscriptBlocks(env: Env, pageId: string, record: InterviewRecord): Promise<void> {
+export async function replaceTranscriptBlocks(env: Env, pageId: string, record: InterviewRecord, transcriptFileUrl?: string): Promise<void> {
   const children = await listBlockChildren(env, pageId);
   const managedBlockIds = collectManagedTranscriptBlockIds(children);
   for (const blockId of managedBlockIds) {
     await deleteBlock(env, blockId);
   }
-  await appendTranscriptBlocks(env, pageId, record);
+  await appendTranscriptBlocks(env, pageId, record, transcriptFileUrl);
 }
 
-export async function appendReviewedMemoToNotionPage(env: Env, pageId: string, reviewResult: InterviewReviewResult, record?: InterviewRecord): Promise<void> {
+function collectManagedReviewBlockIds(children: NotionBlock[]): string[] {
+  const ids: string[] = [];
+  for (let index = 0; index < children.length; index += 1) {
+    const block = children[index];
+    if (block.type !== 'heading_2') continue;
+    const text = headingText(block);
+    if (!REVIEW_SECTION_HEADINGS.includes(text as (typeof REVIEW_SECTION_HEADINGS)[number])) continue;
+    ids.push(block.id);
+    for (let cursor = index + 1; cursor < children.length; cursor += 1) {
+      const next = children[cursor];
+      if (next.type === 'heading_2') break;
+      ids.push(next.id);
+    }
+  }
+  return ids;
+}
+
+export async function appendReviewedMemoToNotionPage(env: Env, pageId: string, reviewResult: InterviewReviewResult): Promise<void> {
   const children = await listBlockChildren(env, pageId);
-  const managedIds = collectManagedReviewAndTranscriptBlockIds(children);
+  const managedIds = collectManagedReviewBlockIds(children);
   for (const blockId of managedIds) {
     await deleteBlock(env, blockId);
   }
-  const transcriptRecord = record ?? {
-    title: '',
-    dedupKey: '',
-    metadata: { name: '' },
-    request: {},
-    processingStatus: 'persisted',
-    transcript: undefined,
-  } as InterviewRecord;
-  const blocks = [
-    ...buildReviewedMemoBlocks(reviewResult),
-    ...buildTranscriptBlocks(transcriptRecord),
-  ];
+  const blocks = [...buildReviewedMemoBlocks(reviewResult)];
   if (blocks.length) {
     await appendBlockChildren(env, pageId, blocks);
   }
@@ -670,7 +682,7 @@ export async function upsertInterviewPage(env: Env, record: InterviewRecord, exi
       method: 'PATCH',
       body: JSON.stringify({ properties }),
     });
-    await replaceTranscriptBlocks(env, existing.id, record);
+    await replaceTranscriptBlocks(env, existing.id, record, record.request.dropboxSharedLink);
     return { pageId: existing.id, created: false };
   }
 
@@ -681,8 +693,30 @@ export async function upsertInterviewPage(env: Env, record: InterviewRecord, exi
       properties,
     }),
   });
-  await appendTranscriptBlocks(env, response.id, record);
+  await appendTranscriptBlocks(env, response.id, record, record.request.dropboxSharedLink);
   return { pageId: response.id, created: true };
+}
+
+
+export async function saveTranscriptLinkToNotion(env: Env, pageId: string, transcriptUrl: string): Promise<{ usedProperty: boolean; fallbackToBody: boolean }> {
+  const page = await notionFetch<{ properties?: Record<string, { type?: string }> }>(env, `/pages/${pageId}`, { method: 'GET' });
+  const transcriptProp = page.properties?.['Transcript Link'];
+  if (transcriptProp && transcriptProp.type === 'url') {
+    await notionFetch(env, `/pages/${pageId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ properties: { 'Transcript Link': { url: transcriptUrl } } }),
+    });
+    return { usedProperty: true, fallbackToBody: false };
+  }
+
+  await appendBlockChildren(env, pageId, [{
+    object: 'block',
+    type: 'paragraph',
+    paragraph: {
+      rich_text: richText(`Transcript全文リンク: ${transcriptUrl}`),
+    },
+  }]);
+  return { usedProperty: false, fallbackToBody: true };
 }
 
 export async function updateInterviewRecordProperties(env: Env, pageId: string, record: InterviewRecord): Promise<void> {
