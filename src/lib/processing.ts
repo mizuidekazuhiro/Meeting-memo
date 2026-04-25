@@ -47,6 +47,42 @@ function normalizeEmailTasks(myTasks: string[] | undefined): Array<{ taskText: s
     .map((taskText) => ({ taskText }));
 }
 
+function hasNonEmptyTaskText(tasks: string[] | undefined): boolean {
+  return Array.isArray(tasks) && tasks.some((task) => typeof task === 'string' && task.trim().length > 0);
+}
+
+function hasNonEmptyMarkdown(value: string | undefined): boolean {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function selectFinalMyTaskInput(params: {
+  review?: InterviewReviewResult;
+  shouldRunReview: boolean;
+  insights?: InterviewInsights;
+}): { taskSource: string; myTasks: unknown; taskCount: number } {
+  if (params.review) {
+    if (hasNonEmptyTaskText(params.review.myTasks)) {
+      const normalized = params.review.myTasks
+        .map((task) => task.trim())
+        .filter((task) => task.length > 0);
+      return { taskSource: 'review.myTasks', myTasks: normalized, taskCount: normalized.length };
+    }
+    if (hasNonEmptyMarkdown(params.review.nextActionsMarkdown)) {
+      return { taskSource: 'review.nextActionsMarkdown', myTasks: params.review.nextActionsMarkdown, taskCount: 1 };
+    }
+    return { taskSource: 'review.nextActionsMarkdown', myTasks: [], taskCount: 0 };
+  }
+
+  if (!params.shouldRunReview && hasNonEmptyTaskText(params.insights?.myTasks)) {
+    const normalized = (params.insights?.myTasks ?? [])
+      .map((task) => task.trim())
+      .filter((task) => task.length > 0);
+    return { taskSource: 'primarySummaryFallback', myTasks: normalized, taskCount: normalized.length };
+  }
+
+  return { taskSource: 'reviewUnavailable', myTasks: [], taskCount: 0 };
+}
+
 async function runPostPersistTasksAndEmail(
   env: Env,
   params: {
@@ -542,6 +578,7 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
   }
 
   let insights = mutable.transcript ? await summarizeInterview(env, mutable.transcript) : undefined;
+  let reviewResult: InterviewReviewResult | undefined;
   if (!mutable.summaryWrittenAt || force) {
     try {
       logEvent('info', 'summary_generation_started', { recordingId });
@@ -563,6 +600,7 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
     try {
       logEvent('info', 'review_started', { recordingId });
       const review = await reviewInterviewWithWebSearch(env, { transcript: mutable.transcript!, insights, title: mutable.fileName, fileName: mutable.fileName, notionPageUrl: pageId ? buildNotionPageUrl(pageId) : undefined });
+      reviewResult = review;
       if (pageId) {
         await appendReviewedMemoToNotionPage(env, pageId, review, ensureInterviewRecord(mutable, mutable.transcript!, insights));
       }
@@ -575,6 +613,63 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
     }
   } else if (!shouldRunInterviewReview(env)) {
     logEvent('info', 'review_skipped_not_configured', { recordingId });
+  }
+
+  if (pageId) {
+    const selectedFinalTasks = selectFinalMyTaskInput({
+      review: reviewResult,
+      shouldRunReview: shouldRunInterviewReview(env),
+      insights,
+    });
+    const emptyImportResult = {
+      importedCount: 0,
+      skippedDuplicates: 0,
+      skippedBecauseMissingProperties: 0,
+      missingProperties: [] as string[],
+    };
+    logEvent('info', 'final my task import started', {
+      recordingId,
+      notionPageId: pageId,
+      taskSource: selectedFinalTasks.taskSource,
+      taskCount: selectedFinalTasks.taskCount,
+    });
+    if (selectedFinalTasks.taskCount === 0) {
+      logEvent('info', 'final my task import finished', {
+        recordingId,
+        notionPageId: pageId,
+        importedCount: 0,
+        skippedDuplicates: 0,
+        missingProperties: [],
+        taskSource: selectedFinalTasks.taskSource,
+        taskCount: 0,
+      });
+    } else {
+      try {
+        const imported = await importMyTasksToInbox(env, {
+          recordingId,
+          sourceInterviewPageId: pageId,
+          myTasks: selectedFinalTasks.myTasks,
+        });
+        logEvent('info', 'final my task import finished', {
+          recordingId,
+          notionPageId: pageId,
+          importedCount: imported.importedCount,
+          skippedDuplicates: imported.skippedDuplicates,
+          missingProperties: imported.missingProperties,
+          taskSource: selectedFinalTasks.taskSource,
+        });
+      } catch (error) {
+        logEvent('warn', 'final my task import failed', {
+          recordingId,
+          notionPageId: pageId,
+          importedCount: emptyImportResult.importedCount,
+          skippedDuplicates: emptyImportResult.skippedDuplicates,
+          missingProperties: emptyImportResult.missingProperties,
+          taskSource: selectedFinalTasks.taskSource,
+          details: error instanceof HttpError ? error.details : error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
   }
 
   const canSendEmail = shouldSendCompletionEmail(env);
