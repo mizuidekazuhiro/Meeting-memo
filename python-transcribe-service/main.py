@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 
 from auth import require_bearer_token
-from callback_client import send_callback
+from callback_client import send_callback, send_finalize
 from dropbox_client import DropboxClient
 from logging_utils import configure_logging, get_logger, log_event, preview_text
 from models import TranscriptionJobRequest, WorkersCallbackPayload
@@ -33,6 +33,7 @@ class JobState:
     error: str | None = None
     processing_seconds: float | None = None
     callback_status: str = 'pending'
+    finalize_status: str = 'pending'
     transcription_status: str = 'pending'
     overall_status: str = 'queued'
     updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -60,7 +61,7 @@ def update_job_state(recording_id: str, status: str, **kwargs) -> JobState:
 
 
 def _process_job_async(job: TranscriptionJobRequest) -> None:
-    update_job_state(job.recordingId, 'running', transcription_status='running', overall_status='running', callback_status='pending')
+    update_job_state(job.recordingId, 'running', transcription_status='running', overall_status='running', callback_status='pending', finalize_status='pending')
     started_at = time.perf_counter()
     log_event(logger, 'info', 'transcription_started', recordingId=job.recordingId, dropboxFileId=job.dropboxFileId, dropboxPathLower=job.dropboxPathLower, fileName=job.fileName)
     try:
@@ -71,19 +72,48 @@ def _process_job_async(job: TranscriptionJobRequest) -> None:
         callback_succeeded = send_callback(payload, callback_url=job.callbackUrl)
         elapsed = round(time.perf_counter() - started_at, 3)
         if callback_succeeded:
+            log_event(logger, 'info', 'callback_attempt_succeeded', recordingId=job.recordingId)
             update_job_state(
                 job.recordingId,
-                'completed',
+                'finalizing',
                 payload=payload,
                 callback_succeeded=True,
                 callback_status='succeeded',
                 transcription_status='transcribed',
-                overall_status='completed',
+                finalize_status='running',
+                overall_status='finalizing',
                 error=None,
                 processing_seconds=elapsed,
             )
-            log_event(logger, 'info', 'callback_attempt_succeeded', recordingId=job.recordingId)
-            log_event(logger, 'info', 'lifecycle_completed', recordingId=job.recordingId, transcriptionStatus='transcribed', callbackStatus='succeeded', overallStatus='completed', processingSeconds=elapsed)
+            finalize_succeeded, finalize_url = send_finalize(job.recordingId, callback_url=job.callbackUrl)
+            if finalize_succeeded:
+                update_job_state(
+                    job.recordingId,
+                    'completed',
+                    payload=payload,
+                    callback_succeeded=True,
+                    callback_status='succeeded',
+                    transcription_status='transcribed',
+                    finalize_status='succeeded',
+                    overall_status='completed',
+                    error=None,
+                    processing_seconds=elapsed,
+                )
+                log_event(logger, 'info', 'lifecycle_completed', recordingId=job.recordingId, transcriptionStatus='transcribed', callbackStatus='succeeded', finalizeStatus='succeeded', overallStatus='completed', processingSeconds=elapsed, finalizeUrl=finalize_url)
+                return
+            update_job_state(
+                job.recordingId,
+                'finalize_failed',
+                payload=payload,
+                callback_succeeded=True,
+                callback_status='succeeded',
+                transcription_status='transcribed',
+                finalize_status='failed',
+                overall_status='finalize_failed',
+                error=f'finalize api call failed: {finalize_url or "url unavailable"}',
+                processing_seconds=elapsed,
+            )
+            log_event(logger, 'warning', 'lifecycle_finished_with_finalize_failed', recordingId=job.recordingId, transcriptionStatus='transcribed', callbackStatus='succeeded', finalizeStatus='failed', overallStatus='finalize_failed', processingSeconds=elapsed, finalizeUrl=finalize_url)
             return
 
         update_job_state(
@@ -93,6 +123,7 @@ def _process_job_async(job: TranscriptionJobRequest) -> None:
             callback_succeeded=False,
             callback_status='failed',
             transcription_status='transcribed',
+            finalize_status='skipped',
             overall_status='transcribed_callback_failed',
             error='callback delivery failed after retries',
             processing_seconds=elapsed,
@@ -107,7 +138,7 @@ def _process_job_async(job: TranscriptionJobRequest) -> None:
             phase = exc.source
             failed_chunk_index = exc.chunk_index
             status_code = exc.external_status_code
-        update_job_state(job.recordingId, 'failed', error=str(exc), callback_succeeded=False, callback_status='failed', transcription_status='failed', overall_status='failed', processing_seconds=elapsed)
+        update_job_state(job.recordingId, 'failed', error=str(exc), callback_succeeded=False, callback_status='failed', transcription_status='failed', finalize_status='skipped', overall_status='failed', processing_seconds=elapsed)
         log_event(
             logger,
             'error',
@@ -156,11 +187,11 @@ def retry_callback(recording_id: str, body: CallbackRetryRequest) -> dict[str, o
     log_event(logger, 'info', 'callback_retry_started', recordingId=recording_id, manual=True)
     callback_succeeded = send_callback(state.payload, callback_url=body.callbackUrl)
     if callback_succeeded:
-        updated = update_job_state(recording_id, 'completed', callback_succeeded=True, callback_status='succeeded', overall_status='completed', error=None)
+        updated = update_job_state(recording_id, 'completed', callback_succeeded=True, callback_status='succeeded', finalize_status='pending', overall_status='transcribed_callback_succeeded', error=None)
         log_event(logger, 'info', 'callback_retry_succeeded', recordingId=recording_id, manual=True)
         return {'ok': True, 'recordingId': recording_id, 'status': updated.status, 'callbackStatus': updated.callback_status, 'overallStatus': updated.overall_status}
 
-    updated = update_job_state(recording_id, 'callback_failed', callback_succeeded=False, callback_status='failed', overall_status='transcribed_callback_failed', error='manual callback retry failed')
+    updated = update_job_state(recording_id, 'callback_failed', callback_succeeded=False, callback_status='failed', finalize_status='skipped', overall_status='transcribed_callback_failed', error='manual callback retry failed')
     log_event(logger, 'warning', 'callback_retry_failed', recordingId=recording_id, manual=True)
     return {'ok': False, 'recordingId': recording_id, 'status': updated.status, 'callbackStatus': updated.callback_status, 'overallStatus': updated.overall_status}
 
@@ -183,6 +214,7 @@ def get_transcribe_job_status(recording_id: str) -> dict[str, object]:
         'callbackSucceeded': state.callback_succeeded,
         'callbackStatus': state.callback_status,
         'transcriptionStatus': state.transcription_status,
+        'finalizeStatus': state.finalize_status,
         'overallStatus': state.overall_status,
         'error': state.error,
         'processingSeconds': state.processing_seconds,
