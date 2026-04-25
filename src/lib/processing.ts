@@ -38,6 +38,11 @@ function buildNotionPageUrl(pageId: string): string {
   return `https://www.notion.so/${pageId.replace(/-/g, '')}`;
 }
 
+function normalizeEmailTasks(myTasks: string[] | undefined): string[] {
+  if (!Array.isArray(myTasks)) return [];
+  return myTasks.map((task) => task.trim()).filter((task) => task.length > 0);
+}
+
 async function runPostPersistTasksAndEmail(
   env: Env,
   params: {
@@ -48,13 +53,14 @@ async function runPostPersistTasksAndEmail(
   },
 ): Promise<void> {
   if (!params.persisted.pageId) return;
+  const fallbackTasks = normalizeEmailTasks(params.persisted.record.insights?.myTasks);
 
   let imported = {
     importedCount: 0,
     skippedDuplicates: 0,
     skippedBecauseMissingProperties: 0,
     missingProperties: [] as string[],
-    normalizedTasks: [] as string[],
+    normalizedTasks: fallbackTasks,
     sourceInterviewUrl: buildNotionPageUrl(params.persisted.pageId),
   };
 
@@ -101,6 +107,8 @@ async function runPostPersistTasksAndEmail(
     return;
   }
 
+  const emailTasks = imported.normalizedTasks.length ? imported.normalizedTasks : fallbackTasks;
+  const completedAt = new Date().toISOString();
   logEvent('info', 'completion email send started', {
     recordingId: params.job.recordingId,
     pageId: params.persisted.pageId,
@@ -111,13 +119,13 @@ async function runPostPersistTasksAndEmail(
       notionPageUrl: buildNotionPageUrl(params.persisted.pageId),
       summary: params.summary ?? '',
       transcript: params.transcriptFullText ?? '',
-      myTasks: imported.normalizedTasks,
+      myTasks: emailTasks,
       fileName: params.job.fileName,
       recordingId: params.job.recordingId,
-      completedAt: new Date().toISOString(),
+      completedAt,
     });
     await updateRecordingJobStatus(env, { recordingId: params.job.recordingId }, 'persisted', {
-      notificationSentAt: new Date().toISOString(),
+      notificationSentAt: completedAt,
     });
     logEvent('info', 'completion email sent', {
       recordingId: params.job.recordingId,

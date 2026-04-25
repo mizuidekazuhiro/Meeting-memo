@@ -8,6 +8,10 @@ function isEnabled(value: string | undefined): boolean {
   return value?.toLowerCase() === 'true';
 }
 
+function hasValue(value: string | undefined): boolean {
+  return Boolean(value?.trim());
+}
+
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (matched) => {
     switch (matched) {
@@ -103,7 +107,12 @@ function buildCompletionEmailHtml(input: {
 }
 
 export function shouldSendCompletionEmail(env: Env): boolean {
-  return isEnabled(env.GMAIL_NOTIFY_ENABLED);
+  return isEnabled(env.GMAIL_NOTIFY_ENABLED)
+    && hasValue(env.GMAIL_TO)
+    && hasValue(env.GMAIL_FROM)
+    && hasValue(env.GMAIL_OAUTH_CLIENT_ID)
+    && hasValue(env.GMAIL_OAUTH_CLIENT_SECRET)
+    && hasValue(env.GMAIL_OAUTH_REFRESH_TOKEN);
 }
 
 export function buildCompletionEmailMessage(input: Parameters<typeof buildCompletionEmailHtml>[0] & { to: string; from: string; subject: string }): string {

@@ -124,6 +124,28 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 
 > 重要: 本番/preview/deployed Workers runtime では fallback store を使いません。`RECORDING_JOB_KV` 未設定時は 500 を返します。
 
+## Gmail 完了通知の設定手順
+
+Interview Memo の Notion 保存完了後に、Gmail API で完了通知メールを送る設定です。
+
+1. Google Cloud で OAuth クライアント（Web application）を作成
+2. Gmail API を有効化
+3. OAuth 同意画面に Gmail 送信ユーザーを追加して consent を完了
+4. `https://developers.google.com/oauthplayground` などで refresh token を発行
+   - scope は `https://www.googleapis.com/auth/gmail.send`
+5. Workers に下記 env を設定
+   - `GMAIL_NOTIFY_ENABLED=true`
+   - `GMAIL_TO`（通知先）
+   - `GMAIL_FROM`（送信元。通常は OAuth ユーザーと同じ Gmail）
+   - `GMAIL_OAUTH_CLIENT_ID`
+   - `GMAIL_OAUTH_CLIENT_SECRET`
+   - `GMAIL_OAUTH_REFRESH_TOKEN`
+
+補足:
+
+- 同一 `recordingId` ですでに `notificationSentAt` が保存済みの場合、完了通知メールは再送しません。
+- `My Tasks` 取込が失敗しても、Interview Memo 本体が Notion 保存済みならメール送信は継続します（warning ログのみ）。
+
 ## Recording callback の lookup 仕様
 
 - job 保存は `recordingId` を主キーに KV 永続化
