@@ -13,6 +13,7 @@ interface MailConfig {
 
 interface CompletionEmailInput {
   notionPageUrl: string;
+  memoChooseUrl?: string;
   summary: string;
   transcript: string;
   myTasks: Array<{ taskText: string; chooseUrl?: string }>;
@@ -114,6 +115,9 @@ function buildCompletionEmailHtml(input: CompletionEmailInput): string {
     }).join('')}</ul>`
     : '<p>なし</p>';
   const notionPageUrl = escapeHtml(input.notionPageUrl);
+  const memoChooseButtonHtml = input.memoChooseUrl
+    ? `<div style="margin:12px 0;"><a href="${escapeHtml(input.memoChooseUrl)}" target="_blank" rel="noopener noreferrer" style="display:inline-block;background:#16a34a;color:#ffffff;text-decoration:none;padding:10px 14px;border-radius:8px;font-size:14px;">この面談メモを処理する</a></div>`
+    : '';
 
   return `<!DOCTYPE html>
 <html lang="ja">
@@ -126,6 +130,7 @@ function buildCompletionEmailHtml(input: CompletionEmailInput): string {
           Notion ページ：
           <a href="${notionPageUrl}" target="_blank" rel="noopener noreferrer">Notion ページを開く</a>
         </p>
+        ${memoChooseButtonHtml}
         <h3 style="margin:16px 0 8px 0;font-size:16px;">Summary</h3>
         <p style="white-space:pre-wrap;margin:0;">${escapeHtml(input.summary || 'なし')}</p>
         <h3 style="margin:16px 0 8px 0;font-size:16px;">My Tasks</h3>

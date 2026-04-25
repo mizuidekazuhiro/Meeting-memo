@@ -165,6 +165,8 @@ Workers に下記 env を設定します。
 - 同一 `recordingId` ですでに `notificationSentAt` が保存済みの場合、完了通知メールは再送しません。
 - `My Tasks` 取込が失敗しても、Interview Memo 本体が Notion 保存済みならメール送信は継続します（warning ログのみ）。
 - `INBOX_TRIAGE_BASE_URL` と `INBOX_TRIAGE_ACTION_SECRET` が設定されている場合、完了通知メールの My Tasks 各項目に `/move/choose` への「タスク処理を選ぶ」ボタンを表示します。
+- `INBOX_TRIAGE_BASE_URL` と `INBOX_TRIAGE_ACTION_SECRET` が設定されている場合、Interview Memo 本体にも `/move/choose` への「この面談メモを処理する」ボタンを表示できます。
+- `INBOX_TRIAGE_ACTION_SECRET` は `Meeting-memo` と `notion-inbox-triage` の `ACTION_SECRET` で同じ値を使用してください。
 
 ## Recording callback の lookup 仕様
 

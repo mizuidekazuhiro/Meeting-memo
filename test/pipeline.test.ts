@@ -86,6 +86,13 @@ test('post-persist flow keeps email path even if My Tasks import fails', async (
   assert.notEqual(processingSource.indexOf('await sendCompletionEmail(env, {'), -1);
 });
 
+test('runPostPersistTasksAndEmail builds memoChooseUrl from persisted.pageId when triage envs exist', async () => {
+  const processingSource = await readFile(join(process.cwd(), 'src/lib/processing.ts'), 'utf8');
+  assert.notEqual(processingSource.indexOf('await signInboxPageId(params.persisted.pageId, inboxTriageActionSecret)'), -1);
+  assert.notEqual(processingSource.indexOf('buildInboxTriageChooseUrl(env.INBOX_TRIAGE_BASE_URL, params.persisted.pageId, memoSignature)'), -1);
+  assert.notEqual(processingSource.indexOf('memoChooseUrl,'), -1);
+});
+
 test('python api transcript merge preserves chunkIndex order and offsets', () => {
   const merged = mergeTranscriptResultsInOrder([
     { chunkIndex: 1, startOffsetMs: 600000, transcript: { fullText: 'second', segments: [{ speaker: 'spk2', startMs: 0, endMs: 1000, text: 'second' }], raw: { idx: 1 } } },
