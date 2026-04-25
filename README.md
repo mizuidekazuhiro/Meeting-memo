@@ -52,8 +52,12 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 
 - 使用モデル: `gpt-5.4-mini`（`OPENAI_MODEL_REVIEW`。未設定時は `OPENAI_MODEL_SUMMARIZE`、さらに未設定時は `gpt-5.4-mini`）
 - Notion DB プロパティの追加は不要です。既存プロパティ（`Summary` / `My Tasks` / `Other Tasks` / `Raw JSON` / `Error Message`）のみ更新します。
-- レビュー結果は Notion の**ページ本文**と完了通知メール本文の両方に出力されます。
-- 長い Transcript は Notion 本文へ全文展開せず、Dropbox `.txt` に保存し、Notion には抜粋と全文リンクのみを記録します。
+- メール本文 / Notion本文 / Summaryプロパティで使う最終メモは `finalMemo`（`review.finalMemoMarkdown` 優先）に統一します。
+- レビュー結果の分割セクションは原則作らず、Notion本文とメール本文は「完成版 面談メモ」を中心に表示します。
+- 長い Transcript は Dropbox `.txt` に保存し、Notion本文とメールには **Transcript全文リンクのみ** を表示します（抜粋は表示しません）。
+- `sourceUrls` はメールとNotion本文の「参考リンク」に表示します（空ならセクション自体を非表示）。
+- Summaryプロパティには URL / Transcript を含めず、`finalMemo` を先頭から保存します。
+- My Tasks 抽出優先順位は `review.myTasks` → `review.nextActionsMarkdown` → `review.finalMemoMarkdown内の次アクション` → `insights.myTasks` です。
 - Web検索結果は補助情報です。低確度/不明は人間確認が必要です。
 - `humanCheckRequired=true` の主な条件:
   - 低確度または不明項目が1つでもある

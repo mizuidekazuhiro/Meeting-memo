@@ -14,19 +14,9 @@ interface MailConfig {
 interface CompletionEmailInput {
   notionPageUrl: string;
   transcriptFileUrl?: string;
-  summary: string;
-  transcript: string;
+  finalMemo: string;
+  sourceUrls: string[];
   myTasks: Array<{ taskText: string; chooseUrl?: string }>;
-  review?: {
-    summaryForEmail: string;
-    correctedTermsMarkdown: string;
-    uncertainItemsMarkdown: string;
-    nextActionsMarkdown: string;
-    humanCheckRequired: boolean;
-    humanCheckReason: string;
-    sourceUrls: string[];
-  };
-  reviewError?: string;
 }
 
 function isEnabled(value: string | undefined): boolean {
@@ -113,6 +103,8 @@ export function getCompletionEmailConfig(env: Env): MailConfig {
 }
 
 function buildCompletionEmailHtml(input: CompletionEmailInput): string {
+  const finalMemo = input.finalMemo ?? '';
+  const sourceUrlsInput = Array.isArray(input.sourceUrls) ? input.sourceUrls : [];
   const myTasksHtml = input.myTasks.length
     ? `<ul style="padding-left:20px;margin:0;">${input.myTasks.map((task) => {
       const buttonHtml = task.chooseUrl
@@ -120,16 +112,15 @@ function buildCompletionEmailHtml(input: CompletionEmailInput): string {
         : '';
       return `<li style="margin-bottom:12px;"><div>${escapeHtml(task.taskText)}</div>${buttonHtml}</li>`;
     }).join('')}</ul>`
-    : '<p>なし</p>';
+    : '';
   const notionPageUrl = escapeHtml(input.notionPageUrl);
-  const reviewStatus = input.reviewError
-    ? '二次レビューは失敗しました。一次要約とTranscriptのみ保存されています。'
-    : input.review
-      ? `${input.review.humanCheckRequired ? '要確認' : '確認不要'}\n理由: ${input.review.humanCheckReason || 'なし'}`
-      : 'レビュー未実行';
-  const sourceUrls = input.review?.sourceUrls?.length
-    ? input.review.sourceUrls.map((url) => `- ${url}`).join('\n')
-    : 'なし';
+  const sourceUrls = sourceUrlsInput.length
+    ? `<h3 style="margin:16px 0 8px 0;font-size:16px;">参考リンク</h3>
+        <ul style="padding-left:20px;margin:0;">${sourceUrlsInput.map((url) => `<li><a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a></li>`).join('')}</ul>`
+    : '';
+  const myTasksSection = input.myTasks.length
+    ? `<h3 style="margin:16px 0 8px 0;font-size:16px;">My Tasks</h3>${myTasksHtml}`
+    : '';
 
   return `<!DOCTYPE html>
 <html lang="ja">
@@ -143,24 +134,10 @@ function buildCompletionEmailHtml(input: CompletionEmailInput): string {
           <a href="${notionPageUrl}" target="_blank" rel="noopener noreferrer">Notion ページを開く</a>
         </p>
         ${input.transcriptFileUrl ? `<p style="margin:0 0 12px 0;">Transcript全文リンク：<a href="${escapeHtml(input.transcriptFileUrl)}" target="_blank" rel="noopener noreferrer">Transcript全文リンク</a></p>` : ''}
-        <h3 style="margin:16px 0 8px 0;font-size:16px;">レビュー結果</h3>
-        <p style="white-space:pre-wrap;margin:0;">${escapeHtml(reviewStatus)}</p>
-        <h3 style="margin:16px 0 8px 0;font-size:16px;">Summary</h3>
-        <p style="white-space:pre-wrap;margin:0;">${escapeHtml(input.summary || 'なし')}</p>
-        <h3 style="margin:16px 0 8px 0;font-size:16px;">完成版要旨</h3>
-        <p style="white-space:pre-wrap;margin:0;">${escapeHtml(input.review?.summaryForEmail || input.summary || 'なし')}</p>
-        <h3 style="margin:16px 0 8px 0;font-size:16px;">固有名詞補正</h3>
-        <p style="white-space:pre-wrap;margin:0;">${escapeHtml(input.review?.correctedTermsMarkdown || 'なし')}</p>
-        <h3 style="margin:16px 0 8px 0;font-size:16px;">未確定事項</h3>
-        <p style="white-space:pre-wrap;margin:0;">${escapeHtml(input.review?.uncertainItemsMarkdown || 'なし')}</p>
-        <h3 style="margin:16px 0 8px 0;font-size:16px;">次に取るべき行動</h3>
-        <p style="white-space:pre-wrap;margin:0;">${escapeHtml(input.review?.nextActionsMarkdown || 'なし')}</p>
-        <h3 style="margin:16px 0 8px 0;font-size:16px;">根拠URL</h3>
-        <p style="white-space:pre-wrap;margin:0;">${escapeHtml(sourceUrls)}</p>
-        <h3 style="margin:16px 0 8px 0;font-size:16px;">My Tasks</h3>
-        ${myTasksHtml}
-        <h3 style="margin:16px 0 8px 0;font-size:16px;">Transcript</h3>
-        <pre style="white-space:pre-wrap;word-break:break-word;background:#f8fafc;padding:12px;border-radius:8px;margin:0;">${escapeHtml(input.transcript || 'なし')}</pre>
+        <h3 style="margin:16px 0 8px 0;font-size:16px;">完成版 面談メモ</h3>
+        <p style="white-space:pre-wrap;margin:0;">${escapeHtml(finalMemo)}</p>
+        ${sourceUrls}
+        ${myTasksSection}
       </div>
     </div>
   </body>
@@ -195,9 +172,7 @@ export function buildCompletionEmailMessage(
   return lines.join('\r\n');
 }
 
-export function buildCompletionEmailSubject(subject: string, review?: CompletionEmailInput['review'], reviewError?: string): string {
-  if (reviewError) return `【レビュー失敗】${subject}`;
-  if (review?.humanCheckRequired) return `【要確認】${subject}`;
+export function buildCompletionEmailSubject(subject: string): string {
   return subject;
 }
 
@@ -324,7 +299,7 @@ export async function sendCompletionEmail(
     from: config.from,
     to: config.to,
     cc: config.cc,
-    subject: buildCompletionEmailSubject(input.subject, input.review, input.reviewError),
+    subject: buildCompletionEmailSubject(input.subject),
   });
 
   const smtp = await createSmtpClient(config.smtpHost, config.smtpPort);

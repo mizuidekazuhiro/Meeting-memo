@@ -5,7 +5,7 @@ import { getCompletionEmailConfig, sendCompletionEmail, shouldSendCompletionEmai
 import { HttpError } from './http';
 import { findRecordingJobWithSource, getRecordingJob, getRecordingJobStorageMeta, markJobFailed, normalizeDropboxPath, shouldSkipProcessingForExistingJob, updateRecordingJobStatus } from './jobs';
 import { logEvent } from './logger';
-import { appendInterviewReviewFailureToNotionPage, appendReviewedMemoToNotionPage, importMyTasksToInbox, saveTranscriptLinkToNotion, updateInterviewRecordProperties, upsertInterviewFromTranscript } from './notion';
+import { appendInterviewReviewFailureToNotionPage, extractTasksFromFinalMemoMarkdown, extractTasksFromNextActionsMarkdown, importMyTasksToInbox, saveTranscriptLinkToNotion, updateInterviewRecordProperties, upsertInterviewFromTranscript, writeFinalMemoToNotionPage } from './notion';
 import { inspectAudioSource, MAX_TRANSCRIBE_DURATION_SEC, reviewInterviewWithWebSearch, summarizeInterview, transcribeWithDiarization } from './openai';
 import type { InterviewReviewResult } from '../types';
 
@@ -76,6 +76,10 @@ async function writeTranscriptTextToDropbox(
   };
 }
 
+function hasNonEmptyTaskText(tasks: string[] | undefined): boolean {
+  return Array.isArray(tasks) && tasks.some((task) => typeof task === 'string' && task.trim().length > 0);
+}
+
 function normalizeEmailTasks(myTasks: string[] | undefined): Array<{ taskText: string; chooseUrl?: string }> {
   if (!Array.isArray(myTasks)) return [];
   return myTasks
@@ -84,40 +88,39 @@ function normalizeEmailTasks(myTasks: string[] | undefined): Array<{ taskText: s
     .map((taskText) => ({ taskText }));
 }
 
-function hasNonEmptyTaskText(tasks: string[] | undefined): boolean {
-  return Array.isArray(tasks) && tasks.some((task) => typeof task === 'string' && task.trim().length > 0);
-}
-
 function hasNonEmptyMarkdown(value: string | undefined): boolean {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
+function selectFinalMemo(params: {
+  review?: InterviewReviewResult;
+  insights?: InterviewInsights;
+}): { source: string; finalMemo: string } {
+  if (hasNonEmptyMarkdown(params.review?.finalMemoMarkdown)) return { source: 'review.finalMemoMarkdown', finalMemo: params.review!.finalMemoMarkdown.trim() };
+  if (hasNonEmptyMarkdown(params.review?.summaryForEmail)) return { source: 'review.summaryForEmail', finalMemo: params.review!.summaryForEmail.trim() };
+  if (hasNonEmptyMarkdown(params.insights?.summary)) return { source: 'insights.summary', finalMemo: params.insights!.summary.trim() };
+  return { source: 'empty', finalMemo: '' };
+}
+
 function selectFinalMyTaskInput(params: {
   review?: InterviewReviewResult;
-  shouldRunReview: boolean;
   insights?: InterviewInsights;
-}): { taskSource: string; myTasks: unknown; taskCount: number } {
+}): { taskSource: string; myTasks: string[] } {
   if (params.review) {
     if (hasNonEmptyTaskText(params.review.myTasks)) {
-      const normalized = params.review.myTasks
-        .map((task) => task.trim())
-        .filter((task) => task.length > 0);
-      return { taskSource: 'review.myTasks', myTasks: normalized, taskCount: normalized.length };
+      return { taskSource: 'review.myTasks', myTasks: params.review.myTasks };
     }
     if (hasNonEmptyMarkdown(params.review.nextActionsMarkdown)) {
-      return { taskSource: 'review.nextActionsMarkdown', myTasks: params.review.nextActionsMarkdown, taskCount: 1 };
+      return { taskSource: 'review.nextActionsMarkdown', myTasks: extractTasksFromNextActionsMarkdown(params.review.nextActionsMarkdown) };
     }
-    return { taskSource: 'review.nextActionsMarkdown', myTasks: [], taskCount: 0 };
+    if (hasNonEmptyMarkdown(params.review.finalMemoMarkdown)) {
+      return { taskSource: 'review.finalMemoMarkdown.nextActions', myTasks: extractTasksFromFinalMemoMarkdown(params.review.finalMemoMarkdown) };
+    }
   }
-
-  if (!params.shouldRunReview && hasNonEmptyTaskText(params.insights?.myTasks)) {
-    const normalized = (params.insights?.myTasks ?? [])
-      .map((task) => task.trim())
-      .filter((task) => task.length > 0);
-    return { taskSource: 'insights.myTasks', myTasks: normalized, taskCount: normalized.length };
+  if (hasNonEmptyTaskText(params.insights?.myTasks)) {
+    return { taskSource: 'insights.myTasks', myTasks: params.insights?.myTasks ?? [] };
   }
-
-  return { taskSource: 'reviewUnavailable', myTasks: [], taskCount: 0 };
+  return { taskSource: 'none', myTasks: [] };
 }
 
 async function runPostPersistTasksAndEmail(
@@ -133,6 +136,7 @@ async function runPostPersistTasksAndEmail(
 ): Promise<void> {
   if (!params.persisted.pageId) return;
   const fallbackTasks = normalizeEmailTasks(params.persisted.record.insights?.myTasks);
+  const finalMemoSelection = selectFinalMemo({ review: params.review, insights: params.persisted.record.insights });
 
   let imported = {
     importedCount: 0,
@@ -206,19 +210,9 @@ async function runPostPersistTasksAndEmail(
       subject: env.MAIL_SUBJECT_PREFIX ?? 'Interview Memo 完了通知',
       notionPageUrl: buildNotionPageUrl(params.persisted.pageId),
       transcriptFileUrl: params.job.transcriptFileUrl,
-      summary: params.summary ?? '',
-      transcript: params.transcriptFullText ?? '',
+      finalMemo: finalMemoSelection.finalMemo,
+      sourceUrls: params.review?.sourceUrls ?? [],
       myTasks: emailTasks,
-      review: params.review ? {
-        summaryForEmail: params.review.summaryForEmail,
-        correctedTermsMarkdown: params.review.correctedTermsMarkdown,
-        uncertainItemsMarkdown: params.review.uncertainItemsMarkdown,
-        nextActionsMarkdown: params.review.nextActionsMarkdown,
-        humanCheckRequired: params.review.humanCheckRequired,
-        humanCheckReason: params.review.humanCheckReason,
-        sourceUrls: params.review.sourceUrls,
-      } : undefined,
-      reviewError: params.reviewError,
     });
     await updateRecordingJobStatus(env, { recordingId: params.job.recordingId }, 'persisted', {
       notificationSentAt: completedAt,
@@ -416,7 +410,8 @@ export async function processUploadedInterview(
           });
           if (persisted.pageId) {
             await updateInterviewRecordProperties(env, persisted.pageId, persisted.record);
-            await appendReviewedMemoToNotionPage(env, persisted.pageId, reviewResult);
+            const chosen = selectFinalMemo({ review: reviewResult, insights: persisted.record.insights });
+            await writeFinalMemoToNotionPage(env, persisted.pageId, chosen.finalMemo, reviewResult.sourceUrls);
           }
           persisted.record.insights = {
             summary: reviewResult.summaryForEmail || persisted.record.insights?.summary || '',
@@ -648,6 +643,7 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
 
     let insights: InterviewInsights | undefined;
     let reviewResult: InterviewReviewResult | undefined;
+    let sourceUrls: string[] = [];
     if (!mutable.summaryWrittenAt || force) {
       try {
         logEvent('info', 'summary_generation_started', { recordingId });
@@ -676,42 +672,60 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
       try {
         const review = await reviewInterviewWithWebSearch(env, { transcript: mutable.transcript!, insights, title: mutable.fileName, fileName: mutable.fileName, notionPageUrl: pageId ? buildNotionPageUrl(pageId) : undefined });
         reviewResult = review;
-        if (pageId) {
-          await appendReviewedMemoToNotionPage(env, pageId, review);
-        }
+        sourceUrls = review.sourceUrls;
         await updateRecordingJobStatus(env, { recordingId }, 'transcribed', { reviewCompletedAt: new Date().toISOString() });
         mutable = (await getRecordingJob(env, { recordingId }))!;
         logEvent('info', 'review_completed', { recordingId });
       } catch (error) {
-        logEvent('error', 'review_failed', {
+        logEvent('warn', 'review_failed', {
           recordingId,
           message: error instanceof Error ? error.message : String(error),
         });
-        if (pageId) {
-          try {
-            await appendInterviewReviewFailureToNotionPage(env, pageId, {
-              message: error instanceof Error ? error.message : String(error),
-              error,
-            });
-          } catch (notionError) {
-            logEvent('warn', 'review_failure_append_failed', {
-              recordingId,
-              notionPageId: pageId,
-              message: notionError instanceof Error ? notionError.message : String(notionError),
-            });
-          }
-        }
-        throw error;
       }
     } else if (!shouldRunInterviewReview(env)) {
       logEvent('info', 'review_skipped_not_configured', { recordingId });
     }
 
+    const finalMemoSelected = selectFinalMemo({ review: reviewResult, insights });
+    logEvent('info', 'final_memo_selected', {
+      recordingId,
+      source: finalMemoSelected.source,
+      finalMemoLength: finalMemoSelected.finalMemo.length,
+      finalMemoStartsWith: finalMemoSelected.finalMemo.slice(0, 32),
+    });
+
     if (pageId) {
+      logEvent('info', 'notion_final_memo_write_started', { recordingId, notionPageId: pageId, finalMemoLength: finalMemoSelected.finalMemo.length, sourceUrlCount: sourceUrls.length });
+      await writeFinalMemoToNotionPage(env, pageId, finalMemoSelected.finalMemo, sourceUrls);
+      logEvent('info', 'notion_final_memo_write_completed', { recordingId, notionPageId: pageId, finalMemoLength: finalMemoSelected.finalMemo.length, sourceUrlCount: sourceUrls.length });
+      const recordForSummary = ensureInterviewRecord(mutable, mutable.transcript!, {
+        summary: finalMemoSelected.finalMemo,
+        myTasks: insights?.myTasks ?? [],
+        otherTasks: insights?.otherTasks ?? [],
+        ambiguities: insights?.ambiguities ?? [],
+        raw: insights?.raw,
+      });
+      logEvent('info', 'summary_property_update_started', { recordingId, notionPageId: pageId, summaryPropertyLength: finalMemoSelected.finalMemo.length, summaryPropertyStartsWith: finalMemoSelected.finalMemo.slice(0, 32) });
+      await updateInterviewRecordProperties(env, pageId, recordForSummary);
+      logEvent('info', 'summary_property_update_completed', { recordingId, notionPageId: pageId, summaryPropertyLength: finalMemoSelected.finalMemo.length, summaryPropertyStartsWith: finalMemoSelected.finalMemo.slice(0, 32) });
+
       const selectedFinalTasks = selectFinalMyTaskInput({
         review: reviewResult,
-        shouldRunReview: shouldRunInterviewReview(env),
         insights,
+      });
+      logEvent('info', 'final_my_task_extract_started', {
+        recordingId,
+        notionPageId: pageId,
+        hasReviewMyTasks: hasNonEmptyTaskText(reviewResult?.myTasks),
+        hasReviewNextActionsMarkdown: hasNonEmptyMarkdown(reviewResult?.nextActionsMarkdown),
+        hasReviewFinalMemoMarkdown: hasNonEmptyMarkdown(reviewResult?.finalMemoMarkdown),
+        hasInsightsMyTasks: hasNonEmptyTaskText(insights?.myTasks),
+      });
+      logEvent('info', 'final_my_task_extract_finished', {
+        recordingId,
+        taskSource: selectedFinalTasks.taskSource,
+        candidateTaskCount: selectedFinalTasks.myTasks.length,
+        normalizedTasks: selectedFinalTasks.myTasks,
       });
       const emptyImportResult = {
         importedCount: 0,
@@ -723,88 +737,90 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
         recordingId,
         notionPageId: pageId,
         taskSource: selectedFinalTasks.taskSource,
-        taskCount: selectedFinalTasks.taskCount,
+        candidateTaskCount: selectedFinalTasks.myTasks.length,
       });
-      if (selectedFinalTasks.taskCount === 0) {
-        logEvent('info', 'final_my_task_import_skipped_no_tasks', {
+      let imported = {
+        importedCount: 0,
+        skippedDuplicates: 0,
+        skippedBecauseMissingProperties: 0,
+        missingProperties: [] as string[],
+        normalizedTasks: [] as string[],
+        importedTaskItems: [] as Array<{ taskText: string; chooseUrl?: string }>,
+      };
+      if (selectedFinalTasks.myTasks.length === 0) {
+        logEvent('info', 'final_my_task_import_skipped', {
           recordingId,
-          notionPageId: pageId,
-          taskSource: selectedFinalTasks.taskSource,
-          importedCount: 0,
-          skippedDuplicates: 0,
-          missingProperties: [],
-          taskCount: 0,
+          reason: 'no_tasks',
         });
       } else {
         try {
-          const imported = await importMyTasksToInbox(env, {
+          imported = await importMyTasksToInbox(env, {
             recordingId,
             sourceInterviewPageId: pageId,
             myTasks: selectedFinalTasks.myTasks,
           });
-          logEvent('info', 'final_my_task_import_finished', {
-            recordingId,
-            notionPageId: pageId,
-            importedCount: imported.importedCount,
-            skippedDuplicates: imported.skippedDuplicates,
-            missingProperties: imported.missingProperties,
-            taskSource: selectedFinalTasks.taskSource,
-            taskCount: selectedFinalTasks.taskCount,
-          });
         } catch (error) {
-          logEvent('warn', 'final_my_task_import_failed', {
+          logEvent('warn', 'finalize_completed_with_task_import_warning', {
             recordingId,
             notionPageId: pageId,
-            importedCount: emptyImportResult.importedCount,
-            skippedDuplicates: emptyImportResult.skippedDuplicates,
-            missingProperties: emptyImportResult.missingProperties,
-            taskSource: selectedFinalTasks.taskSource,
-            taskCount: selectedFinalTasks.taskCount,
             details: error instanceof HttpError ? error.details : error instanceof Error ? error.message : String(error),
           });
         }
       }
-    }
+      logEvent('info', 'final_my_task_import_finished', {
+        recordingId,
+        taskSource: selectedFinalTasks.taskSource,
+        importedCount: imported.importedCount,
+        skippedDuplicates: imported.skippedDuplicates,
+        skippedBecauseMissingProperties: imported.skippedBecauseMissingProperties,
+        missingProperties: imported.missingProperties,
+        normalizedTasks: imported.normalizedTasks,
+      });
 
-    const canSendEmail = shouldSendCompletionEmail(env);
-    if (!canSendEmail) {
-      logEvent('warn', 'email_send_failed', { recordingId, reason: 'email configuration missing' });
-    } else if (!mutable.emailSentAt || force || forceEmail) {
-      if (!transcriptFileUrl) {
-        throw new HttpError('Transcript link is required before sending completion email.', 500, { recordingId });
-      }
-      logEvent('info', 'email_send_started', { recordingId, fileName: mutable.fileName, notionPageUrl: mutable.notionPageUrl ?? null });
-      try {
+      if (shouldSendCompletionEmail(env) && (!mutable.emailSentAt || force || forceEmail)) {
+        const emailTasks = imported.importedTaskItems;
         await sendCompletionEmail(env, {
           subject: env.MAIL_SUBJECT_PREFIX ?? 'Interview Memo 完了通知',
-          notionPageUrl: mutable.notionPageUrl ?? (pageId ? buildNotionPageUrl(pageId) : ''),
+          notionPageUrl: mutable.notionPageUrl ?? buildNotionPageUrl(pageId),
           transcriptFileUrl,
-          summary: insights?.summary ?? '',
-          transcript: mutable.transcript?.fullText ?? '',
-          myTasks: [],
+          finalMemo: finalMemoSelected.finalMemo,
+          sourceUrls,
+          myTasks: emailTasks,
+        });
+        logEvent('info', 'completion_email_rendered', {
+          recordingId,
+          finalMemoIncluded: true,
+          transcriptExcerptIncluded: false,
+          transcriptBodyIncluded: false,
+          duplicatedSummaryIncluded: false,
+          sourceUrlCount: sourceUrls.length,
+          myTaskCount: emailTasks.length,
         });
         await updateRecordingJobStatus(env, { recordingId }, 'transcribed', { emailSentAt: new Date().toISOString() });
-        logEvent('info', 'email_send_completed', { recordingId });
-        mutable = (await getRecordingJob(env, { recordingId }))!;
-      } catch (error) {
-        logEvent('warn', 'email_send_failed', {
-          recordingId,
-          message: error instanceof Error ? error.message : String(error),
-        });
       }
-    } else {
-      logEvent('info', 'email_skipped_already_sent', { recordingId, emailSentAt: mutable.emailSentAt });
-    }
 
-    await updateRecordingJobStatus(env, { recordingId }, 'completed', {
-      summaryWrittenAt: mutable.summaryWrittenAt ?? new Date().toISOString(),
-      finalizeStatus: 'completed',
-      finalizeCompletedAt: new Date().toISOString(),
-      callbackStatus: 'succeeded',
-      lastError: undefined,
-    });
-    logEvent('info', 'finalize_completed', { recordingId });
-    return { ok: true, status: 'completed' };
+      const elapsedSeconds = Math.max(0, Math.round((Date.now() - new Date(finalizeStartedAt).getTime()) / 1000));
+      await updateRecordingJobStatus(env, { recordingId }, 'completed', {
+        summaryWrittenAt: mutable.summaryWrittenAt ?? new Date().toISOString(),
+        finalizeStatus: 'completed',
+        finalizeCompletedAt: new Date().toISOString(),
+        callbackStatus: 'succeeded',
+        lastError: undefined,
+      });
+      logEvent('info', 'finalize_completed', {
+        recordingId,
+        notionPageId: pageId,
+        transcriptFileUrlPresent: Boolean(transcriptFileUrl),
+        finalMemoLength: finalMemoSelected.finalMemo.length,
+        summaryPropertyLength: finalMemoSelected.finalMemo.length,
+        sourceUrlCount: sourceUrls.length,
+        myTaskImportedCount: imported.importedCount,
+        myTaskSkippedDuplicates: imported.skippedDuplicates,
+        elapsedSeconds,
+      });
+      return { ok: true, status: 'completed' };
+    }
+    throw new HttpError('Notion page was not created.', 500, { recordingId });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logEvent('error', 'finalize_failed', { recordingId, message });
