@@ -201,7 +201,15 @@ test('appendReviewedMemoToNotionPage adds review sections and keeps Transcript',
     { NOTION_TOKEN: 'token', INBOX_DB_ID: 'db' } as any,
     'page_1',
     {
-      finalMemoMarkdown: 'final',
+      finalMemoMarkdown: [
+        '# 面談メモ（二次レビュー）',
+        '## 結論',
+        '- **四番線の電車は各駅停車で押上行き**',
+        '## 事実',
+        '| 項目 | 値 |',
+        '|---|---|',
+        '| 発話 | Mike test |',
+      ].join('\n'),
       correctedTermsMarkdown: 'corrected',
       summaryForEmail: 'summary',
       uncertainItemsMarkdown: 'uncertain',
@@ -231,4 +239,20 @@ test('appendReviewedMemoToNotionPage adds review sections and keeps Transcript',
   assert.ok(headings.includes('未確定事項'));
   assert.ok(headings.includes('次に取るべき行動'));
   assert.ok(headings.includes('Transcript'));
+  const h1 = allChildren.find((block) => block.type === 'heading_1');
+  assert.equal(h1.heading_1.rich_text[0].text.content, '面談メモ（二次レビュー）');
+  const nestedH2 = allChildren.find((block) => block.type === 'heading_2' && block.heading_2.rich_text[0].text.content === '結論');
+  assert.ok(nestedH2);
+  const bullet = allChildren.find((block) => block.type === 'bulleted_list_item');
+  assert.equal(bullet.bulleted_list_item.rich_text[0].text.content, '四番線の電車は各駅停車で押上行き');
+  assert.equal(bullet.bulleted_list_item.rich_text[0].annotations.bold, true);
+  const table = allChildren.find((block) => block.type === 'table');
+  assert.ok(table);
+  assert.equal(table.table.children[0].table_row.cells[0][0].text.content, '項目');
+  const transcriptParagraph = allChildren.find((block) => block.type === 'paragraph' && block.paragraph?.rich_text?.[0]?.text?.content === 'hello transcript');
+  assert.ok(transcriptParagraph);
+  const plainTextDump = JSON.stringify(allChildren);
+  assert.equal(plainTextDump.includes('|---|---|'), false);
+  assert.equal(plainTextDump.includes('**四番線の電車は各駅停車で押上行き**'), false);
+  assert.equal(plainTextDump.includes('## 結論'), false);
 });

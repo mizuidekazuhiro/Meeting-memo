@@ -14,7 +14,11 @@ const REVIEW_SECTION_HEADINGS = [
   'レビュー情報',
 ] as const;
 
-type NotionRichText = Array<{ type: 'text'; text: { content: string } }>;
+type NotionRichText = Array<{
+  type: 'text';
+  text: { content: string };
+  annotations?: { bold?: boolean };
+}>;
 
 type NotionBlock = {
   object: 'block';
@@ -30,8 +34,22 @@ type NotionBlock = {
 type NotionBlockInput =
   | {
       object: 'block';
+      type: 'heading_1';
+      heading_1: {
+        rich_text: NotionRichText;
+      };
+    }
+  | {
+      object: 'block';
       type: 'heading_2';
       heading_2: {
+        rich_text: NotionRichText;
+      };
+    }
+  | {
+      object: 'block';
+      type: 'heading_3';
+      heading_3: {
         rich_text: NotionRichText;
       };
     }
@@ -40,6 +58,29 @@ type NotionBlockInput =
       type: 'paragraph';
       paragraph: {
         rich_text: NotionRichText;
+      };
+    }
+  | {
+      object: 'block';
+      type: 'bulleted_list_item';
+      bulleted_list_item: {
+        rich_text: NotionRichText;
+      };
+    }
+  | {
+      object: 'block';
+      type: 'table';
+      table: {
+        table_width: number;
+        has_column_header: boolean;
+        has_row_header: boolean;
+        children: Array<{
+          object: 'block';
+          type: 'table_row';
+          table_row: {
+            cells: NotionRichText[];
+          };
+        }>;
       };
     };
 
@@ -88,6 +129,84 @@ function titleText(content: string): NotionRichText {
 
 function richText(content: string): NotionRichText {
   return [{ type: 'text', text: { content: content.slice(0, NOTION_TEXT_LIMIT) } }];
+}
+
+interface InlineSegment {
+  text: string;
+  bold: boolean;
+}
+
+function parseInlineMarkdown(content: string): InlineSegment[] {
+  const segments: InlineSegment[] = [];
+  if (!content) return segments;
+  const pattern = /\*\*(.+?)\*\*/g;
+  let cursor = 0;
+  for (let match = pattern.exec(content); match; match = pattern.exec(content)) {
+    if (match.index > cursor) {
+      segments.push({ text: content.slice(cursor, match.index), bold: false });
+    }
+    if (match[1]) {
+      segments.push({ text: match[1], bold: true });
+    }
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < content.length) {
+    segments.push({ text: content.slice(cursor), bold: false });
+  }
+  return segments;
+}
+
+function splitInlineSegmentsByLimit(segments: InlineSegment[], maxLength: number): InlineSegment[][] {
+  const groups: InlineSegment[][] = [];
+  let current: InlineSegment[] = [];
+  let currentLength = 0;
+
+  const flushCurrent = (): void => {
+    if (!current.length) return;
+    groups.push(current);
+    current = [];
+    currentLength = 0;
+  };
+
+  for (const segment of segments) {
+    let remaining = segment.text;
+    while (remaining.length > 0) {
+      const capacity = maxLength - currentLength;
+      if (capacity === 0) {
+        flushCurrent();
+        continue;
+      }
+      const slice = remaining.slice(0, capacity);
+      current.push({ text: slice, bold: segment.bold });
+      currentLength += slice.length;
+      remaining = remaining.slice(slice.length);
+      if (currentLength >= maxLength) {
+        flushCurrent();
+      }
+    }
+  }
+
+  flushCurrent();
+  return groups;
+}
+
+function richTextFromInlineSegments(segments: InlineSegment[]): NotionRichText {
+  const richTexts: NotionRichText = [];
+  for (const segment of segments) {
+    if (!segment.text) continue;
+    richTexts.push({
+      type: 'text',
+      text: { content: segment.text.slice(0, NOTION_TEXT_LIMIT) },
+      ...(segment.bold ? { annotations: { bold: true } } : {}),
+    });
+  }
+  return richTexts.length ? richTexts : richText('');
+}
+
+function markdownInlineToRichTextGroups(content: string, maxLength: number): NotionRichText[] {
+  const parsed = parseInlineMarkdown(content);
+  const safeParsed = parsed.length ? parsed : [{ text: content, bold: false }];
+  return splitInlineSegmentsByLimit(safeParsed, maxLength).map((group) => richTextFromInlineSegments(group));
 }
 
 function bulletList(items: string[]): string {
@@ -323,27 +442,133 @@ function collectManagedReviewAndTranscriptBlockIds(children: NotionBlock[]): str
     ids.push(block.id);
     for (let cursor = index + 1; cursor < children.length; cursor += 1) {
       const next = children[cursor];
-      if (next.type === 'heading_2') break;
-      if (next.type === 'paragraph') ids.push(next.id);
+      if (isManagedHeadingBlock(next)) break;
+      ids.push(next.id);
     }
   }
   return ids;
 }
 
+function splitMarkdownTableRow(line: string): string[] {
+  const trimmed = line.trim();
+  const raw = trimmed.replace(/^\|/, '').replace(/\|$/, '');
+  return raw.split('|').map((cell) => cell.trim());
+}
+
+function isMarkdownTableSeparatorRow(line: string): boolean {
+  const cells = splitMarkdownTableRow(line);
+  return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+}
+
+function tryParseMarkdownTable(lines: string[], startIndex: number): { block: NotionBlockInput; consumed: number } | null {
+  const header = lines[startIndex]?.trim() ?? '';
+  const separator = lines[startIndex + 1]?.trim() ?? '';
+  if (!header.includes('|') || !separator.includes('|')) return null;
+  if (!isMarkdownTableSeparatorRow(separator)) return null;
+
+  const headerCells = splitMarkdownTableRow(header);
+  if (!headerCells.length) return null;
+
+  const rows = [headerCells];
+  let cursor = startIndex + 2;
+  while (cursor < lines.length) {
+    const line = lines[cursor].trim();
+    if (!line || !line.includes('|')) break;
+    rows.push(splitMarkdownTableRow(line));
+    cursor += 1;
+  }
+
+  const tableWidth = Math.max(...rows.map((row) => row.length));
+  const tableRows = rows.map((row) => ({
+    object: 'block' as const,
+    type: 'table_row' as const,
+    table_row: {
+      cells: Array.from({ length: tableWidth }, (_, index) => {
+        const cell = row[index] ?? '';
+        const groups = markdownInlineToRichTextGroups(cell, NOTION_TEXT_LIMIT);
+        return groups[0] ?? richText('');
+      }),
+    },
+  }));
+
+  return {
+    block: {
+      object: 'block',
+      type: 'table',
+      table: {
+        table_width: tableWidth,
+        has_column_header: true,
+        has_row_header: false,
+        children: tableRows,
+      },
+    },
+    consumed: cursor - startIndex,
+  };
+}
+
 function markdownParagraphBlocks(content: string): NotionBlockInput[] {
-  const chunks = splitIntoChunks(content, TRANSCRIPT_BLOCK_TEXT_LIMIT);
-  if (!chunks.length) {
+  const lines = content.replace(/\r\n/g, '\n').split('\n');
+  const blocks: NotionBlockInput[] = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].trim();
+    if (!line) continue;
+
+    const table = tryParseMarkdownTable(lines, index);
+    if (table) {
+      blocks.push(table.block);
+      index += table.consumed - 1;
+      continue;
+    }
+
+    const headingMatch = line.match(/^(#{1,3})\s+(.+)$/);
+    if (headingMatch) {
+      const hashes = headingMatch[1].length;
+      const headingTextValue = headingMatch[2].trim();
+      const groups = markdownInlineToRichTextGroups(headingTextValue, TRANSCRIPT_BLOCK_TEXT_LIMIT);
+      for (const richGroup of groups) {
+        if (hashes === 1) {
+          blocks.push({ object: 'block', type: 'heading_1', heading_1: { rich_text: richGroup } });
+        } else if (hashes === 2) {
+          blocks.push({ object: 'block', type: 'heading_2', heading_2: { rich_text: richGroup } });
+        } else {
+          blocks.push({ object: 'block', type: 'heading_3', heading_3: { rich_text: richGroup } });
+        }
+      }
+      continue;
+    }
+
+    const bulletMatch = line.match(/^- (.+)$/);
+    if (bulletMatch) {
+      const groups = markdownInlineToRichTextGroups(bulletMatch[1].trim(), TRANSCRIPT_BLOCK_TEXT_LIMIT);
+      for (const richGroup of groups) {
+        blocks.push({
+          object: 'block',
+          type: 'bulleted_list_item',
+          bulleted_list_item: { rich_text: richGroup },
+        });
+      }
+      continue;
+    }
+
+    const groups = markdownInlineToRichTextGroups(line, TRANSCRIPT_BLOCK_TEXT_LIMIT);
+    for (const richGroup of groups) {
+      blocks.push({
+        object: 'block',
+        type: 'paragraph',
+        paragraph: { rich_text: richGroup },
+      });
+    }
+  }
+
+  if (!blocks.length) {
     return [{
       object: 'block',
       type: 'paragraph',
       paragraph: { rich_text: richText('なし') },
     }];
   }
-  return chunks.map((chunk) => ({
-    object: 'block',
-    type: 'paragraph',
-    paragraph: { rich_text: richText(chunk) },
-  }));
+  return blocks;
 }
 
 function buildReviewedMemoBlocks(reviewResult: InterviewReviewResult): NotionBlockInput[] {
