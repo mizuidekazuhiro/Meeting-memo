@@ -11,11 +11,14 @@ import { HttpError, jsonResponse, parseJson } from './lib/http';
 import { processInterviewFromMetadata } from './lib/interviews';
 import { createRecordingJob, findRecordingJobWithSource, getRecordingJob, getRecordingJobStorageMeta, normalizeDropboxPath, shouldSkipProcessingForExistingJob, upsertRecordingJob } from './lib/jobs';
 import { logEvent } from './lib/logger';
+import { updateRecordingJobStatus } from './lib/jobs';
 import { finalizeInterviewJob, getInterviewJobStatus, persistTranscriptionCallback, processUploadedInterview, resendInterviewEmail } from './lib/processing';
 import { requireWebhookSecret } from './lib/security';
-import type { Env, IntakeRequest, RecordingJobCallbackPayload, ScanRequest, UploadRequestMetadata } from './types';
+import type { Env, FinalizeQueueMessage, IntakeRequest, RecordingJobCallbackPayload, ScanRequest, UploadRequestMetadata } from './types';
 
 type ExecutionContext = { waitUntil(promise: Promise<unknown>): void };
+type QueueMessageLike<T> = { body: T; ack?: () => void; retry?: () => void; attempts?: number };
+type QueueBatchLike<T> = { messages: Array<QueueMessageLike<T>> };
 
 function parseBooleanEnv(value: string | undefined, fallback: boolean): boolean {
   if (value === undefined) return fallback;
@@ -293,8 +296,62 @@ async function handleTranscriptionCallback(request: Request, env: Env): Promise<
   }
   try {
     const result = await persistTranscriptionCallback(env, payload);
+    const lookup = await findRecordingJobWithSource(env, {
+      recordingId: payload.recordingId?.trim(),
+      dropboxFileId: payload.dropboxFileId?.trim(),
+      dropboxPathLower: normalizeDropboxPath(payload.dropboxPathLower),
+    });
+    if (!lookup.job) throw new HttpError('Recording job not found after callback persistence.', 404, { phase: 'lookup_after_persist' });
+    if (!env.FINALIZE_QUEUE) throw new HttpError('FINALIZE_QUEUE binding is required.', 500, { phase: 'enqueue_finalize' });
+    const message: FinalizeQueueMessage = {
+      recordingId: lookup.job.recordingId,
+      force: false,
+      source: 'callback',
+      enqueuedAt: new Date().toISOString(),
+    };
+    logEvent('info', 'finalize_queue_enqueue_started', {
+      recordingId: payload.recordingId ?? null,
+      dropboxFileId: payload.dropboxFileId ?? null,
+      dropboxPathLower: payload.dropboxPathLower ?? null,
+      bindingName: 'FINALIZE_QUEUE',
+      queueName: 'meeting-memo-finalize',
+      enqueueSource: 'callback',
+    });
+    try {
+      await env.FINALIZE_QUEUE.send(message);
+      await updateRecordingJobStatus(env, { recordingId: message.recordingId }, 'callback_received', {
+        finalizeQueuedAt: message.enqueuedAt,
+        finalizeSource: 'callback',
+      });
+      logEvent('info', 'finalize_queue_enqueue_succeeded', {
+        recordingId: payload.recordingId ?? null,
+        dropboxFileId: payload.dropboxFileId ?? null,
+        dropboxPathLower: payload.dropboxPathLower ?? null,
+        bindingName: 'FINALIZE_QUEUE',
+        queueName: 'meeting-memo-finalize',
+        finalizeQueued: true,
+        enqueueSource: 'callback',
+      });
+    } catch (error) {
+      await updateRecordingJobStatus(env, { recordingId: message.recordingId }, 'failed', {
+        finalizeStatus: 'failed',
+        finalizeFailedAt: new Date().toISOString(),
+        lastError: `finalize queue enqueue failed: ${error instanceof Error ? error.message : String(error)}`,
+      });
+      logEvent('error', 'finalize_queue_enqueue_failed', {
+        recordingId: payload.recordingId ?? null,
+        dropboxFileId: payload.dropboxFileId ?? null,
+        dropboxPathLower: payload.dropboxPathLower ?? null,
+        bindingName: 'FINALIZE_QUEUE',
+        queueName: 'meeting-memo-finalize',
+        finalizeQueued: false,
+        enqueueSource: 'callback',
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
     logEvent('info', 'callback_ack_returned', { recordingId: payload.recordingId ?? null, status: 202 });
-    return jsonResponse({ ok: result.action !== 'error', action: result.action, reason: result.reason }, { status: 202 });
+    return jsonResponse({ ok: result.action !== 'error', action: result.action, reason: 'Callback accepted, persisted, and finalize job enqueued.', finalizeQueued: true }, { status: 202 });
   } catch (error) {
     logEvent('error', 'transcription callback failed', {
       phase: error instanceof HttpError ? ((error.details as { phase?: string } | undefined)?.phase ?? 'unknown') : 'unknown',
@@ -311,8 +368,28 @@ async function handleTranscriptionCallback(request: Request, env: Env): Promise<
 async function handleFinalize(request: Request, env: Env): Promise<Response> {
   requireWebhookSecret(request, env.INTERVIEW_WEBHOOK_SECRET);
   const body = await parseJson<{ recordingId: string; force?: boolean }>(request);
+  await updateRecordingJobStatus(env, { recordingId: body.recordingId }, 'callback_received', { finalizeSource: 'manual' });
   const result = await finalizeInterviewJob(env, body.recordingId, { force: body.force === true });
   return jsonResponse({ ok: result.ok, status: result.status, recordingId: body.recordingId });
+}
+
+async function handleFinalizeEnqueue(request: Request, env: Env): Promise<Response> {
+  requireWebhookSecret(request, env.INTERVIEW_WEBHOOK_SECRET);
+  const body = await parseJson<{ recordingId: string; force?: boolean }>(request);
+  if (!env.FINALIZE_QUEUE) throw new HttpError('FINALIZE_QUEUE binding is required.', 500, { phase: 'manual_enqueue_finalize' });
+  const message: FinalizeQueueMessage = {
+    recordingId: body.recordingId,
+    force: body.force === true,
+    source: 'manual',
+    enqueuedAt: new Date().toISOString(),
+  };
+  await env.FINALIZE_QUEUE.send(message);
+  await updateRecordingJobStatus(env, { recordingId: body.recordingId }, 'callback_received', {
+    finalizeQueuedAt: message.enqueuedAt,
+    finalizeSource: 'manual',
+    finalizeStatus: 'pending',
+  });
+  return jsonResponse({ ok: true, recordingId: body.recordingId, finalizeQueued: true, source: 'manual' }, { status: 202 });
 }
 
 async function handleResendEmail(request: Request, env: Env): Promise<Response> {
@@ -352,6 +429,7 @@ export default {
       if (request.method === 'POST' && url.pathname === '/api/interviews/upload') return await handleUpload(request, env, ctx);
       if (request.method === 'POST' && url.pathname === '/api/interviews/transcription-callback') return await handleTranscriptionCallback(request, env);
       if (request.method === 'POST' && url.pathname === '/api/interviews/finalize') return await handleFinalize(request, env);
+      if (request.method === 'POST' && url.pathname === '/api/interviews/finalize/enqueue') return await handleFinalizeEnqueue(request, env);
       if (request.method === 'POST' && url.pathname === '/api/interviews/resend-email') return await handleResendEmail(request, env);
       if (request.method === 'GET' && url.pathname === '/api/interviews/job-status') return await handleJobStatus(request, env);
       if (request.method === 'GET' && url.pathname === '/api/interviews/debug-dropbox') return await handleDebugDropbox(request, env);
@@ -366,5 +444,66 @@ export default {
       logEvent('error', 'worker.unhandled_error', { message, stack: error instanceof Error ? error.stack : undefined });
       return Response.json({ ok: false, message }, { status: 500 });
     }
+  },
+  async queue(batch: QueueBatchLike<FinalizeQueueMessage>, env: Env): Promise<void> {
+    const batchStartedAt = Date.now();
+    logEvent('info', 'finalize_queue_consumer_started', { messageCount: batch.messages.length });
+    for (const message of batch.messages) {
+      const startedAt = Date.now();
+      const recordingId = message.body?.recordingId;
+      const force = message.body?.force === true;
+      const source = message.body?.source ?? 'retry';
+      if (!recordingId || typeof recordingId !== 'string') {
+        logEvent('error', 'finalize_queue_message_failed', {
+          recordingId: recordingId ?? null,
+          source,
+          force,
+          attempt: message.attempts ?? null,
+          errorMessage: 'recordingId is required in finalize queue message',
+        });
+        message.ack?.();
+        continue;
+      }
+      logEvent('info', 'finalize_queue_message_started', {
+        recordingId,
+        source,
+        force,
+        attempt: message.attempts ?? null,
+      });
+      try {
+        await updateRecordingJobStatus(env, { recordingId }, 'callback_received', {
+          finalizeSource: source,
+          finalizeStatus: 'pending',
+        });
+        const result = await finalizeInterviewJob(env, recordingId, { force });
+        logEvent('info', 'finalize_queue_message_completed', {
+          recordingId,
+          source,
+          force,
+          attempt: message.attempts ?? null,
+          finalizeStatus: result.status,
+          elapsedSeconds: Number(((Date.now() - startedAt) / 1000).toFixed(3)),
+        });
+        message.ack?.();
+      } catch (error) {
+        logEvent('error', 'finalize_queue_message_failed', {
+          recordingId,
+          source,
+          force,
+          attempt: message.attempts ?? null,
+          elapsedSeconds: Number(((Date.now() - startedAt) / 1000).toFixed(3)),
+          errorMessage: error instanceof Error ? error.message : String(error),
+        });
+        if (message.retry) {
+          message.retry();
+          continue;
+        }
+        throw error;
+      }
+    }
+    logEvent('info', 'finalize_queue_batch_completed', {
+      messageCount: batch.messages.length,
+      elapsedSeconds: Number(((Date.now() - batchStartedAt) / 1000).toFixed(3)),
+    });
   },
 };

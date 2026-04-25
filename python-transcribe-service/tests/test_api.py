@@ -55,9 +55,7 @@ def test_transcribe_job_success_and_processing_seconds(monkeypatch):
 
     monkeypatch.setattr(main, 'dropbox', FakeDropbox())
     monkeypatch.setattr(main, 'service', SuccessService())
-    monkeypatch.setattr(main, 'send_callback', lambda payload, callback_url=None: True)
-    finalize_calls = []
-    monkeypatch.setattr(main, 'send_finalize', lambda recording_id, callback_url=None: (finalize_calls.append((recording_id, callback_url)) or True, 'https://example.com/api/interviews/finalize'))
+    monkeypatch.setattr(main, 'send_callback', lambda payload, callback_url=None: (True, True))
     monkeypatch.setattr(main, 'executor', InlineExecutor())
     main.job_states.clear()
 
@@ -82,11 +80,11 @@ def test_transcribe_job_success_and_processing_seconds(monkeypatch):
     status_response = client.get('/jobs/transcribe/rec-1', headers={'authorization': f'Bearer {token}'})
     assert status_response.status_code == 200
     body = status_response.json()
-    assert body['status'] == 'completed'
+    assert body['status'] == 'callback_delivered'
     assert body['callbackSucceeded'] is True
-    assert body['finalizeStatus'] == 'succeeded'
+    assert body['finalizeStatus'] == 'queued_in_workers'
+    assert body['overallStatus'] == 'callback_delivered_finalize_queued'
     assert isinstance(body['processingSeconds'], float)
-    assert finalize_calls == [('rec-1', None)]
 
 
 def test_transcribe_job_callback_failure_marks_callback_failed(monkeypatch):
@@ -110,8 +108,7 @@ def test_transcribe_job_callback_failure_marks_callback_failed(monkeypatch):
 
     monkeypatch.setattr(main, 'dropbox', FakeDropbox())
     monkeypatch.setattr(main, 'service', SuccessService())
-    monkeypatch.setattr(main, 'send_callback', lambda payload, callback_url=None: False)
-    monkeypatch.setattr(main, 'send_finalize', lambda recording_id, callback_url=None: (True, 'https://example.com/api/interviews/finalize'))
+    monkeypatch.setattr(main, 'send_callback', lambda payload, callback_url=None: (False, None))
     monkeypatch.setattr(main, 'executor', InlineExecutor())
     main.job_states.clear()
 
@@ -162,50 +159,7 @@ def test_transcribe_job_deduplicates_running_job(monkeypatch):
     assert response.json()['status'] == 'running'
 
 
-def test_callback_success_finalize_failure_marks_finalize_failed(monkeypatch):
-    import main
-
-    class FakeDropbox:
-        def download_file(self, dropbox_file_id, dropbox_path_lower):
-            return b'audio-bytes'
-
-    class SuccessPayload:
-        recordingId = 'rec-finalize-fail'
-        transcript = type('Transcript', (), {'fullText': 'hello', 'segments': []})()
-
-    class SuccessService:
-        def process(self, job, source_bytes):
-            return SuccessPayload()
-
-    class InlineExecutor:
-        def submit(self, fn, *args, **kwargs):
-            fn(*args, **kwargs)
-
-    monkeypatch.setattr(main, 'dropbox', FakeDropbox())
-    monkeypatch.setattr(main, 'service', SuccessService())
-    monkeypatch.setattr(main, 'send_callback', lambda payload, callback_url=None: True)
-    monkeypatch.setattr(main, 'send_finalize', lambda recording_id, callback_url=None: (False, 'https://example.com/api/interviews/finalize'))
-    monkeypatch.setattr(main, 'executor', InlineExecutor())
-    main.job_states.clear()
-
-    client = TestClient(main.app)
-    import auth
-
-    token = auth.SETTINGS.api_token or 'anything'
-    client.post(
-        '/jobs/transcribe',
-        headers={'authorization': f'Bearer {token}'},
-        json={'recordingId': 'rec-finalize-fail', 'dropboxFileId': 'id:123', 'fileName': 'audio.m4a'},
-    )
-    status_response = client.get('/jobs/transcribe/rec-finalize-fail', headers={'authorization': f'Bearer {token}'})
-    body = status_response.json()
-    assert body['status'] == 'finalize_failed'
-    assert body['callbackStatus'] == 'succeeded'
-    assert body['finalizeStatus'] == 'failed'
-    assert body['overallStatus'] == 'finalize_failed'
-
-
-def test_callback_success_without_finalize_success_not_completed(monkeypatch):
+def test_callback_success_without_finalize_queued_not_completed(monkeypatch):
     import main
 
     class FakeDropbox:
@@ -226,8 +180,7 @@ def test_callback_success_without_finalize_success_not_completed(monkeypatch):
 
     monkeypatch.setattr(main, 'dropbox', FakeDropbox())
     monkeypatch.setattr(main, 'service', SuccessService())
-    monkeypatch.setattr(main, 'send_callback', lambda payload, callback_url=None: True)
-    monkeypatch.setattr(main, 'send_finalize', lambda recording_id, callback_url=None: (False, None))
+    monkeypatch.setattr(main, 'send_callback', lambda payload, callback_url=None: (True, None))
     monkeypatch.setattr(main, 'executor', InlineExecutor())
     main.job_states.clear()
 
@@ -243,21 +196,5 @@ def test_callback_success_without_finalize_success_not_completed(monkeypatch):
     status_response = client.get('/jobs/transcribe/rec-not-completed', headers={'authorization': f'Bearer {token}'})
     body = status_response.json()
     assert body['overallStatus'] != 'completed'
-
-
-def test_finalize_url_derived_from_callback_url(monkeypatch):
-    from callback_client import derive_finalize_url
-
-    assert derive_finalize_url('https://meeting-memo.example.workers.dev/api/interviews/transcription-callback') == 'https://meeting-memo.example.workers.dev/api/interviews/finalize'
-
-
-def test_finalize_skipped_no_url_logs(monkeypatch):
-    import callback_client
-
-    monkeypatch.setattr(callback_client, 'resolve_finalize_url', lambda callback_url=None: None)
-    events = []
-    monkeypatch.setattr(callback_client, 'log_event', lambda *args, **kwargs: events.append((args, kwargs)))
-    ok, url = callback_client.send_finalize('rec-skip', callback_url=None)
-    assert ok is False
-    assert url is None
-    assert any(args[2] == 'finalize_skipped_no_url' for args, _kwargs in events)
+    assert body['finalizeStatus'] == 'unknown_in_workers'
+    assert body['status'] == 'callback_delivered'

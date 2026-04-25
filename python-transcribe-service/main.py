@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 
 from auth import require_bearer_token
-from callback_client import send_callback, send_finalize
+from callback_client import send_callback
 from dropbox_client import DropboxClient
 from logging_utils import configure_logging, get_logger, log_event, preview_text
 from models import TranscriptionJobRequest, WorkersCallbackPayload
@@ -69,51 +69,34 @@ def _process_job_async(job: TranscriptionJobRequest) -> None:
         payload = service.process(job, source)
         log_event(logger, 'info', 'transcript_merge_completed', recordingId=job.recordingId, transcriptLength=len(payload.transcript.fullText), segmentCount=len(payload.transcript.segments))
 
-        callback_succeeded = send_callback(payload, callback_url=job.callbackUrl)
+        callback_succeeded, finalize_queued = send_callback(payload, callback_url=job.callbackUrl)
         elapsed = round(time.perf_counter() - started_at, 3)
         if callback_succeeded:
             log_event(logger, 'info', 'callback_attempt_succeeded', recordingId=job.recordingId)
+            overall_status = 'callback_delivered_finalize_queued' if finalize_queued is True else 'callback_delivered_finalize_unknown'
             update_job_state(
                 job.recordingId,
-                'finalizing',
+                'callback_delivered',
                 payload=payload,
                 callback_succeeded=True,
                 callback_status='succeeded',
                 transcription_status='transcribed',
-                finalize_status='running',
-                overall_status='finalizing',
+                finalize_status='queued_in_workers' if finalize_queued is True else 'unknown_in_workers',
                 error=None,
                 processing_seconds=elapsed,
+                overall_status=overall_status,
             )
-            finalize_succeeded, finalize_url = send_finalize(job.recordingId, callback_url=job.callbackUrl)
-            if finalize_succeeded:
-                update_job_state(
-                    job.recordingId,
-                    'completed',
-                    payload=payload,
-                    callback_succeeded=True,
-                    callback_status='succeeded',
-                    transcription_status='transcribed',
-                    finalize_status='succeeded',
-                    overall_status='completed',
-                    error=None,
-                    processing_seconds=elapsed,
-                )
-                log_event(logger, 'info', 'lifecycle_completed', recordingId=job.recordingId, transcriptionStatus='transcribed', callbackStatus='succeeded', finalizeStatus='succeeded', overallStatus='completed', processingSeconds=elapsed, finalizeUrl=finalize_url)
-                return
-            update_job_state(
-                job.recordingId,
-                'finalize_failed',
-                payload=payload,
-                callback_succeeded=True,
-                callback_status='succeeded',
-                transcription_status='transcribed',
-                finalize_status='failed',
-                overall_status='finalize_failed',
-                error=f'finalize api call failed: {finalize_url or "url unavailable"}',
-                processing_seconds=elapsed,
+            log_event(
+                logger,
+                'info',
+                'lifecycle_completed',
+                recordingId=job.recordingId,
+                transcriptionStatus='transcribed',
+                callbackStatus='succeeded',
+                finalizeStatus='queued_in_workers' if finalize_queued is True else 'unknown_in_workers',
+                overallStatus=overall_status,
+                processingSeconds=elapsed,
             )
-            log_event(logger, 'warning', 'lifecycle_finished_with_finalize_failed', recordingId=job.recordingId, transcriptionStatus='transcribed', callbackStatus='succeeded', finalizeStatus='failed', overallStatus='finalize_failed', processingSeconds=elapsed, finalizeUrl=finalize_url)
             return
 
         update_job_state(
@@ -185,9 +168,17 @@ def retry_callback(recording_id: str, body: CallbackRetryRequest) -> dict[str, o
         raise HTTPException(status_code=400, detail={'message': 'transcription payload not found for callback retry', 'recordingId': recording_id})
 
     log_event(logger, 'info', 'callback_retry_started', recordingId=recording_id, manual=True)
-    callback_succeeded = send_callback(state.payload, callback_url=body.callbackUrl)
+    callback_succeeded, finalize_queued = send_callback(state.payload, callback_url=body.callbackUrl)
     if callback_succeeded:
-        updated = update_job_state(recording_id, 'completed', callback_succeeded=True, callback_status='succeeded', finalize_status='pending', overall_status='transcribed_callback_succeeded', error=None)
+        updated = update_job_state(
+            recording_id,
+            'callback_delivered',
+            callback_succeeded=True,
+            callback_status='succeeded',
+            finalize_status='queued_in_workers' if finalize_queued is True else 'unknown_in_workers',
+            overall_status='callback_delivered_finalize_queued' if finalize_queued is True else 'callback_delivered_finalize_unknown',
+            error=None,
+        )
         log_event(logger, 'info', 'callback_retry_succeeded', recordingId=recording_id, manual=True)
         return {'ok': True, 'recordingId': recording_id, 'status': updated.status, 'callbackStatus': updated.callback_status, 'overallStatus': updated.overall_status}
 

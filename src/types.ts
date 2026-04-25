@@ -3,6 +3,17 @@ export interface RecordingJobKvStore {
   put(key: string, value: string): Promise<void>;
 }
 
+export interface QueueLike<TMessage> {
+  send(message: TMessage): Promise<void>;
+}
+
+export interface FinalizeQueueMessage {
+  recordingId: string;
+  force?: boolean;
+  source: 'callback' | 'manual' | 'retry';
+  enqueuedAt: string;
+}
+
 export interface Env {
   APP_ENV?: string;
   INTERVIEW_WEBHOOK_SECRET: string;
@@ -25,6 +36,7 @@ export interface Env {
   PYTHON_TRANSCRIBE_API_URL?: string;
   PYTHON_TRANSCRIBE_API_TOKEN?: string;
   WORKERS_CALLBACK_BASE_URL?: string;
+  FINALIZE_QUEUE?: QueueLike<FinalizeQueueMessage>;
   RECORDING_JOB_KV?: RecordingJobKvStore;
   ALLOW_IN_MEMORY_RECORDING_JOB_STORE?: string;
   CALLBACK_JOB_LOOKUP_MAX_ATTEMPTS?: string;
@@ -198,6 +210,12 @@ export interface RecordingJob {
   emailSentAt?: string;
   finalizeStatus?: 'pending' | 'running' | 'completed' | 'failed';
   lastError?: string;
+  finalizeQueuedAt?: string;
+  finalizeStartedAt?: string;
+  finalizeCompletedAt?: string;
+  finalizeFailedAt?: string;
+  finalizeAttemptCount?: number;
+  finalizeSource?: 'callback' | 'manual' | 'retry';
   notionPageId?: string;
   notionPageUrl?: string;
 }
