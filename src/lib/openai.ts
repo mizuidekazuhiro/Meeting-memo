@@ -1,4 +1,4 @@
-import type { Env, InterviewInsights, TranscriptResult, TranscriptSegment } from '../types';
+import type { Env, InterviewInsights, InterviewReviewResult, TranscriptResult, TranscriptSegment } from '../types';
 import { HttpError } from './http';
 import { logEvent } from './logger';
 
@@ -657,6 +657,10 @@ function buildSummaryPayloadPreview(payload: unknown): Record<string, unknown> {
 }
 
 export function extractSummaryTextFromResponsesPayload(payload: unknown): string | undefined {
+  return extractOutputTextFromResponsesPayload(payload);
+}
+
+export function extractOutputTextFromResponsesPayload(payload: unknown): string | undefined {
   if (!isRecord(payload)) return undefined;
   if (typeof payload.output_text === 'string' && payload.output_text.trim()) return payload.output_text;
   if (!Array.isArray(payload.output)) return undefined;
@@ -668,4 +672,159 @@ export function extractSummaryTextFromResponsesPayload(payload: unknown): string
     }
   }
   return undefined;
+}
+
+function normalizeStringArray(values: unknown): string[] {
+  if (!Array.isArray(values)) return [];
+  return values
+    .map((value) => (typeof value === 'string' ? value.trim() : ''))
+    .filter((value) => value.length > 0);
+}
+
+function normalizeReviewResult(parsed: unknown): Omit<InterviewReviewResult, 'raw'> {
+  const record = isRecord(parsed) ? parsed : {};
+  return {
+    finalMemoMarkdown: typeof record.finalMemoMarkdown === 'string' ? record.finalMemoMarkdown : '',
+    correctedTermsMarkdown: typeof record.correctedTermsMarkdown === 'string' ? record.correctedTermsMarkdown : '',
+    summaryForEmail: typeof record.summaryForEmail === 'string' ? record.summaryForEmail : '',
+    uncertainItemsMarkdown: typeof record.uncertainItemsMarkdown === 'string' ? record.uncertainItemsMarkdown : '',
+    nextActionsMarkdown: typeof record.nextActionsMarkdown === 'string' ? record.nextActionsMarkdown : '',
+    humanCheckRequired: record.humanCheckRequired === true,
+    humanCheckReason: typeof record.humanCheckReason === 'string' ? record.humanCheckReason : '',
+    myTasks: normalizeStringArray(record.myTasks),
+    otherTasks: normalizeStringArray(record.otherTasks),
+    sourceUrls: normalizeStringArray(record.sourceUrls),
+  };
+}
+
+export async function reviewInterviewWithWebSearch(
+  env: Env,
+  input: {
+    transcript: TranscriptResult;
+    insights?: InterviewInsights;
+    title?: string;
+    fileName?: string;
+    notionPageUrl?: string;
+  },
+): Promise<InterviewReviewResult> {
+  const model = env.OPENAI_MODEL_REVIEW ?? env.OPENAI_MODEL_SUMMARIZE ?? 'gpt-5.4-mini';
+  const webSearchEnabled = env.INTERVIEW_REVIEW_WEB_SEARCH_ENABLED?.toLowerCase() !== 'false';
+
+  const tools = webSearchEnabled ? [{ type: 'web_search_preview' as const }] : [];
+  let response: Response;
+  try {
+    response = await fetch(`${OPENAI_API}/responses`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model,
+        tools,
+        input: [
+          {
+            role: 'system',
+            content: [{
+              type: 'input_text',
+              text: [
+                'あなたは面談メモの二次レビュー担当です。',
+                'Transcriptと一次要約を読み、必要に応じてWeb検索で固有名詞・会社名・人物名・略称を確認してください。',
+                '不明な事項を推測で埋めてはいけません。',
+                '事実、推測、提案を分けて明記してください。',
+                '金額、株式比率、株主間協定、契約条件、会計処理、法務論点は断定しないでください。',
+                'correctedTermsMarkdown には「文字起こし上の表記 / 推定される正確な表記 / 確度 / 根拠」を必ず含めてください。',
+                '確度は「高 / 中 / 低 / 不明」の4段階のみを使ってください。',
+                'Web検索で断定できないものは「不明」と書いてください。',
+                'sourceUrls には根拠URLのみを入れてください。根拠がなければ空配列でよいです。',
+                'myTasks / otherTasks は二次レビュー結果を優先してください。ただし担当者不明を勝手にmyTasksへ入れないでください。',
+                'humanCheckRequired は次の場合 true: 確度が低または不明を含む、金額/株式比率/株主間協定/会計/法務論点がある、誤変換が多い、Web検索とTranscriptが矛盾しうる、sourceUrls空かつ固有名詞補正あり。',
+                'finalMemoMarkdown はNotion本文に貼れる日本語Markdown風テキストにしてください。',
+              ].join(' '),
+            }],
+          },
+          {
+            role: 'user',
+            content: [{
+              type: 'input_text',
+              text: JSON.stringify({
+                title: input.title ?? '',
+                fileName: input.fileName ?? '',
+                notionPageUrl: input.notionPageUrl ?? '',
+                transcript: input.transcript.fullText,
+                primarySummary: input.insights?.summary ?? '',
+                primaryMyTasks: input.insights?.myTasks ?? [],
+                primaryOtherTasks: input.insights?.otherTasks ?? [],
+                primaryAmbiguities: input.insights?.ambiguities ?? [],
+              }),
+            }],
+          },
+        ],
+        text: {
+          format: {
+            type: 'json_schema',
+            name: 'interview_review_result',
+            schema: {
+              type: 'object',
+              additionalProperties: false,
+              required: [
+                'finalMemoMarkdown',
+                'correctedTermsMarkdown',
+                'summaryForEmail',
+                'uncertainItemsMarkdown',
+                'nextActionsMarkdown',
+                'humanCheckRequired',
+                'humanCheckReason',
+                'myTasks',
+                'otherTasks',
+                'sourceUrls',
+              ],
+              properties: {
+                finalMemoMarkdown: { type: 'string' },
+                correctedTermsMarkdown: { type: 'string' },
+                summaryForEmail: { type: 'string' },
+                uncertainItemsMarkdown: { type: 'string' },
+                nextActionsMarkdown: { type: 'string' },
+                humanCheckRequired: { type: 'boolean' },
+                humanCheckReason: { type: 'string' },
+                myTasks: { type: 'array', items: { type: 'string' } },
+                otherTasks: { type: 'array', items: { type: 'string' } },
+                sourceUrls: { type: 'array', items: { type: 'string' } },
+              },
+            },
+          },
+        },
+      }),
+    });
+  } catch (error) {
+    logEvent('error', 'review request failed', { details: error instanceof Error ? error.message : error });
+    throw new HttpError('Interview review request failed.', 502, { cause: error instanceof Error ? error.message : error });
+  }
+
+  if (!response.ok) {
+    const responseText = await readResponseTextSafely(response);
+    logEvent('error', 'review request failed', { responseStatus: response.status, responseTextPreview: responseText.slice(0, 300) });
+    throw new HttpError('Interview review failed.', 502, { responseStatus: response.status, responseTextPreview: responseText.slice(0, 300) });
+  }
+
+  const payload = (await response.json()) as unknown;
+  const outputText = extractOutputTextFromResponsesPayload(payload);
+  if (!outputText) {
+    const payloadPreview = buildSummaryPayloadPreview(payload);
+    logEvent('error', 'review response text missing', payloadPreview);
+    throw new HttpError('Interview review response text missing.', 502, payloadPreview);
+  }
+
+  try {
+    const parsed = JSON.parse(outputText);
+    return { ...normalizeReviewResult(parsed), raw: payload };
+  } catch (error) {
+    const details = {
+      ...buildSummaryPayloadPreview(payload),
+      reviewTextPreview: outputText.slice(0, 400),
+      parseMessage: error instanceof Error ? error.message : String(error),
+    };
+    logEvent('error', 'review response parse failed', details);
+    throw new HttpError('Interview review response parse failed.', 502, details);
+  }
 }

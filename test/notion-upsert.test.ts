@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 
-import { importMyTasksToInbox, upsertInterviewFromTranscript } from '../src/lib/notion';
+import { appendReviewedMemoToNotionPage, importMyTasksToInbox, upsertInterviewFromTranscript } from '../src/lib/notion';
 
 test('upsertInterviewFromTranscript stores insights fields and transcript raw JSON', async () => {
   const originalFetch = global.fetch;
@@ -170,4 +170,65 @@ test('importMyTasksToInbox omits optional source properties that are not in DB s
   assert.equal(pageBodies[0].properties['Source Recording ID'], undefined);
   assert.equal(pageBodies[0].properties['Source Interview Page ID'], undefined);
   assert.equal(pageBodies[0].properties['Source Interview URL'], undefined);
+});
+
+test('appendReviewedMemoToNotionPage adds review sections and keeps Transcript', async () => {
+  const originalFetch = global.fetch;
+  const appendedChildren: any[] = [];
+  global.fetch = (async (input: string, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url.includes('/blocks/page_1/children?')) {
+      return new Response(JSON.stringify({
+        results: [
+          { object: 'block', id: 'h1', type: 'heading_2', heading_2: { rich_text: [{ plain_text: 'Transcript' }] } },
+          { object: 'block', id: 'p1', type: 'paragraph' },
+        ],
+        next_cursor: null,
+        has_more: false,
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/blocks/') && init?.method === 'DELETE') {
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/blocks/page_1/children') && init?.method === 'PATCH') {
+      if (typeof init.body === 'string') appendedChildren.push(JSON.parse(init.body));
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+
+  await appendReviewedMemoToNotionPage(
+    { NOTION_TOKEN: 'token', INBOX_DB_ID: 'db' } as any,
+    'page_1',
+    {
+      finalMemoMarkdown: 'final',
+      correctedTermsMarkdown: 'corrected',
+      summaryForEmail: 'summary',
+      uncertainItemsMarkdown: 'uncertain',
+      nextActionsMarkdown: 'actions',
+      humanCheckRequired: true,
+      humanCheckReason: 'reason',
+      myTasks: [],
+      otherTasks: [],
+      sourceUrls: ['https://example.com'],
+      raw: {},
+    },
+    {
+      title: 't',
+      dedupKey: 'd',
+      metadata: { name: 'm4a' },
+      request: {},
+      processingStatus: 'persisted',
+      transcript: { fullText: 'hello transcript', segments: [], raw: {} },
+    } as any,
+  );
+  global.fetch = originalFetch;
+
+  const allChildren = appendedChildren.flatMap((payload) => payload.children);
+  const headings = allChildren.filter((block) => block.type === 'heading_2').map((block) => block.heading_2.rich_text[0].text.content);
+  assert.ok(headings.includes('面談メモ（完成版）'));
+  assert.ok(headings.includes('固有名詞補正'));
+  assert.ok(headings.includes('未確定事項'));
+  assert.ok(headings.includes('次に取るべき行動'));
+  assert.ok(headings.includes('Transcript'));
 });

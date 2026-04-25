@@ -46,8 +46,25 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 8. Python API が transcript を chunkIndex 順で結合して Workers callback
 9. Workers が transcript 完了後に要約（summary / tasks）を生成
 10. Workers が Notion に保存（Interview Memo 本体。`Record Type=Interview Memo`）
-11. Workers が `My Tasks` のみを同一 DB（`INBOX_DB_ID`）へ 1件ずつ追加（`Record Type=Task`）
-12. Workers が Gmail SMTP（アプリパスワード）で完了通知メール送信
+11. Workers が二次レビュー（`gpt-5.4-mini` + 任意でWeb検索）を実行
+12. Workers が Notion ページ本文へ完成版メモ/固有名詞補正/未確定事項/次アクション/レビュー情報を追記
+13. Workers が `My Tasks` のみを同一 DB（`INBOX_DB_ID`）へ 1件ずつ追加（`Record Type=Task`）
+14. Workers が Gmail SMTP（アプリパスワード）で完了通知メール送信（レビュー結果を本文に記載）
+
+### 二次レビュー機能（重要）
+
+- 使用モデル: `gpt-5.4-mini`（`OPENAI_MODEL_REVIEW`。未設定時は `OPENAI_MODEL_SUMMARIZE`、さらに未設定時は `gpt-5.4-mini`）
+- Notion DB プロパティの追加は不要です。既存プロパティ（`Summary` / `My Tasks` / `Other Tasks` / `Raw JSON` / `Error Message`）のみ更新します。
+- レビュー結果は Notion の**ページ本文**と完了通知メール本文の両方に出力されます。
+- `Transcript` セクションは削除しません。
+- Web検索結果は補助情報です。低確度/不明は人間確認が必要です。
+- `humanCheckRequired=true` の主な条件:
+  - 低確度または不明項目が1つでもある
+  - 金額 / 株式比率 / 株主間協定 / 会計処理 / 法務論点が含まれる
+  - 誤変換が多い
+  - Web検索結果と transcript が矛盾する可能性がある
+  - 固有名詞補正をしているのに根拠URLが空
+- 二次レビューが失敗しても、一次要約 + Transcript 保存 + メール通知は継続します。
 
 ### Notion My Tasks の任意プロパティ（別ページ化する場合）
 
@@ -115,6 +132,9 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 - `CALLBACK_JOB_LOOKUP_BASE_DELAY_MS`（指数 backoff の基準遅延。既定: `200`）
 - `CALLBACK_JOB_LOOKUP_MAX_DELAY_MS`（指数 backoff の最大遅延。既定: `1600`）
 - `GMAIL_NOTIFY_ENABLED`（`true` の時だけ通知）
+- `INTERVIEW_REVIEW_ENABLED`（未設定は有効。`false` の時のみ二次レビュー無効）
+- `INTERVIEW_REVIEW_WEB_SEARCH_ENABLED`（未設定は有効。`false` の時のみWeb検索無効）
+- `OPENAI_MODEL_REVIEW`（既定: `gpt-5.4-mini`）
 - `MAIL_FROM`（送信元 Gmail アドレス）
 - `MAIL_PASSWORD`（Google アプリパスワード）
 - `MAIL_TO`（通知先。カンマ/セミコロン/改行区切り可）
@@ -127,6 +147,8 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 - `INBOX_TRIAGE_ACTION_SECRET`（任意。`notion-inbox-triage` 側の `ACTION_SECRET` と同じ値）
 - 旧方式（非推奨 / 互換メモ）: `GMAIL_OAUTH_CLIENT_ID`, `GMAIL_OAUTH_CLIENT_SECRET`, `GMAIL_OAUTH_REFRESH_TOKEN`
 - 既存 Dropbox / OpenAI / Notion 関連 env
+
+> `OPENAI_API_KEY` は `wrangler.toml` には書かず、Wrangler Secret / GitHub Secrets で管理してください。
 
 > 重要: 本番/preview/deployed Workers runtime では fallback store を使いません。`RECORDING_JOB_KV` 未設定時は 500 を返します。
 
