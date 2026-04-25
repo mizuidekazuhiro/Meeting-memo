@@ -391,14 +391,38 @@ export interface ImportMyTasksInput {
   myTasks: unknown;
 }
 
+async function getInboxDatabasePropertyNames(env: Env): Promise<Set<string>> {
+  const response = await notionFetch<{ properties?: Record<string, unknown> }>(env, `/databases/${env.INBOX_DB_ID}`, {
+    method: 'GET',
+  });
+  return new Set(Object.keys(response.properties ?? {}));
+}
+
 export async function importMyTasksToInbox(
   env: Env,
   input: ImportMyTasksInput,
-): Promise<{ importedCount: number; skippedDuplicates: number; normalizedTasks: string[]; sourceInterviewUrl: string }> {
+): Promise<{
+  importedCount: number;
+  skippedDuplicates: number;
+  skippedBecauseMissingProperties: number;
+  missingProperties: string[];
+  normalizedTasks: string[];
+  sourceInterviewUrl: string;
+}> {
   const normalizedTasks = normalizeMyTasksInput(input.myTasks);
   const sourceInterviewUrl = notionPageUrl(input.sourceInterviewPageId);
+  const inboxPropertyNames = await getInboxDatabasePropertyNames(env);
+  const optionalPropertyPayload = cleanProperties({
+    'Source Recording ID': inboxPropertyNames.has('Source Recording ID') ? { rich_text: richText(input.recordingId) } : undefined,
+    'Source Interview Page ID': inboxPropertyNames.has('Source Interview Page ID') ? { rich_text: richText(input.sourceInterviewPageId) } : undefined,
+    'Source Interview URL': inboxPropertyNames.has('Source Interview URL') ? { url: sourceInterviewUrl } : undefined,
+  });
+  const missingProperties = ['Source Recording ID', 'Source Interview Page ID', 'Source Interview URL'].filter(
+    (property) => !inboxPropertyNames.has(property),
+  );
   let importedCount = 0;
   let skippedDuplicates = 0;
+  let skippedBecauseMissingProperties = 0;
 
   for (const taskText of normalizedTasks) {
     const taskHash = await sha256Hex(taskText);
@@ -417,16 +441,15 @@ export async function importMyTasksToInbox(
           Name: { title: titleText(taskText) },
           Source: { rich_text: richText('meeting_memo') },
           'Record Type': { select: { name: 'Task' } },
-          'Source Recording ID': { rich_text: richText(input.recordingId) },
-          'Source Interview Page ID': { rich_text: richText(input.sourceInterviewPageId) },
-          'Source Interview URL': { url: sourceInterviewUrl },
+          ...optionalPropertyPayload,
           'Imported At': { date: { start: new Date().toISOString() } },
           'Dedup Key': { rich_text: richText(dedupKey) },
         }),
       }),
     });
     importedCount += 1;
+    skippedBecauseMissingProperties += missingProperties.length;
   }
 
-  return { importedCount, skippedDuplicates, normalizedTasks, sourceInterviewUrl };
+  return { importedCount, skippedDuplicates, skippedBecauseMissingProperties, missingProperties, normalizedTasks, sourceInterviewUrl };
 }

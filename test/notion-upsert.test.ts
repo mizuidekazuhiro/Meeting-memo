@@ -52,6 +52,23 @@ test('importMyTasksToInbox creates only My Tasks and deduplicates same recording
 
   global.fetch = (async (input: string, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();
+    if (url.endsWith('/databases/db') && (init?.method ?? 'GET') === 'GET') {
+      return new Response(
+        JSON.stringify({
+          properties: {
+            Name: {},
+            Source: {},
+            'Record Type': {},
+            'Source Recording ID': {},
+            'Source Interview Page ID': {},
+            'Source Interview URL': {},
+            'Imported At': {},
+            'Dedup Key': {},
+          },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
     if (url.includes('/databases/') && url.endsWith('/query')) {
       const body = typeof init?.body === 'string' ? JSON.parse(init.body) : {};
       queryBodies.push(body);
@@ -85,10 +102,62 @@ test('importMyTasksToInbox creates only My Tasks and deduplicates same recording
   global.fetch = originalFetch;
 
   assert.equal(first.importedCount, 2);
+  assert.equal(first.skippedBecauseMissingProperties, 0);
+  assert.deepEqual(first.missingProperties, []);
   assert.equal(second.importedCount, 0);
   assert.equal(second.skippedDuplicates, 2);
   assert.ok(pageBodies.every((body) => body.properties['Record Type'].select.name === 'Task'));
   assert.ok(pageBodies.every((body) => body.properties.Source.rich_text[0].text.content === 'meeting_memo'));
   assert.ok(pageBodies.every((body) => body.properties.Name.title[0].text.content !== ''));
+  assert.ok(pageBodies.every((body) => body.properties['Source Recording ID']));
+  assert.ok(pageBodies.every((body) => body.properties['Source Interview Page ID']));
+  assert.ok(pageBodies.every((body) => body.properties['Source Interview URL']));
   assert.ok(queryBodies.length >= 4);
+});
+
+test('importMyTasksToInbox omits optional source properties that are not in DB schema', async () => {
+  const originalFetch = global.fetch;
+  const pageBodies: any[] = [];
+
+  global.fetch = (async (input: string, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url.endsWith('/databases/db') && (init?.method ?? 'GET') === 'GET') {
+      return new Response(
+        JSON.stringify({
+          properties: {
+            Name: {},
+            Source: {},
+            'Record Type': {},
+            'Imported At': {},
+            'Dedup Key': {},
+          },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    if (url.includes('/databases/') && url.endsWith('/query')) {
+      return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.endsWith('/pages')) {
+      if (typeof init?.body === 'string') pageBodies.push(JSON.parse(init.body));
+      return new Response(JSON.stringify({ id: `task_${pageBodies.length}` }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+
+  const env = { NOTION_TOKEN: 'token', INBOX_DB_ID: 'db' } as any;
+  const result = await importMyTasksToInbox(env, {
+    recordingId: 'rec-1',
+    sourceInterviewPageId: 'interview-page-id',
+    myTasks: ['first task'],
+  });
+  global.fetch = originalFetch;
+
+  assert.equal(result.importedCount, 1);
+  assert.equal(result.skippedBecauseMissingProperties, 3);
+  assert.deepEqual(result.missingProperties, ['Source Recording ID', 'Source Interview Page ID', 'Source Interview URL']);
+  assert.equal(pageBodies.length, 1);
+  assert.equal(pageBodies[0].properties['Source Recording ID'], undefined);
+  assert.equal(pageBodies[0].properties['Source Interview Page ID'], undefined);
+  assert.equal(pageBodies[0].properties['Source Interview URL'], undefined);
 });

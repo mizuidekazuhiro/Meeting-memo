@@ -49,27 +49,42 @@ async function runPostPersistTasksAndEmail(
 ): Promise<void> {
   if (!params.persisted.pageId) return;
 
+  let imported = {
+    importedCount: 0,
+    skippedDuplicates: 0,
+    skippedBecauseMissingProperties: 0,
+    missingProperties: [] as string[],
+    normalizedTasks: [] as string[],
+    sourceInterviewUrl: buildNotionPageUrl(params.persisted.pageId),
+  };
+
   logEvent('info', 'my task import started', {
     recordingId: params.job.recordingId,
     pageId: params.persisted.pageId,
   });
-  const imported = await importMyTasksToInbox(env, {
-    recordingId: params.job.recordingId,
-    sourceInterviewPageId: params.persisted.pageId,
-    myTasks: params.persisted.record.insights?.myTasks,
-  });
-  if (imported.importedCount > 0) {
-    logEvent('info', 'my task import page created', {
+  try {
+    imported = await importMyTasksToInbox(env, {
       recordingId: params.job.recordingId,
-      pageId: params.persisted.pageId,
-      importedCount: imported.importedCount,
+      sourceInterviewPageId: params.persisted.pageId,
+      myTasks: params.persisted.record.insights?.myTasks,
     });
-  }
-  if (imported.skippedDuplicates > 0) {
-    logEvent('info', 'my task import skipped duplicate', {
+    logEvent('info', 'my task import finished', {
       recordingId: params.job.recordingId,
-      pageId: params.persisted.pageId,
+      sourceInterviewPageId: params.persisted.pageId,
+      importedCount: imported.importedCount,
       skippedDuplicates: imported.skippedDuplicates,
+      skippedBecauseMissingProperties: imported.skippedBecauseMissingProperties,
+      missingProperties: imported.missingProperties,
+    });
+  } catch (error) {
+    logEvent('warn', 'my task import failed', {
+      recordingId: params.job.recordingId,
+      sourceInterviewPageId: params.persisted.pageId,
+      importedCount: imported.importedCount,
+      skippedDuplicates: imported.skippedDuplicates,
+      skippedBecauseMissingProperties: imported.skippedBecauseMissingProperties,
+      missingProperties: imported.missingProperties,
+      details: error instanceof HttpError ? error.details : error instanceof Error ? error.message : String(error),
     });
   }
 

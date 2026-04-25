@@ -49,6 +49,14 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 11. Workers が `My Tasks` のみを同一 DB（`INBOX_DB_ID`）へ 1件ずつ追加（`Record Type=Task`）
 12. Workers が Gmail API（OAuth refresh token）で完了通知メール送信
 
+### Notion My Tasks の任意プロパティ（別ページ化する場合）
+
+`My Tasks` を Interview Memo 本体と別ページで管理する場合、以下の追加プロパティがあると関連付けに便利です（任意）。
+
+- `Source Recording ID`: `rich_text`
+- `Source Interview Page ID`: `rich_text`
+- `Source Interview URL`: `url`
+
 ### iPhone Shortcut 側の成功判定
 
 - `/api/interviews/upload` の `action: queued` は成功扱いにしてください
