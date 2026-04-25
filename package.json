@@ -5,6 +5,6 @@
   "type": "module",
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "rm -rf .tmp-test && tsc -p tsconfig.test.json && printf '{\"type\":\"commonjs\"}' > .tmp-test/package.json && node --test .tmp-test/test/**/*.test.js"
+    "test": "rm -rf .tmp-test && tsc -p tsconfig.test.json && printf '{\"type\":\"commonjs\"}' > .tmp-test/package.json && node scripts/test-runner.mjs"
   }
 }

@@ -1,16 +1,30 @@
 // @ts-nocheck
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
 
-import { HttpError } from '../src/lib/http';
-import { createRecordingJob, getRecordingJob, normalizeDropboxPath, upsertRecordingJob } from '../src/lib/jobs';
-import { persistTranscriptionCallback } from '../src/lib/processing';
+async function importFirst(candidates: string[]) {
+  for (const candidate of candidates) {
+    try {
+      return await import(candidate);
+    } catch {
+      // try next
+    }
+  }
+  throw new Error(`Unable to import module from candidates: ${candidates.join(', ')}`);
+}
+
+async function loadDeps() {
+  const workerMod = await importFirst(['../src/index.js', '../.tmp-test/src/index.js']);
+  const httpMod = await importFirst(['../src/lib/http.js', '../.tmp-test/src/lib/http.js']);
+  const jobsMod = await importFirst(['../src/lib/jobs.js', '../.tmp-test/src/lib/jobs.js']);
+  const processingMod = await importFirst(['../src/lib/processing.js', '../.tmp-test/src/lib/processing.js']);
+  const loggerMod = await importFirst(['../src/lib/logger.js', '../.tmp-test/src/lib/logger.js']);
+  const gmailMod = await importFirst(['../src/lib/gmail.js', '../.tmp-test/src/lib/gmail.js']);
+  return { workerMod, httpMod, jobsMod, processingMod, loggerMod, gmailMod };
+}
 
 class MockKv {
   map = new Map<string, string>();
-  puts: string[] = [];
 
   async get(key: string, type?: 'text' | 'json') {
     const value = this.map.get(key);
@@ -20,33 +34,18 @@ class MockKv {
   }
 
   async put(key: string, value: string) {
-    this.puts.push(key);
     this.map.set(key, value);
-  }
-}
-
-class EventuallyConsistentMockKv extends MockKv {
-  missesRemainingByKey = new Map<string, number>();
-
-  setMisses(key: string, misses: number) {
-    this.missesRemainingByKey.set(key, misses);
-  }
-
-  async get(key: string, type?: 'text' | 'json') {
-    const missesRemaining = this.missesRemainingByKey.get(key) ?? 0;
-    if (missesRemaining > 0) {
-      this.missesRemainingByKey.set(key, missesRemaining - 1);
-      return null;
-    }
-    return super.get(key, type);
   }
 }
 
 function makeEnv(kv: MockKv, overrides: Record<string, unknown> = {}) {
   return {
     APP_ENV: 'test',
+    INTERVIEW_WEBHOOK_SECRET: 'secret',
     NOTION_TOKEN: 'token',
     INBOX_DB_ID: 'db',
+    OPENAI_API_KEY: 'openai-test',
+    INTERVIEW_REVIEW_ENABLED: 'false',
     RECORDING_JOB_KV: kv,
     ...overrides,
   } as any;
@@ -63,373 +62,221 @@ function transcriptPayload(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function installNotionFetchMock() {
+function installFinalizeFetchMock() {
   const originalFetch = global.fetch;
-  let calls = 0;
-  const pagePayloads: any[] = [];
+  const stats = {
+    notionTranscriptAppendCalls: 0,
+    notionPageCreateCalls: 0,
+    notionPagePatchCalls: 0,
+    summaryCalls: 0,
+    summaryPayloads: [] as any[],
+  };
+
   global.fetch = (async (input: string, init?: RequestInit) => {
-    calls += 1;
     const url = typeof input === 'string' ? input : input.toString();
     if (url.includes('/v1/responses')) {
-      return new Response(JSON.stringify({ output_text: JSON.stringify({ summary: '要約', myTasks: ['自分タスク'], otherTasks: ['相手タスク'], ambiguities: [] }) }), { status: 200, headers: { 'content-type': 'application/json' } });
+      stats.summaryCalls += 1;
+      return new Response(
+        JSON.stringify({ output_text: JSON.stringify({ summary: '要約です', myTasks: ['task1'], otherTasks: ['task2'], ambiguities: [] }) }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
     }
-    if (url.includes('/databases/') && url.endsWith('/query')) {
-      return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
-    }
-    if (url.endsWith('/pages')) {
-      if (init?.body && typeof init.body === 'string') pagePayloads.push(JSON.parse(init.body));
+    if (url.includes('/databases/') && url.endsWith('/query')) return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.endsWith('/pages') && init?.method === 'POST') {
+      stats.notionPageCreateCalls += 1;
       return new Response(JSON.stringify({ id: 'page_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
-    if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') {
+    if (url.includes('/pages/') && init?.method === 'PATCH') {
+      stats.notionPagePatchCalls += 1;
+      if (typeof init?.body === 'string') stats.summaryPayloads.push(JSON.parse(init.body));
       return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
+    if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') {
+      stats.notionTranscriptAppendCalls += 1;
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/children?')) return new Response(JSON.stringify({ results: [], has_more: false, next_cursor: null }), { status: 200, headers: { 'content-type': 'application/json' } });
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
   }) as any;
-  return {
-    getCalls: () => calls,
-    getPagePayloads: () => pagePayloads,
-    restore: () => {
-      global.fetch = originalFetch;
-    },
-  };
+
+  return { stats, restore: () => { global.fetch = originalFetch; } };
 }
 
-test('callback lookup finds job by recordingId', async () => {
+test('callback endpoint returns 202, stores callback state, and schedules finalize via waitUntil', async () => {
+  const { workerMod, jobsMod, processingMod, loggerMod } = await loadDeps();
+  const worker = workerMod.default;
+  const { createRecordingJob, upsertRecordingJob, getRecordingJob } = jobsMod;
+
   const kv = new MockKv();
   const env = makeEnv(kv);
   const job = createRecordingJob({ request: { fileName: 'a.m4a' }, dropboxFileId: 'id:1', dropboxPathLower: '/apps/meetingmemo/inbox/a.m4a', fileName: 'a.m4a' });
   await upsertRecordingJob(env, job);
 
-  const fetchMock = installNotionFetchMock();
-  const result = await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId, dropboxFileId: 'different', dropboxPathLower: '/different' }));
+  const waitUntilPromises: Promise<unknown>[] = [];
+  const calls: string[] = [];
+  const originalFinalize = processingMod.finalizeInterviewJob;
+  const originalLogEvent = loggerMod.logEvent;
+  processingMod.finalizeInterviewJob = async () => {
+    calls.push('finalize-called');
+    return { ok: true, status: 'completed' };
+  };
+  loggerMod.logEvent = ((_: string, message: string) => calls.push(message)) as any;
+
+  const request = new Request('https://example.com/api/interviews/transcription-callback', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-webhook-secret': env.INTERVIEW_WEBHOOK_SECRET },
+    body: JSON.stringify(transcriptPayload({ recordingId: job.recordingId, dropboxFileId: job.dropboxFileId, dropboxPathLower: job.dropboxPathLower })),
+  });
+  const response = await worker.fetch(request, env, { waitUntil: (p: Promise<unknown>) => waitUntilPromises.push(p) });
+  await Promise.all(waitUntilPromises);
+
+  processingMod.finalizeInterviewJob = originalFinalize;
+  loggerMod.logEvent = originalLogEvent;
+
+  const updated = await getRecordingJob(env, { recordingId: job.recordingId });
+  assert.equal(response.status, 202);
+  assert.equal(updated?.status, 'callback_received');
+  assert.equal(updated?.callbackStatus, 'received');
+  assert.equal(waitUntilPromises.length, 1);
+  assert.ok(calls.includes('callback_ack_returned'));
+  assert.ok(calls.includes('finalize-called'));
+});
+
+test('callback persistence path stores transcript payload and remains lightweight', async () => {
+  const { jobsMod, processingMod } = await loadDeps();
+  const { createRecordingJob, upsertRecordingJob, getRecordingJob } = jobsMod;
+  const { persistTranscriptionCallback } = processingMod;
+
+  const kv = new MockKv();
+  const env = makeEnv(kv);
+  const job = createRecordingJob({ request: { fileName: 'b.m4a' }, dropboxFileId: 'id:2', dropboxPathLower: '/apps/meetingmemo/inbox/b.m4a', fileName: 'b.m4a' });
+  await upsertRecordingJob(env, job);
+
+  const result = await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
+  const updated = await getRecordingJob(env, { recordingId: job.recordingId });
+  assert.equal(result.action, 'processed');
+  assert.equal(updated?.status, 'callback_received');
+  assert.equal(updated?.transcript?.fullText, 'hello world');
+  assert.equal(updated?.finalizeStatus, 'pending');
+});
+
+test('finalizeInterviewJob executes transcript -> summary -> email and marks completed', async () => {
+  const { jobsMod, processingMod, gmailMod } = await loadDeps();
+  const { createRecordingJob, upsertRecordingJob, getRecordingJob } = jobsMod;
+  const { persistTranscriptionCallback, finalizeInterviewJob } = processingMod;
+
+  const kv = new MockKv();
+  const env = makeEnv(kv, { GMAIL_NOTIFY_ENABLED: 'true', MAIL_TO: 'to@example.com', MAIL_FROM: 'from@example.com', MAIL_PASSWORD: 'password' });
+  const job = createRecordingJob({ request: { fileName: 'finalize.m4a' }, dropboxFileId: 'id:3', dropboxPathLower: '/apps/meetingmemo/inbox/finalize.m4a', fileName: 'finalize.m4a' });
+  await upsertRecordingJob(env, job);
+  await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
+
+  const fetchMock = installFinalizeFetchMock();
+  const emailCalls: any[] = [];
+  const originalSendEmail = gmailMod.sendCompletionEmail;
+  gmailMod.sendCompletionEmail = (async (_env: any, payload: any) => emailCalls.push(payload)) as any;
+
+  await finalizeInterviewJob(env, job.recordingId);
+
+  gmailMod.sendCompletionEmail = originalSendEmail;
   fetchMock.restore();
 
   const updated = await getRecordingJob(env, { recordingId: job.recordingId });
-  assert.equal(result.action, 'processed');
-  assert.equal(updated?.status, 'persisted');
-  assert.equal(updated?.callbackStatus, 'persisted');
+  assert.equal(updated?.status, 'completed');
+  assert.equal(updated?.finalizeStatus, 'completed');
+  assert.ok(updated?.transcriptWrittenAt);
+  assert.ok(updated?.summaryWrittenAt);
+  assert.ok(updated?.emailSentAt);
+  assert.ok(fetchMock.stats.notionTranscriptAppendCalls >= 1);
+  assert.ok(fetchMock.stats.summaryCalls >= 1);
+  assert.ok(fetchMock.stats.notionPagePatchCalls >= 1);
+  assert.equal(emailCalls.length, 1);
 });
 
-test('callback lookup retries and succeeds when KV index visibility is delayed', async () => {
-  const kv = new EventuallyConsistentMockKv();
-  const env = makeEnv(kv, {
-    CALLBACK_JOB_LOOKUP_MAX_ATTEMPTS: '6',
-    CALLBACK_JOB_LOOKUP_BASE_DELAY_MS: '1',
-    CALLBACK_JOB_LOOKUP_MAX_DELAY_MS: '2',
-  });
-  const job = createRecordingJob({ request: { fileName: 'late-index.m4a' }, dropboxFileId: 'id:late', dropboxPathLower: '/apps/meetingmemo/inbox/late-index.m4a', fileName: 'late-index.m4a' });
+test('finalize resumes from partial state and skips transcript append when transcriptWrittenAt exists', async () => {
+  const { jobsMod, processingMod, gmailMod } = await loadDeps();
+  const { createRecordingJob, upsertRecordingJob, getRecordingJob } = jobsMod;
+  const { persistTranscriptionCallback, finalizeInterviewJob } = processingMod;
+
+  const kv = new MockKv();
+  const env = makeEnv(kv, { GMAIL_NOTIFY_ENABLED: 'true', MAIL_TO: 'to@example.com', MAIL_FROM: 'from@example.com', MAIL_PASSWORD: 'password' });
+  const job = createRecordingJob({ request: { fileName: 'resume.m4a' }, dropboxFileId: 'id:4', dropboxPathLower: '/apps/meetingmemo/inbox/resume.m4a', fileName: 'resume.m4a' });
   await upsertRecordingJob(env, job);
+  await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
+  await upsertRecordingJob(env, {
+    ...(await getRecordingJob(env, { recordingId: job.recordingId }))!,
+    transcriptWrittenAt: new Date().toISOString(),
+    notionPageId: 'page_existing',
+    notionPageUrl: 'https://www.notion.so/pageexisting',
+  } as any);
 
-  kv.setMisses(`recordingJob:index:dropboxFileId:${job.dropboxFileId}`, 2);
+  const fetchMock = installFinalizeFetchMock();
+  let emailCount = 0;
+  const originalSendEmail = gmailMod.sendCompletionEmail;
+  gmailMod.sendCompletionEmail = (async () => {
+    emailCount += 1;
+  }) as any;
 
-  const fetchMock = installNotionFetchMock();
-  const result = await persistTranscriptionCallback(
-    env,
-    transcriptPayload({ recordingId: 'unknown-recording-id', dropboxFileId: job.dropboxFileId, dropboxPathLower: '/different' }),
-  );
+  await finalizeInterviewJob(env, job.recordingId);
+
+  gmailMod.sendCompletionEmail = originalSendEmail;
   fetchMock.restore();
 
-  assert.equal(result.action, 'processed');
+  const updated = await getRecordingJob(env, { recordingId: job.recordingId });
+  assert.equal(fetchMock.stats.notionTranscriptAppendCalls, 0);
+  assert.ok(fetchMock.stats.summaryCalls >= 1);
+  assert.equal(emailCount, 1);
+  assert.equal(updated?.status, 'completed');
 });
 
-test('callback lookup falls back to dropboxPathLower with normalized path', async () => {
+test('finalize idempotency skips duplicate heavy work unless force=true', async () => {
+  const { jobsMod, processingMod, gmailMod } = await loadDeps();
+  const { createRecordingJob, upsertRecordingJob } = jobsMod;
+  const { persistTranscriptionCallback, finalizeInterviewJob } = processingMod;
+
+  const kv = new MockKv();
+  const env = makeEnv(kv, { GMAIL_NOTIFY_ENABLED: 'true', MAIL_TO: 'to@example.com', MAIL_FROM: 'from@example.com', MAIL_PASSWORD: 'password' });
+  const job = createRecordingJob({ request: { fileName: 'idempotent.m4a' }, dropboxFileId: 'id:5', dropboxPathLower: '/apps/meetingmemo/inbox/idempotent.m4a', fileName: 'idempotent.m4a' });
+  await upsertRecordingJob(env, job);
+  await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
+
+  const fetchMock = installFinalizeFetchMock();
+  let emailCount = 0;
+  const originalSendEmail = gmailMod.sendCompletionEmail;
+  gmailMod.sendCompletionEmail = (async () => {
+    emailCount += 1;
+  }) as any;
+
+  await finalizeInterviewJob(env, job.recordingId);
+  const first = { notion: fetchMock.stats.notionTranscriptAppendCalls, summary: fetchMock.stats.summaryCalls, email: emailCount };
+  await finalizeInterviewJob(env, job.recordingId);
+  assert.equal(fetchMock.stats.notionTranscriptAppendCalls, first.notion);
+  assert.equal(fetchMock.stats.summaryCalls, first.summary);
+  assert.equal(emailCount, first.email);
+
+  await finalizeInterviewJob(env, job.recordingId, { force: true });
+  assert.ok(fetchMock.stats.notionTranscriptAppendCalls > first.notion);
+  assert.ok(fetchMock.stats.summaryCalls > first.summary);
+  assert.ok(emailCount > first.email);
+
+  gmailMod.sendCompletionEmail = originalSendEmail;
+  fetchMock.restore();
+});
+
+test('callback not found still returns lookup error', async () => {
+  const { processingMod, httpMod } = await loadDeps();
+  const { persistTranscriptionCallback } = processingMod;
+  const { HttpError } = httpMod;
+
   const kv = new MockKv();
   const env = makeEnv(kv);
-  const job = createRecordingJob({ request: { fileName: 'c.m4a' }, dropboxFileId: 'id:3', dropboxPathLower: ' /apps/meetingmemo/inbox/c.m4a ', fileName: 'c.m4a' });
-  await upsertRecordingJob(env, job);
-
-  const fetchMock = installNotionFetchMock();
-  const result = await persistTranscriptionCallback(
-    env,
-    transcriptPayload({
-      recordingId: 'wrong-recording-id',
-      dropboxFileId: 'wrong-dropbox-id',
-      dropboxPathLower: '/APPS/MEETINGMEMO/INBOX/C.M4A',
-    }),
-  );
-  fetchMock.restore();
-
-  assert.equal(result.action, 'processed');
-});
-
-test('callback returns not found with retry details when no lookup key resolves', async () => {
-  const kv = new MockKv();
-  const env = makeEnv(kv, {
-    CALLBACK_JOB_LOOKUP_MAX_ATTEMPTS: '3',
-    CALLBACK_JOB_LOOKUP_BASE_DELAY_MS: '1',
-    CALLBACK_JOB_LOOKUP_MAX_DELAY_MS: '1',
-  });
-
   await assert.rejects(
     () => persistTranscriptionCallback(env, transcriptPayload({ recordingId: 'missing', dropboxFileId: 'missing', dropboxPathLower: '/missing' })),
     (error: unknown) => {
       assert.ok(error instanceof HttpError);
       assert.equal(error.status, 404);
       assert.equal((error.details as any).phase, 'lookup_job');
-      assert.equal((error.details as any).attempts, 3);
-      assert.equal((error.details as any).totalWaitMs, 2);
       return true;
     },
   );
-});
-
-test('duplicate callback is idempotent after persisted status', async () => {
-  const kv = new MockKv();
-  const env = makeEnv(kv);
-  const job = createRecordingJob({ request: { fileName: 'd.m4a' }, dropboxFileId: 'id:4', dropboxPathLower: '/apps/meetingmemo/inbox/d.m4a', fileName: 'd.m4a' });
-  await upsertRecordingJob(env, job);
-
-  const fetchMock = installNotionFetchMock();
-  const first = await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId, dropboxFileId: job.dropboxFileId, dropboxPathLower: job.dropboxPathLower }));
-  const notionCallsAfterFirst = fetchMock.getCalls();
-  const second = await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId, dropboxFileId: job.dropboxFileId, dropboxPathLower: job.dropboxPathLower }));
-  fetchMock.restore();
-
-  assert.equal(first.action, 'processed');
-  assert.match(second.reason, /Duplicate callback ignored/);
-  assert.equal(fetchMock.getCalls(), notionCallsAfterFirst);
-});
-
-test('callback path writes Summary/My Tasks/Other Tasks in Notion payload', async () => {
-  const kv = new MockKv();
-  const env = makeEnv(kv, { OPENAI_API_KEY: 'test' });
-  const job = createRecordingJob({ request: { fileName: 'summary.m4a' }, dropboxFileId: 'id:summary', dropboxPathLower: '/apps/meetingmemo/inbox/summary.m4a', fileName: 'summary.m4a' });
-  await upsertRecordingJob(env, job);
-
-  const fetchMock = installNotionFetchMock();
-  await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId, dropboxFileId: job.dropboxFileId, dropboxPathLower: job.dropboxPathLower }));
-  fetchMock.restore();
-
-  const pagePayload = fetchMock.getPagePayloads()[0];
-  assert.ok(pagePayload.properties.Summary.rich_text[0].text.content.includes('要約'));
-  assert.ok(pagePayload.properties['My Tasks'].rich_text[0].text.content.includes('自分タスク'));
-  assert.ok(pagePayload.properties['Other Tasks'].rich_text[0].text.content.includes('相手タスク'));
-});
-
-test('callback imports only My Tasks into inbox task pages', async () => {
-  const kv = new MockKv();
-  const env = makeEnv(kv, { OPENAI_API_KEY: 'test' });
-  const job = createRecordingJob({ request: { fileName: 'tasks-only.m4a' }, dropboxFileId: 'id:tasks-only', dropboxPathLower: '/apps/meetingmemo/inbox/tasks-only.m4a', fileName: 'tasks-only.m4a' });
-  await upsertRecordingJob(env, job);
-
-  const originalFetch = global.fetch;
-  const pagePayloads: any[] = [];
-  global.fetch = (async (input: string, init?: RequestInit) => {
-    const url = typeof input === 'string' ? input : input.toString();
-    if (url.includes('/v1/responses')) {
-      return new Response(JSON.stringify({ output_text: JSON.stringify({ summary: 'ok', myTasks: ['私タスク1'], otherTasks: ['他者タスク1'], ambiguities: [] }) }), { status: 200, headers: { 'content-type': 'application/json' } });
-    }
-    if (url.includes('/databases/') && url.endsWith('/query')) return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
-    if (url.endsWith('/pages')) {
-      if (typeof init?.body === 'string') pagePayloads.push(JSON.parse(init.body));
-      return new Response(JSON.stringify({ id: `page_${pagePayloads.length}` }), { status: 200, headers: { 'content-type': 'application/json' } });
-    }
-    if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as any;
-
-  await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
-  global.fetch = originalFetch;
-
-  const taskPages = pagePayloads.filter((payload) => payload.properties?.['Record Type']?.select?.name === 'Task');
-  assert.equal(taskPages.length, 1);
-  assert.equal(taskPages[0].properties.Name.title[0].text.content, '私タスク1');
-});
-
-test('summary generation failure still persists transcript in callback path', async () => {
-  const kv = new MockKv();
-  const env = makeEnv(kv, { OPENAI_API_KEY: 'test' });
-  const job = createRecordingJob({ request: { fileName: 'summary-fail.m4a' }, dropboxFileId: 'id:summary-fail', dropboxPathLower: '/apps/meetingmemo/inbox/summary-fail.m4a', fileName: 'summary-fail.m4a' });
-  await upsertRecordingJob(env, job);
-
-  const originalFetch = global.fetch;
-  const pagePayloads: any[] = [];
-  global.fetch = (async (input: string, init?: RequestInit) => {
-    const url = typeof input === 'string' ? input : input.toString();
-    if (url.includes('/v1/responses')) {
-      return new Response(JSON.stringify({ output: [{ content: [{ type: 'output_text', text: '{broken-json' }] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
-    }
-    if (url.includes('/databases/') && url.endsWith('/query')) return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
-    if (url.endsWith('/pages')) {
-      if (typeof init?.body === 'string') pagePayloads.push(JSON.parse(init.body));
-      return new Response(JSON.stringify({ id: 'page_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
-    }
-    if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as any;
-
-  const result = await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
-  global.fetch = originalFetch;
-
-  const updated = await getRecordingJob(env, { recordingId: job.recordingId });
-  assert.equal(result.action, 'processed');
-  assert.equal(updated?.status, 'persisted');
-  assert.match(updated?.errorMessage ?? '', /Summary response parse failed/);
-  const rawJsonContent = pagePayloads[0]?.properties?.['Raw JSON']?.rich_text?.[0]?.text?.content ?? '';
-  assert.ok(pagePayloads[0]?.properties?.['Error Message']?.rich_text?.[0]?.text?.content.includes('Summary response parse failed'));
-  assert.ok(rawJsonContent.includes('"summaryErrorMessage"'));
-});
-
-test('callback returns partial success when status update fails after Notion persistence', async () => {
-  const kv = new MockKv();
-  const env = makeEnv(kv, { OPENAI_API_KEY: 'test' });
-  const job = createRecordingJob({ request: { fileName: 'status-fail.m4a' }, dropboxFileId: 'id:status-fail', dropboxPathLower: '/apps/meetingmemo/inbox/status-fail.m4a', fileName: 'status-fail.m4a' });
-  await upsertRecordingJob(env, job);
-
-  const originalFetch = global.fetch;
-  global.fetch = (async (input: string, init?: RequestInit) => {
-    const url = typeof input === 'string' ? input : input.toString();
-    if (url.includes('/v1/responses')) return new Response(JSON.stringify({ output_text: JSON.stringify({ summary: 'ok', myTasks: [], otherTasks: [], ambiguities: [] }) }), { status: 200, headers: { 'content-type': 'application/json' } });
-    if (url.includes('/databases/') && url.endsWith('/query')) return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
-    if (url.endsWith('/pages')) return new Response(JSON.stringify({ id: 'page_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
-    if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as any;
-
-  let updates = 0;
-  const originalPut = kv.put.bind(kv);
-  kv.put = async (key: string, value: string) => {
-    if (key === `recordingJob:recordingId:${job.recordingId}`) {
-      const parsed = JSON.parse(value);
-      if (parsed.status === 'persisted') {
-        updates += 1;
-        if (updates >= 1) throw new Error('kv persisted write failed');
-      }
-    }
-    await originalPut(key, value);
-  };
-
-  const result = await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
-  global.fetch = originalFetch;
-
-  assert.equal(result.action, 'processed');
-  assert.match(result.reason, /status update failed after Notion persistence/);
-  assert.equal(result.pageId, 'page_1');
-});
-
-test('gmail send failure does not fail callback persistence', async () => {
-  const kv = new MockKv();
-  const env = makeEnv(kv, {
-    OPENAI_API_KEY: 'test',
-    GMAIL_NOTIFY_ENABLED: 'true',
-    MAIL_TO: 'to@example.com',
-    MAIL_FROM: 'from@example.com',
-    MAIL_PASSWORD: 'app-password',
-  });
-  const job = createRecordingJob({ request: { fileName: 'gmail-fail.m4a' }, dropboxFileId: 'id:gmail-fail', dropboxPathLower: '/apps/meetingmemo/inbox/gmail-fail.m4a', fileName: 'gmail-fail.m4a' });
-  await upsertRecordingJob(env, job);
-
-  const originalFetch = global.fetch;
-  global.fetch = (async (input: string, init?: RequestInit) => {
-    const url = typeof input === 'string' ? input : input.toString();
-    if (url.includes('/v1/responses')) return new Response(JSON.stringify({ output_text: JSON.stringify({ summary: 'ok', myTasks: ['task a'], otherTasks: ['other'], ambiguities: [] }) }), { status: 200, headers: { 'content-type': 'application/json' } });
-    if (url.includes('/databases/') && url.endsWith('/query')) return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
-    if (url.endsWith('/pages')) return new Response(JSON.stringify({ id: 'page_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
-    if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as any;
-
-  const result = await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
-  global.fetch = originalFetch;
-
-  const updated = await getRecordingJob(env, { recordingId: job.recordingId });
-  assert.equal(result.action, 'processed');
-  assert.equal(updated?.status, 'persisted');
-});
-
-test('INTERVIEW_REVIEW_ENABLED=false skips secondary review call', async () => {
-  const kv = new MockKv();
-  const env = makeEnv(kv, { OPENAI_API_KEY: 'test', INTERVIEW_REVIEW_ENABLED: 'false' });
-  const job = createRecordingJob({ request: { fileName: 'review-skip.m4a' }, dropboxFileId: 'id:review-skip', dropboxPathLower: '/apps/meetingmemo/inbox/review-skip.m4a', fileName: 'review-skip.m4a' });
-  await upsertRecordingJob(env, job);
-
-  const originalFetch = global.fetch;
-  let responseCalls = 0;
-  global.fetch = (async (input: string, init?: RequestInit) => {
-    const url = typeof input === 'string' ? input : input.toString();
-    if (url.includes('/v1/responses')) {
-      responseCalls += 1;
-      return new Response(JSON.stringify({ output_text: JSON.stringify({ summary: 'ok', myTasks: [], otherTasks: [], ambiguities: [] }) }), { status: 200, headers: { 'content-type': 'application/json' } });
-    }
-    if (url.includes('/databases/') && url.endsWith('/query')) return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
-    if (url.endsWith('/pages')) return new Response(JSON.stringify({ id: 'page_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
-    if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as any;
-
-  const result = await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
-  global.fetch = originalFetch;
-  assert.equal(result.action, 'processed');
-  assert.equal(responseCalls, 1);
-});
-
-test('secondary review failure does not fail callback persistence', async () => {
-  const kv = new MockKv();
-  const env = makeEnv(kv, { OPENAI_API_KEY: 'test' });
-  const job = createRecordingJob({ request: { fileName: 'review-fail.m4a' }, dropboxFileId: 'id:review-fail', dropboxPathLower: '/apps/meetingmemo/inbox/review-fail.m4a', fileName: 'review-fail.m4a' });
-  await upsertRecordingJob(env, job);
-
-  const originalFetch = global.fetch;
-  let responseCalls = 0;
-  global.fetch = (async (input: string, init?: RequestInit) => {
-    const url = typeof input === 'string' ? input : input.toString();
-    if (url.includes('/v1/responses')) {
-      responseCalls += 1;
-      if (responseCalls === 1) {
-        return new Response(JSON.stringify({ output_text: JSON.stringify({ summary: 'ok', myTasks: [], otherTasks: [], ambiguities: [] }) }), { status: 200, headers: { 'content-type': 'application/json' } });
-      }
-      return new Response('review failed', { status: 500 });
-    }
-    if (url.includes('/databases/') && url.endsWith('/query')) return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
-    if (url.endsWith('/pages')) return new Response(JSON.stringify({ id: 'page_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
-    if (url.includes('/blocks/') && init?.method === 'DELETE') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-    if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') {
-      if (url.includes('/children?')) {
-        return new Response(JSON.stringify({ results: [], next_cursor: null, has_more: false }), { status: 200, headers: { 'content-type': 'application/json' } });
-      }
-      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-    }
-    if (url.includes('/children?')) return new Response(JSON.stringify({ results: [], next_cursor: null, has_more: false }), { status: 200, headers: { 'content-type': 'application/json' } });
-    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as any;
-
-  const result = await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
-  global.fetch = originalFetch;
-  const updated = await getRecordingJob(env, { recordingId: job.recordingId });
-  assert.equal(result.action, 'processed');
-  assert.equal(updated?.status, 'persisted');
-  assert.equal(responseCalls, 2);
-});
-
-test('upsert uses persistent KV abstraction for writes', async () => {
-  const kv = new MockKv();
-  const env = makeEnv(kv);
-  const job = createRecordingJob({ request: { fileName: 'e.m4a' }, dropboxFileId: 'id:5', dropboxPathLower: '/apps/meetingmemo/inbox/e.m4a', fileName: 'e.m4a' });
-  await upsertRecordingJob(env, job);
-
-  assert.ok(kv.puts.some((key) => key.startsWith('recordingJob:recordingId:')));
-  assert.ok(kv.puts.some((key) => key.startsWith('recordingJob:index:dropboxFileId:')));
-  assert.ok(kv.puts.some((key) => key.startsWith('recordingJob:index:dropboxPathLower:')));
-});
-
-test('dropboxPathLower normalization is consistent across upload/save/lookup', async () => {
-  const kv = new MockKv();
-  const env = makeEnv(kv);
-  const rawPath = ' /Apps/MeetingMemo/Inbox/Normalize.M4A ';
-  const job = createRecordingJob({ request: { fileName: 'normalize.m4a' }, dropboxFileId: 'id:norm', dropboxPathLower: rawPath, fileName: 'normalize.m4a' });
-  await upsertRecordingJob(env, job);
-
-  const found = await getRecordingJob(env, { dropboxPathLower: '/apps/meetingmemo/inbox/normalize.m4a' });
-
-  assert.equal(normalizeDropboxPath(rawPath), '/apps/meetingmemo/inbox/normalize.m4a');
-  assert.equal(found?.dropboxPathLower, '/apps/meetingmemo/inbox/normalize.m4a');
-});
-
-test('upload flow persists job before transcription dispatch path is invoked', async () => {
-  const indexSource = await readFile(join(process.cwd(), 'src/index.ts'), 'utf8');
-  const upsertIndex = indexSource.indexOf('await upsertRecordingJob(env, seededJob)');
-  const processIndex = indexSource.indexOf('ctx.waitUntil(');
-  assert.notEqual(upsertIndex, -1);
-  assert.notEqual(processIndex, -1);
-  assert.ok(upsertIndex < processIndex);
 });

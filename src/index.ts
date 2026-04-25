@@ -11,7 +11,7 @@ import { HttpError, jsonResponse, parseJson } from './lib/http';
 import { processInterviewFromMetadata } from './lib/interviews';
 import { createRecordingJob, findRecordingJobWithSource, getRecordingJob, getRecordingJobStorageMeta, normalizeDropboxPath, shouldSkipProcessingForExistingJob, upsertRecordingJob } from './lib/jobs';
 import { logEvent } from './lib/logger';
-import { persistTranscriptionCallback, processUploadedInterview } from './lib/processing';
+import { finalizeInterviewJob, getInterviewJobStatus, persistTranscriptionCallback, processUploadedInterview, resendInterviewEmail } from './lib/processing';
 import { requireWebhookSecret } from './lib/security';
 import type { Env, IntakeRequest, RecordingJobCallbackPayload, ScanRequest, UploadRequestMetadata } from './types';
 
@@ -270,27 +270,41 @@ async function handleUpload(request: Request, env: Env, ctx: ExecutionContext): 
   }
 }
 
-async function handleTranscriptionCallback(request: Request, env: Env): Promise<Response> {
-  requireWebhookSecret(request, env.INTERVIEW_WEBHOOK_SECRET);
-  let payload: RecordingJobCallbackPayload;
+async function handleTranscriptionCallback(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   try {
-    payload = await parseJson<RecordingJobCallbackPayload>(request);
+    requireWebhookSecret(request, env.INTERVIEW_WEBHOOK_SECRET);
   } catch (error) {
-    logEvent('error', 'transcription callback failed', {
-      phase: 'parse_payload',
-      details: error instanceof HttpError ? error.details : error,
-      stack: error instanceof Error ? error.stack : undefined,
-    });
+    logEvent('error', 'callback_auth_failed', { details: error instanceof Error ? error.message : String(error) });
     throw error;
   }
-  logEvent('info', 'transcription callback received', {
-    recordingId: payload.recordingId ?? null,
-    dropboxFileId: payload.dropboxFileId ?? null,
-    path: payload.dropboxPathLower ?? null,
-  });
+  let payload: RecordingJobCallbackPayload;
+  try {
+    logEvent('info', 'callback_received', { path: '/api/interviews/transcription-callback' });
+    payload = await parseJson<RecordingJobCallbackPayload>(request);
+    logEvent('info', 'callback_payload_validated', {
+      recordingId: payload.recordingId ?? null,
+      fileName: payload.fileName ?? null,
+      dropboxFileId: payload.dropboxFileId ?? null,
+      dropboxPathLower: payload.dropboxPathLower ?? null,
+    });
+  } catch (error) {
+    logEvent('error', 'callback_payload_invalid', { details: error instanceof HttpError ? error.details : error });
+    throw error;
+  }
   try {
     const result = await persistTranscriptionCallback(env, payload);
-    return jsonResponse({ ok: result.action !== 'error', action: result.action, reason: result.reason, pageId: result.pageId, created: result.created });
+    if (payload.recordingId) {
+      ctx.waitUntil(
+        finalizeInterviewJob(env, payload.recordingId, { force: false }).catch((error) => {
+          logEvent('error', 'finalize_failed', {
+            recordingId: payload.recordingId,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }),
+      );
+    }
+    logEvent('info', 'callback_ack_returned', { recordingId: payload.recordingId ?? null, status: 202 });
+    return jsonResponse({ ok: result.action !== 'error', action: result.action, reason: result.reason }, { status: 202 });
   } catch (error) {
     logEvent('error', 'transcription callback failed', {
       phase: error instanceof HttpError ? ((error.details as { phase?: string } | undefined)?.phase ?? 'unknown') : 'unknown',
@@ -302,6 +316,29 @@ async function handleTranscriptionCallback(request: Request, env: Env): Promise<
     });
     throw error;
   }
+}
+
+async function handleFinalize(request: Request, env: Env): Promise<Response> {
+  requireWebhookSecret(request, env.INTERVIEW_WEBHOOK_SECRET);
+  const body = await parseJson<{ recordingId: string; force?: boolean }>(request);
+  const result = await finalizeInterviewJob(env, body.recordingId, { force: body.force === true });
+  return jsonResponse({ ok: result.ok, status: result.status, recordingId: body.recordingId });
+}
+
+async function handleResendEmail(request: Request, env: Env): Promise<Response> {
+  requireWebhookSecret(request, env.INTERVIEW_WEBHOOK_SECRET);
+  const body = await parseJson<{ recordingId: string; force?: boolean }>(request);
+  const result = await resendInterviewEmail(env, body.recordingId, body.force !== false);
+  return jsonResponse({ ok: result.ok, status: result.status, recordingId: body.recordingId });
+}
+
+async function handleJobStatus(request: Request, env: Env): Promise<Response> {
+  requireWebhookSecret(request, env.INTERVIEW_WEBHOOK_SECRET);
+  const url = new URL(request.url);
+  const recordingId = url.searchParams.get('recordingId');
+  if (!recordingId) throw new HttpError('recordingId query parameter is required.', 400);
+  const status = await getInterviewJobStatus(env, recordingId);
+  return jsonResponse({ ok: true, ...status });
 }
 
 async function handleDebugDropbox(request: Request, env: Env): Promise<Response> {
@@ -323,7 +360,10 @@ export default {
       if (request.method === 'POST' && url.pathname === '/api/interviews/intake') return await handleIntake(request, env);
       if (request.method === 'POST' && url.pathname === '/api/interviews/scan') return await handleScan(request, env);
       if (request.method === 'POST' && url.pathname === '/api/interviews/upload') return await handleUpload(request, env, ctx);
-      if (request.method === 'POST' && url.pathname === '/api/interviews/transcription-callback') return await handleTranscriptionCallback(request, env);
+      if (request.method === 'POST' && url.pathname === '/api/interviews/transcription-callback') return await handleTranscriptionCallback(request, env, ctx);
+      if (request.method === 'POST' && url.pathname === '/api/interviews/finalize') return await handleFinalize(request, env);
+      if (request.method === 'POST' && url.pathname === '/api/interviews/resend-email') return await handleResendEmail(request, env);
+      if (request.method === 'GET' && url.pathname === '/api/interviews/job-status') return await handleJobStatus(request, env);
       if (request.method === 'GET' && url.pathname === '/api/interviews/debug-dropbox') return await handleDebugDropbox(request, env);
       if (request.method === 'GET' && url.pathname === '/health') return jsonResponse({ ok: true, env: env.APP_ENV ?? 'unknown' });
       return jsonResponse({ ok: false, message: 'Not Found' }, { status: 404 });

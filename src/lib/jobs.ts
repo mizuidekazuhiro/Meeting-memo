@@ -28,8 +28,8 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-const NON_REPROCESSABLE_STATUSES: ReadonlySet<RecordingJobStatus> = new Set(['queued', 'transcoding', 'transcribing', 'transcribed', 'persisted']);
-const TERMINAL_STATUSES: ReadonlySet<RecordingJobStatus> = new Set(['persisted', 'failed']);
+const NON_REPROCESSABLE_STATUSES: ReadonlySet<RecordingJobStatus> = new Set(['queued', 'transcoding', 'transcribing', 'transcribed', 'callback_received', 'finalizing', 'completed', 'persisted']);
+const TERMINAL_STATUSES: ReadonlySet<RecordingJobStatus> = new Set(['completed', 'persisted', 'failed', 'callback_failed']);
 
 export function isTerminalRecordingJobStatus(status: RecordingJobStatus): boolean {
   return TERMINAL_STATUSES.has(status);

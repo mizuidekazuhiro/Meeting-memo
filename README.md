@@ -253,3 +253,62 @@ Python API 実行環境には `ffmpeg` と `ffprobe` が必要です。
   - auth
   - chunk plan
   - merge order
+
+## Callback/Finalize 復旧フロー（2026-04 更新）
+
+### 新しい設計
+
+- `/api/interviews/transcription-callback` は **軽量受信専用**（認証・payload検証・job state保存・`202 Accepted` 返却）
+- Notion追記 / Summary / 2次レビュー / メール送信は `finalizeInterviewJob` で非同期実行
+- callback受信後は `ctx.waitUntil(finalizeInterviewJob(...))` で後続処理を起動
+- 手動復旧API:
+  - `POST /api/interviews/finalize` `{ "recordingId": "...", "force": false }`
+  - `POST /api/interviews/resend-email` `{ "recordingId": "...", "force": true }`
+  - `GET /api/interviews/job-status?recordingId=...`
+- Railway(Python) 手動callback再送API:
+  - `POST /jobs/{recordingId}/callback/retry`
+
+### ケース1: Railwayでcallback timeoutが出たがNotionには追加されている
+
+確認:
+- Workerログに `callback_received`
+- `notion_transcript_append_completed`
+- `summary_generation_completed`
+- `email_send_completed` または `email_send_failed`
+
+対応:
+- `POST /api/interviews/finalize` を `recordingId` 指定で実行
+
+### ケース2: NotionにTranscriptはあるがSummaryがない
+
+対応:
+- `POST /api/interviews/finalize`
+- `summary_generation_failed` ログ確認
+
+### ケース3: Summaryはあるがメールが届かない
+
+対応:
+- `email_send_failed` / `email_skipped_missing_config` を確認
+- メール環境変数を確認
+- `POST /api/interviews/resend-email` を実行
+
+### ケース4: callbackログがCloudflare側に見えない
+
+確認:
+- Railway側 callbackUrl
+- `INTERVIEW_WEBHOOK_SECRET`
+- Worker route
+- `/api/interviews/transcription-callback` のデプロイ有無
+
+### ケース5: callback_failed の録音を復旧したい
+
+対応:
+- Railway側 `POST /jobs/{recordingId}/callback/retry`
+- すでにNotionにTranscriptがある場合は Worker側 `POST /api/interviews/finalize`
+
+### Python callback retry / timeout 設定
+
+- `CALLBACK_CONNECT_TIMEOUT_SEC`（既定: 10秒）
+- `CALLBACK_READ_TIMEOUT_SEC`（既定: 60秒）
+- callback送信は `0s -> 10s -> 30s -> 60s` の指数バックオフで再試行
+- 全失敗時は completed 扱いにせず、`transcribed_callback_failed` 状態で保持

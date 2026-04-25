@@ -164,6 +164,10 @@ export type RecordingJobStatus =
   | 'transcoding'
   | 'transcribing'
   | 'transcribed'
+  | 'callback_received'
+  | 'finalizing'
+  | 'completed'
+  | 'callback_failed'
   | 'persisted'
   | 'failed';
 
@@ -182,11 +186,20 @@ export interface RecordingJob {
   clientModified?: string;
   serverModified?: string;
   request: IntakeRequest;
-  callbackStatus?: 'pending' | 'received' | 'persisted' | 'failed';
+  callbackStatus?: 'pending' | 'received' | 'persisted' | 'succeeded' | 'failed';
   transcriptionRequestMetadata?: Record<string, unknown>;
   transcript?: TranscriptResult;
   errorMessage?: string;
   notificationSentAt?: string;
+  callbackReceivedAt?: string;
+  transcriptWrittenAt?: string;
+  summaryWrittenAt?: string;
+  reviewCompletedAt?: string;
+  emailSentAt?: string;
+  finalizeStatus?: 'pending' | 'running' | 'completed' | 'failed';
+  lastError?: string;
+  notionPageId?: string;
+  notionPageUrl?: string;
 }
 
 export interface RecordingJobCallbackPayload {
