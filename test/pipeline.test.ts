@@ -80,6 +80,12 @@ test('forcePythonTranscription option bypasses Workers direct transcription gate
   assert.notEqual(processingSource.indexOf('!options.forcePythonTranscription && shouldAttemptDirectWorkerTranscription(metadata, durationSec)'), -1);
 });
 
+test('post-persist flow keeps email path even if My Tasks import fails', async () => {
+  const processingSource = await readFile(join(process.cwd(), 'src/lib/processing.ts'), 'utf8');
+  assert.notEqual(processingSource.indexOf('logEvent(\'warn\', \'my task import failed\''), -1);
+  assert.notEqual(processingSource.indexOf('await sendCompletionEmail(env, {'), -1);
+});
+
 test('python api transcript merge preserves chunkIndex order and offsets', () => {
   const merged = mergeTranscriptResultsInOrder([
     { chunkIndex: 1, startOffsetMs: 600000, transcript: { fullText: 'second', segments: [{ speaker: 'spk2', startMs: 0, endMs: 1000, text: 'second' }], raw: { idx: 1 } } },
