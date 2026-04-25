@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import { Blob } from 'node:buffer';
 
-import { createChunkPlan, validateChunk, transcribeWithDiarization, buildChunkLogMeta, summarizeInterview, normalizeAudioMimeType } from '../src/lib/openai';
+import { createChunkPlan, validateChunk, transcribeWithDiarization, buildChunkLogMeta, summarizeInterview, normalizeAudioMimeType, reviewInterviewWithWebSearch } from '../src/lib/openai';
 import { HttpError } from '../src/lib/http';
 
 const env = { OPENAI_API_KEY: 'test' } as any;
@@ -370,4 +370,67 @@ test('summarizeInterview throws parse error when summary json is invalid', async
     /Summary response parse failed/,
   );
   global.fetch = originalFetch;
+});
+
+test('reviewInterviewWithWebSearch returns structured output JSON', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = (async () => new Response(JSON.stringify({
+    output_text: JSON.stringify({
+      finalMemoMarkdown: 'final',
+      correctedTermsMarkdown: 'terms',
+      summaryForEmail: 'summary',
+      uncertainItemsMarkdown: 'uncertain',
+      nextActionsMarkdown: 'actions',
+      humanCheckRequired: true,
+      humanCheckReason: '要確認理由',
+      myTasks: ['m1'],
+      otherTasks: ['o1'],
+      sourceUrls: ['https://example.com'],
+    }),
+  }), { status: 200, headers: { 'content-type': 'application/json' } })) as any;
+
+  const result = await reviewInterviewWithWebSearch(env, {
+    transcript: { fullText: 'text', segments: [], raw: { source: true } },
+    insights: { summary: 's', myTasks: [], otherTasks: [], ambiguities: [], raw: {} },
+  });
+  global.fetch = originalFetch;
+
+  assert.equal(result.finalMemoMarkdown, 'final');
+  assert.equal(result.humanCheckRequired, true);
+  assert.deepEqual(result.sourceUrls, ['https://example.com']);
+});
+
+test('reviewInterviewWithWebSearch uses OPENAI_MODEL_REVIEW first', async () => {
+  const originalFetch = global.fetch;
+  let model = '';
+  global.fetch = (async (_input: string, init?: RequestInit) => {
+    const body = typeof init?.body === 'string' ? JSON.parse(init.body) : {};
+    model = body.model;
+    return new Response(JSON.stringify({ output_text: JSON.stringify({
+      finalMemoMarkdown: '', correctedTermsMarkdown: '', summaryForEmail: '', uncertainItemsMarkdown: '', nextActionsMarkdown: '', humanCheckRequired: false, humanCheckReason: '', myTasks: [], otherTasks: [], sourceUrls: [],
+    }) }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+
+  await reviewInterviewWithWebSearch({ OPENAI_API_KEY: 'test', OPENAI_MODEL_REVIEW: 'gpt-5.4-mini' } as any, {
+    transcript: { fullText: 'text', segments: [], raw: {} },
+  });
+  global.fetch = originalFetch;
+  assert.equal(model, 'gpt-5.4-mini');
+});
+
+test('reviewInterviewWithWebSearch disables web search tool when configured false', async () => {
+  const originalFetch = global.fetch;
+  let tools: unknown[] = [];
+  global.fetch = (async (_input: string, init?: RequestInit) => {
+    const body = typeof init?.body === 'string' ? JSON.parse(init.body) : {};
+    tools = body.tools;
+    return new Response(JSON.stringify({ output_text: JSON.stringify({
+      finalMemoMarkdown: '', correctedTermsMarkdown: '', summaryForEmail: '', uncertainItemsMarkdown: '', nextActionsMarkdown: '', humanCheckRequired: false, humanCheckReason: '', myTasks: [], otherTasks: [], sourceUrls: [],
+    }) }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+  await reviewInterviewWithWebSearch({ OPENAI_API_KEY: 'test', INTERVIEW_REVIEW_WEB_SEARCH_ENABLED: 'false' } as any, {
+    transcript: { fullText: 'text', segments: [], raw: {} },
+  });
+  global.fetch = originalFetch;
+  assert.deepEqual(tools, []);
 });

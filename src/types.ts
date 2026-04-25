@@ -19,6 +19,9 @@ export interface Env {
   OPENAI_API_KEY: string;
   OPENAI_MODEL_TRANSCRIBE?: string;
   OPENAI_MODEL_SUMMARIZE?: string;
+  OPENAI_MODEL_REVIEW?: string;
+  INTERVIEW_REVIEW_ENABLED?: string;
+  INTERVIEW_REVIEW_WEB_SEARCH_ENABLED?: string;
   PYTHON_TRANSCRIBE_API_URL?: string;
   PYTHON_TRANSCRIBE_API_TOKEN?: string;
   WORKERS_CALLBACK_BASE_URL?: string;
@@ -110,6 +113,20 @@ export interface InterviewInsights {
   myTasks: string[];
   otherTasks: string[];
   ambiguities: string[];
+  raw: unknown;
+}
+
+export interface InterviewReviewResult {
+  finalMemoMarkdown: string;
+  correctedTermsMarkdown: string;
+  summaryForEmail: string;
+  uncertainItemsMarkdown: string;
+  nextActionsMarkdown: string;
+  humanCheckRequired: boolean;
+  humanCheckReason: string;
+  myTasks: string[];
+  otherTasks: string[];
+  sourceUrls: string[];
   raw: unknown;
 }
 

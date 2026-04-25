@@ -337,6 +337,70 @@ test('gmail send failure does not fail callback persistence', async () => {
   assert.equal(updated?.status, 'persisted');
 });
 
+test('INTERVIEW_REVIEW_ENABLED=false skips secondary review call', async () => {
+  const kv = new MockKv();
+  const env = makeEnv(kv, { OPENAI_API_KEY: 'test', INTERVIEW_REVIEW_ENABLED: 'false' });
+  const job = createRecordingJob({ request: { fileName: 'review-skip.m4a' }, dropboxFileId: 'id:review-skip', dropboxPathLower: '/apps/meetingmemo/inbox/review-skip.m4a', fileName: 'review-skip.m4a' });
+  await upsertRecordingJob(env, job);
+
+  const originalFetch = global.fetch;
+  let responseCalls = 0;
+  global.fetch = (async (input: string, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url.includes('/v1/responses')) {
+      responseCalls += 1;
+      return new Response(JSON.stringify({ output_text: JSON.stringify({ summary: 'ok', myTasks: [], otherTasks: [], ambiguities: [] }) }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/databases/') && url.endsWith('/query')) return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.endsWith('/pages')) return new Response(JSON.stringify({ id: 'page_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+
+  const result = await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
+  global.fetch = originalFetch;
+  assert.equal(result.action, 'processed');
+  assert.equal(responseCalls, 1);
+});
+
+test('secondary review failure does not fail callback persistence', async () => {
+  const kv = new MockKv();
+  const env = makeEnv(kv, { OPENAI_API_KEY: 'test' });
+  const job = createRecordingJob({ request: { fileName: 'review-fail.m4a' }, dropboxFileId: 'id:review-fail', dropboxPathLower: '/apps/meetingmemo/inbox/review-fail.m4a', fileName: 'review-fail.m4a' });
+  await upsertRecordingJob(env, job);
+
+  const originalFetch = global.fetch;
+  let responseCalls = 0;
+  global.fetch = (async (input: string, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url.includes('/v1/responses')) {
+      responseCalls += 1;
+      if (responseCalls === 1) {
+        return new Response(JSON.stringify({ output_text: JSON.stringify({ summary: 'ok', myTasks: [], otherTasks: [], ambiguities: [] }) }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response('review failed', { status: 500 });
+    }
+    if (url.includes('/databases/') && url.endsWith('/query')) return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.endsWith('/pages')) return new Response(JSON.stringify({ id: 'page_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/blocks/') && init?.method === 'DELETE') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') {
+      if (url.includes('/children?')) {
+        return new Response(JSON.stringify({ results: [], next_cursor: null, has_more: false }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/children?')) return new Response(JSON.stringify({ results: [], next_cursor: null, has_more: false }), { status: 200, headers: { 'content-type': 'application/json' } });
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+
+  const result = await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
+  global.fetch = originalFetch;
+  const updated = await getRecordingJob(env, { recordingId: job.recordingId });
+  assert.equal(result.action, 'processed');
+  assert.equal(updated?.status, 'persisted');
+  assert.equal(responseCalls, 2);
+});
+
 test('upsert uses persistent KV abstraction for writes', async () => {
   const kv = new MockKv();
   const env = makeEnv(kv);

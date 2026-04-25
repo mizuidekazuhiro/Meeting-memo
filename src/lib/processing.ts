@@ -5,8 +5,9 @@ import { getCompletionEmailConfig, sendCompletionEmail, shouldSendCompletionEmai
 import { HttpError } from './http';
 import { findRecordingJobWithSource, getRecordingJob, getRecordingJobStorageMeta, markJobFailed, normalizeDropboxPath, shouldSkipProcessingForExistingJob, updateRecordingJobStatus } from './jobs';
 import { logEvent } from './logger';
-import { importMyTasksToInbox, upsertInterviewFromTranscript } from './notion';
-import { inspectAudioSource, MAX_TRANSCRIBE_DURATION_SEC, summarizeInterview, transcribeWithDiarization } from './openai';
+import { appendInterviewReviewFailureToNotionPage, appendReviewedMemoToNotionPage, importMyTasksToInbox, updateInterviewRecordProperties, upsertInterviewFromTranscript } from './notion';
+import { inspectAudioSource, MAX_TRANSCRIBE_DURATION_SEC, reviewInterviewWithWebSearch, summarizeInterview, transcribeWithDiarization } from './openai';
+import type { InterviewReviewResult } from '../types';
 
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
@@ -53,6 +54,8 @@ async function runPostPersistTasksAndEmail(
     persisted: Awaited<ReturnType<typeof upsertInterviewFromTranscript>>;
     transcriptFullText?: string;
     summary?: string;
+    review?: InterviewReviewResult;
+    reviewError?: string;
   },
 ): Promise<void> {
   if (!params.persisted.pageId) return;
@@ -132,9 +135,16 @@ async function runPostPersistTasksAndEmail(
       summary: params.summary ?? '',
       transcript: params.transcriptFullText ?? '',
       myTasks: emailTasks,
-      fileName: params.job.fileName,
-      recordingId: params.job.recordingId,
-      completedAt,
+      review: params.review ? {
+        summaryForEmail: params.review.summaryForEmail,
+        correctedTermsMarkdown: params.review.correctedTermsMarkdown,
+        uncertainItemsMarkdown: params.review.uncertainItemsMarkdown,
+        nextActionsMarkdown: params.review.nextActionsMarkdown,
+        humanCheckRequired: params.review.humanCheckRequired,
+        humanCheckReason: params.review.humanCheckReason,
+        sourceUrls: params.review.sourceUrls,
+      } : undefined,
+      reviewError: params.reviewError,
     });
     await updateRecordingJobStatus(env, { recordingId: params.job.recordingId }, 'persisted', {
       notificationSentAt: completedAt,
@@ -162,6 +172,10 @@ async function runPostPersistTasksAndEmail(
       details: error instanceof HttpError ? error.details : error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+function shouldRunInterviewReview(env: Env): boolean {
+  return env.INTERVIEW_REVIEW_ENABLED?.toLowerCase() !== 'false';
 }
 
 export function shouldAttemptDirectWorkerTranscription(metadata: DropboxFileMetadata, durationSec: number | undefined): boolean {
@@ -315,11 +329,71 @@ export async function processUploadedInterview(
         });
         throw error;
       }
+      let reviewResult: InterviewReviewResult | undefined;
+      let reviewError: string | undefined;
+      try {
+        if (shouldRunInterviewReview(env)) {
+          reviewResult = await reviewInterviewWithWebSearch(env, {
+            transcript,
+            insights,
+            title: persisted.record.title,
+            fileName: metadata.name,
+            notionPageUrl: persisted.pageId ? buildNotionPageUrl(persisted.pageId) : undefined,
+          });
+          if (persisted.pageId) {
+            await updateInterviewRecordProperties(env, persisted.pageId, persisted.record);
+            await appendReviewedMemoToNotionPage(env, persisted.pageId, reviewResult, persisted.record);
+          }
+          persisted.record.insights = {
+            summary: reviewResult.summaryForEmail || persisted.record.insights?.summary || '',
+            myTasks: reviewResult.myTasks.length
+              ? reviewResult.myTasks
+              : persisted.record.insights?.myTasks ?? [],
+            otherTasks: reviewResult.otherTasks.length
+              ? reviewResult.otherTasks
+              : persisted.record.insights?.otherTasks ?? [],
+            ambiguities: persisted.record.insights?.ambiguities ?? [],
+            raw: {
+              ...(persisted.record.insights?.raw && typeof persisted.record.insights.raw === 'object' ? persisted.record.insights.raw as Record<string, unknown> : {}),
+              review: reviewResult.raw ?? reviewResult,
+            },
+          };
+        }
+      } catch (error) {
+        reviewError = '二次レビューは失敗しました。一次要約とTranscriptのみ保存されています。';
+        const reviewFailureMessage = '二次レビュー失敗。一次要約とTranscriptのみ保存。';
+        persisted.record.errorMessage = persisted.record.errorMessage
+          ? `${persisted.record.errorMessage}\n${reviewFailureMessage}`
+          : reviewFailureMessage;
+        logEvent('warn', 'interview review failed; continuing with primary summary', {
+          recordingId: job.recordingId,
+          fileName: job.fileName,
+          details: error instanceof HttpError ? error.details : error instanceof Error ? error.message : String(error),
+        });
+        try {
+          if (persisted.pageId) {
+            await updateInterviewRecordProperties(env, persisted.pageId, persisted.record);
+            await appendInterviewReviewFailureToNotionPage(env, persisted.pageId, {
+              message: '二次レビュー失敗。一次要約とTranscriptのみ保存。',
+              error,
+            });
+          }
+        } catch (notionError) {
+          logEvent('warn', 'failed to append review failure note to Notion', {
+            recordingId: job.recordingId,
+            fileName: job.fileName,
+            details: notionError instanceof Error ? notionError.message : String(notionError),
+          });
+        }
+      }
+
       await runPostPersistTasksAndEmail(env, {
         job,
         persisted,
         transcriptFullText: transcript.fullText,
-        summary: insights?.summary,
+        summary: persisted.record.insights?.summary ?? insights?.summary,
+        review: reviewResult,
+        reviewError,
       });
       await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'persisted', { errorMessage: summaryError });
       return {
@@ -554,11 +628,71 @@ export async function persistTranscriptionCallback(env: Env, payload: RecordingJ
     throw error;
   }
 
+  let reviewResult: InterviewReviewResult | undefined;
+  let reviewError: string | undefined;
+  try {
+    if (shouldRunInterviewReview(env)) {
+      reviewResult = await reviewInterviewWithWebSearch(env, {
+        transcript: payload.transcript,
+        insights,
+        title: persisted.record.title,
+        fileName: metadata.name,
+        notionPageUrl: persisted.pageId ? buildNotionPageUrl(persisted.pageId) : undefined,
+      });
+      if (persisted.pageId) {
+        await updateInterviewRecordProperties(env, persisted.pageId, persisted.record);
+        await appendReviewedMemoToNotionPage(env, persisted.pageId, reviewResult, persisted.record);
+      }
+      persisted.record.insights = {
+        summary: reviewResult.summaryForEmail || persisted.record.insights?.summary || '',
+        myTasks: reviewResult.myTasks.length
+          ? reviewResult.myTasks
+          : persisted.record.insights?.myTasks ?? [],
+        otherTasks: reviewResult.otherTasks.length
+          ? reviewResult.otherTasks
+          : persisted.record.insights?.otherTasks ?? [],
+        ambiguities: persisted.record.insights?.ambiguities ?? [],
+        raw: {
+          ...(persisted.record.insights?.raw && typeof persisted.record.insights.raw === 'object' ? persisted.record.insights.raw as Record<string, unknown> : {}),
+          review: reviewResult.raw ?? reviewResult,
+        },
+      };
+    }
+  } catch (error) {
+    reviewError = '二次レビューは失敗しました。一次要約とTranscriptのみ保存されています。';
+    const reviewFailureMessage = '二次レビュー失敗。一次要約とTranscriptのみ保存。';
+    persisted.record.errorMessage = persisted.record.errorMessage
+      ? `${persisted.record.errorMessage}\n${reviewFailureMessage}`
+      : reviewFailureMessage;
+    logEvent('warn', 'interview review failed; continuing with primary summary', {
+      recordingId: job.recordingId,
+      fileName: job.fileName,
+      details: error instanceof HttpError ? error.details : error instanceof Error ? error.message : String(error),
+    });
+    try {
+      if (persisted.pageId) {
+        await updateInterviewRecordProperties(env, persisted.pageId, persisted.record);
+        await appendInterviewReviewFailureToNotionPage(env, persisted.pageId, {
+          message: '二次レビュー失敗。一次要約とTranscriptのみ保存。',
+          error,
+        });
+      }
+    } catch (notionError) {
+      logEvent('warn', 'failed to append review failure note to Notion', {
+        recordingId: job.recordingId,
+        fileName: job.fileName,
+        details: notionError instanceof Error ? notionError.message : String(notionError),
+      });
+    }
+  }
+
   await runPostPersistTasksAndEmail(env, {
     job,
     persisted,
     transcriptFullText: payload.transcript.fullText,
-    summary: insights?.summary,
+    summary: persisted.record.insights?.summary ?? insights?.summary,
+    review: reviewResult,
+    reviewError,
   });
 
   logEvent('info', 'callback phase started', {

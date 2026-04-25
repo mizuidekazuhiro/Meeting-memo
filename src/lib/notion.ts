@@ -1,4 +1,4 @@
-import type { Env, InterviewRecord, NotionPageMatch, TranscriptSegment } from '../types';
+import type { Env, InterviewRecord, InterviewReviewResult, NotionPageMatch, TranscriptSegment } from '../types';
 import { HttpError } from './http';
 
 const NOTION_API = 'https://api.notion.com/v1';
@@ -6,6 +6,13 @@ const NOTION_VERSION = '2022-06-28';
 const NOTION_TEXT_LIMIT = 1900;
 const TRANSCRIPT_BLOCK_TEXT_LIMIT = 1700;
 const TRANSCRIPT_HEADING = 'Transcript';
+const REVIEW_SECTION_HEADINGS = [
+  '面談メモ（完成版）',
+  '固有名詞補正',
+  '未確定事項',
+  '次に取るべき行動',
+  'レビュー情報',
+] as const;
 
 type NotionRichText = Array<{ type: 'text'; text: { content: string } }>;
 
@@ -298,6 +305,76 @@ function collectManagedTranscriptBlockIds(children: NotionBlock[]): string[] {
   return blockIds;
 }
 
+function headingText(block: NotionBlock): string {
+  return block.heading_2?.rich_text?.map((item) => item.plain_text ?? '').join('').trim() ?? '';
+}
+
+function isManagedHeadingBlock(block: NotionBlock): boolean {
+  if (block.type !== 'heading_2') return false;
+  const text = headingText(block);
+  return REVIEW_SECTION_HEADINGS.includes(text as (typeof REVIEW_SECTION_HEADINGS)[number]) || text === TRANSCRIPT_HEADING;
+}
+
+function collectManagedReviewAndTranscriptBlockIds(children: NotionBlock[]): string[] {
+  const ids: string[] = [];
+  for (let index = 0; index < children.length; index += 1) {
+    const block = children[index];
+    if (!isManagedHeadingBlock(block)) continue;
+    ids.push(block.id);
+    for (let cursor = index + 1; cursor < children.length; cursor += 1) {
+      const next = children[cursor];
+      if (next.type === 'heading_2') break;
+      if (next.type === 'paragraph') ids.push(next.id);
+    }
+  }
+  return ids;
+}
+
+function markdownParagraphBlocks(content: string): NotionBlockInput[] {
+  const chunks = splitIntoChunks(content, TRANSCRIPT_BLOCK_TEXT_LIMIT);
+  if (!chunks.length) {
+    return [{
+      object: 'block',
+      type: 'paragraph',
+      paragraph: { rich_text: richText('なし') },
+    }];
+  }
+  return chunks.map((chunk) => ({
+    object: 'block',
+    type: 'paragraph',
+    paragraph: { rich_text: richText(chunk) },
+  }));
+}
+
+function buildReviewedMemoBlocks(reviewResult: InterviewReviewResult): NotionBlockInput[] {
+  const sourceUrls = reviewResult.sourceUrls.length
+    ? reviewResult.sourceUrls.map((url) => `- ${url}`).join('\n')
+    : '- なし';
+  const reviewInfo = [
+    `- 人間確認要否: ${reviewResult.humanCheckRequired ? '要確認' : '確認不要'}`,
+    `- 理由: ${reviewResult.humanCheckReason || 'なし'}`,
+    '- 根拠URL:',
+    sourceUrls,
+  ].join('\n');
+
+  const sections: Array<{ title: string; body: string }> = [
+    { title: '面談メモ（完成版）', body: reviewResult.finalMemoMarkdown },
+    { title: '固有名詞補正', body: reviewResult.correctedTermsMarkdown },
+    { title: '未確定事項', body: reviewResult.uncertainItemsMarkdown },
+    { title: '次に取るべき行動', body: reviewResult.nextActionsMarkdown },
+    { title: 'レビュー情報', body: reviewInfo },
+  ];
+
+  return sections.flatMap((section) => [
+    {
+      object: 'block' as const,
+      type: 'heading_2' as const,
+      heading_2: { rich_text: titleText(section.title) },
+    },
+    ...markdownParagraphBlocks(section.body),
+  ]);
+}
+
 export async function appendTranscriptBlocks(env: Env, pageId: string, record: InterviewRecord): Promise<void> {
   const blocks = buildTranscriptBlocks(record);
   if (!blocks.length) {
@@ -313,6 +390,52 @@ export async function replaceTranscriptBlocks(env: Env, pageId: string, record: 
     await deleteBlock(env, blockId);
   }
   await appendTranscriptBlocks(env, pageId, record);
+}
+
+export async function appendReviewedMemoToNotionPage(env: Env, pageId: string, reviewResult: InterviewReviewResult, record?: InterviewRecord): Promise<void> {
+  const children = await listBlockChildren(env, pageId);
+  const managedIds = collectManagedReviewAndTranscriptBlockIds(children);
+  for (const blockId of managedIds) {
+    await deleteBlock(env, blockId);
+  }
+  const transcriptRecord = record ?? {
+    title: '',
+    dedupKey: '',
+    metadata: { name: '' },
+    request: {},
+    processingStatus: 'persisted',
+    transcript: undefined,
+  } as InterviewRecord;
+  const blocks = [
+    ...buildReviewedMemoBlocks(reviewResult),
+    ...buildTranscriptBlocks(transcriptRecord),
+  ];
+  if (blocks.length) {
+    await appendBlockChildren(env, pageId, blocks);
+  }
+}
+
+export async function appendInterviewReviewFailureToNotionPage(
+  env: Env,
+  pageId: string,
+  input: { message: string; error?: unknown },
+): Promise<void> {
+  const children = await listBlockChildren(env, pageId);
+  const managedIds = collectManagedReviewAndTranscriptBlockIds(children).filter((blockId) => {
+    const block = children.find((item) => item.id === blockId);
+    return block?.type === 'heading_2' && headingText(block) !== TRANSCRIPT_HEADING;
+  });
+  for (const blockId of managedIds) {
+    await deleteBlock(env, blockId);
+  }
+
+  const details = input.error instanceof Error ? input.error.message : input.error ? String(input.error) : '';
+  const body = details ? `${input.message}\n${details}` : input.message;
+  const blocks: NotionBlockInput[] = [
+    { object: 'block', type: 'heading_2', heading_2: { rich_text: titleText('レビュー情報') } },
+    ...markdownParagraphBlocks(`二次レビュー失敗。一次要約とTranscriptのみ保存。\n${body}`),
+  ];
+  await appendBlockChildren(env, pageId, blocks);
 }
 
 export async function upsertInterviewPage(env: Env, record: InterviewRecord, existing: NotionPageMatch | null): Promise<{ pageId: string; created: boolean }> {
@@ -335,6 +458,14 @@ export async function upsertInterviewPage(env: Env, record: InterviewRecord, exi
   });
   await appendTranscriptBlocks(env, response.id, record);
   return { pageId: response.id, created: true };
+}
+
+export async function updateInterviewRecordProperties(env: Env, pageId: string, record: InterviewRecord): Promise<void> {
+  const properties = cleanProperties(buildProperties(record));
+  await notionFetch(env, `/pages/${pageId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ properties }),
+  });
 }
 
 function splitTaskCandidatesFromText(value: string): string[] {
