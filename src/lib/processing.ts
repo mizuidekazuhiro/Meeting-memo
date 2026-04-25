@@ -189,7 +189,13 @@ export async function dispatchLongAudioJob(env: Env, job: RecordingJob, metadata
   }
 }
 
-export async function processUploadedInterview(env: Env, request: IntakeRequest, metadata: DropboxFileMetadata, job: RecordingJob, options: { dryRun?: boolean } = {}): Promise<ProcessInterviewResult> {
+export async function processUploadedInterview(
+  env: Env,
+  request: IntakeRequest,
+  metadata: DropboxFileMetadata,
+  job: RecordingJob,
+  options: { dryRun?: boolean; forcePythonTranscription?: boolean } = {},
+): Promise<ProcessInterviewResult> {
   const dedupCandidates = buildDedupCandidates(request, metadata);
   const duplicateGate = shouldSkipProcessingForExistingJob(job);
   if (duplicateGate.shouldSkip) {
@@ -216,7 +222,7 @@ export async function processUploadedInterview(env: Env, request: IntakeRequest,
     durationSec = inspected.durationSec;
     await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'queued', { sourceDurationSec: durationSec, sourceBytes: inspected.bytes });
 
-    if (shouldAttemptDirectWorkerTranscription(metadata, durationSec)) {
+    if (!options.forcePythonTranscription && shouldAttemptDirectWorkerTranscription(metadata, durationSec)) {
       await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'transcribing');
       const transcript = await transcribeWithDiarization(env, audio, metadata.name, request.languageHint, {
         recordingId: job.recordingId,

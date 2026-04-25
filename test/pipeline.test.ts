@@ -1,6 +1,8 @@
 // @ts-nocheck
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import { createRecordingJob, getRecordingJob, upsertRecordingJob } from '../src/lib/jobs';
 import { shouldSkipProcessingForExistingJob } from '../src/lib/jobs';
@@ -71,6 +73,11 @@ test('short duration files stay in Workers direct path', () => {
 test('long duration files are delegated away from Workers', () => {
   assert.equal(shouldAttemptDirectWorkerTranscription({ name: 'long.m4a' }, 2707.75), false);
   assert.equal(shouldAttemptDirectWorkerTranscription({ name: 'unknown.m4a' }, undefined), false);
+});
+
+test('forcePythonTranscription option bypasses Workers direct transcription gate', async () => {
+  const processingSource = await readFile(join(process.cwd(), 'src/lib/processing.ts'), 'utf8');
+  assert.notEqual(processingSource.indexOf('!options.forcePythonTranscription && shouldAttemptDirectWorkerTranscription(metadata, durationSec)'), -1);
 });
 
 test('python api transcript merge preserves chunkIndex order and offsets', () => {
