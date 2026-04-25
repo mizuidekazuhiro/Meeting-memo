@@ -15,6 +15,8 @@ import { persistTranscriptionCallback, processUploadedInterview } from './lib/pr
 import { requireWebhookSecret } from './lib/security';
 import type { Env, IntakeRequest, RecordingJobCallbackPayload, ScanRequest, UploadRequestMetadata } from './types';
 
+type ExecutionContext = { waitUntil(promise: Promise<unknown>): void };
+
 function parseBooleanEnv(value: string | undefined, fallback: boolean): boolean {
   if (value === undefined) return fallback;
   return value.toLowerCase() === 'true';
@@ -137,7 +139,7 @@ async function handleScan(request: Request, env: Env): Promise<Response> {
   return jsonResponse({ ok: true, folderPath, scannedCount: scannedEntries.length, audioCandidateCount: audioEntries.length, processedCount, skippedCount, errorCount: 0, dryRun: scan.dryRun ?? false, mode: 'supplemental-only', results });
 }
 
-async function handleUpload(request: Request, env: Env): Promise<Response> {
+async function handleUpload(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   requireWebhookSecret(request, env.INTERVIEW_WEBHOOK_SECRET);
   const contentType = request.headers.get('content-type') ?? '';
   if (!contentType.toLowerCase().includes('multipart/form-data')) throw new HttpError('Upload endpoint requires multipart/form-data.', 415);
@@ -228,8 +230,32 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       return jsonResponse({ ok: true, action: 'skipped', reason: `Duplicate upload skipped: ${duplicateGate.reason}.`, dropboxFileId: metadata.id, dropboxPathLower: metadata.path_lower, storedFileName: metadata.name, fileSizeBytes: metadata.size, recordingId: job.recordingId, jobStatus: job.status, createdJob: created });
     }
 
-    const result = await processUploadedInterview(env, requestWithDropbox, metadata, job, { dryRun });
-    return jsonResponse({ ok: result.action !== 'error', action: result.action, reason: result.reason, pageId: result.pageId, created: result.created, dropboxFileId: metadata.id, dropboxPathLower: metadata.path_lower, storedFileName: metadata.name, fileSizeBytes: metadata.size, recordingId: job.recordingId, jobStatus: job.status, createdJob: created, dedupCandidates: result.dedupCandidates, errorMessage: result.record?.errorMessage });
+    ctx.waitUntil(
+      processUploadedInterview(env, requestWithDropbox, metadata, job, { dryRun, forcePythonTranscription: true }).catch((error) => {
+        logEvent('error', 'background upload processing failed', {
+          phase: 'background_upload_processing',
+          recordingId: job.recordingId,
+          fileName: metadata.name,
+          dropboxFileId: metadata.id,
+          dropboxPathLower: metadata.path_lower,
+          message: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+        });
+      }),
+    );
+
+    return jsonResponse({
+      ok: true,
+      action: 'queued',
+      reason: 'Upload accepted. Transcription will continue in background.',
+      dropboxFileId: metadata.id,
+      dropboxPathLower: metadata.path_lower,
+      storedFileName: metadata.name,
+      fileSizeBytes: metadata.size,
+      recordingId: job.recordingId,
+      jobStatus: 'queued',
+      createdJob: created,
+    }, { status: 202 });
   } catch (error) {
     logEvent('error', 'job creation failed', {
       requestId,
@@ -290,13 +316,13 @@ async function handleDebugDropbox(request: Request, env: Env): Promise<Response>
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
       const url = new URL(request.url);
       if (request.method === 'GET' && url.pathname === '/') return jsonResponse({ ok: true, service: 'meeting-memo' });
       if (request.method === 'POST' && url.pathname === '/api/interviews/intake') return await handleIntake(request, env);
       if (request.method === 'POST' && url.pathname === '/api/interviews/scan') return await handleScan(request, env);
-      if (request.method === 'POST' && url.pathname === '/api/interviews/upload') return await handleUpload(request, env);
+      if (request.method === 'POST' && url.pathname === '/api/interviews/upload') return await handleUpload(request, env, ctx);
       if (request.method === 'POST' && url.pathname === '/api/interviews/transcription-callback') return await handleTranscriptionCallback(request, env);
       if (request.method === 'GET' && url.pathname === '/api/interviews/debug-dropbox') return await handleDebugDropbox(request, env);
       if (request.method === 'GET' && url.pathname === '/health') return jsonResponse({ ok: true, env: env.APP_ENV ?? 'unknown' });

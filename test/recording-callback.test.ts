@@ -368,7 +368,7 @@ test('dropboxPathLower normalization is consistent across upload/save/lookup', a
 test('upload flow persists job before transcription dispatch path is invoked', async () => {
   const indexSource = await readFile(join(process.cwd(), 'src/index.ts'), 'utf8');
   const upsertIndex = indexSource.indexOf('await upsertRecordingJob(env, seededJob)');
-  const processIndex = indexSource.indexOf('await processUploadedInterview(env, requestWithDropbox, metadata, job, { dryRun })');
+  const processIndex = indexSource.indexOf('ctx.waitUntil(');
   assert.notEqual(upsertIndex, -1);
   assert.notEqual(processIndex, -1);
   assert.ok(upsertIndex < processIndex);

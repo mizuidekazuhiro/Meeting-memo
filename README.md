@@ -39,16 +39,21 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 1. Shortcut が `POST /api/interviews/upload` を呼ぶ
 2. Workers が Dropbox に保存
 3. Dropbox upload 成功 metadata（`dropboxFileId`, `dropboxPathLower`, `fileName`, `size` など）で recording job を作成
-4. Workers が duration を判定
-   - 短時間: Workers 内で既存処理を継続
-   - 長時間 / 安全判定不能: Python API へ委譲
-5. Python API が Dropbox から直接取得、`ffprobe` / `ffmpeg` で安全分割
-6. Python API が `gpt-4o-transcribe-diarize` へ `chunking_strategy` を指定して chunkIndex 順に送信
-7. Python API が transcript を chunkIndex 順で結合して Workers callback
-8. Workers が transcript 完了後に要約（summary / tasks）を生成
-9. Workers が Notion に保存（Interview Memo 本体。`Record Type=Interview Memo`）
-10. Workers が `My Tasks` のみを同一 DB（`INBOX_DB_ID`）へ 1件ずつ追加（`Record Type=Task`）
-11. Workers が Gmail API（OAuth refresh token）で完了通知メール送信
+4. `POST /api/interviews/upload` は受付専用で **202 Accepted (`action: queued`)** を即時返却（文字起こし完了は意味しない）
+5. iPhone アップロード経由の文字起こしは duration に関係なく Python API（Railway Python service）へ委譲
+6. Python API が Dropbox から直接取得、`ffprobe` / `ffmpeg` で安全分割
+7. Python API が `gpt-4o-transcribe-diarize` へ `chunking_strategy` を指定して chunkIndex 順に送信
+8. Python API が transcript を chunkIndex 順で結合して Workers callback
+9. Workers が transcript 完了後に要約（summary / tasks）を生成
+10. Workers が Notion に保存（Interview Memo 本体。`Record Type=Interview Memo`）
+11. Workers が `My Tasks` のみを同一 DB（`INBOX_DB_ID`）へ 1件ずつ追加（`Record Type=Task`）
+12. Workers が Gmail API（OAuth refresh token）で完了通知メール送信
+
+### iPhone Shortcut 側の成功判定
+
+- `/api/interviews/upload` の `action: queued` は成功扱いにしてください
+- upload レスポンスは「受付完了」であり、文字起こし完了ではありません
+- 文字起こし完了は Notion ページ作成または通知メールで確認します
 
 ### 重複防止ポリシー
 
