@@ -1,7 +1,7 @@
 import type { DropboxFileMetadata, Env, IntakeRequest, ProcessInterviewResult, RecordingJob, RecordingJobCallbackPayload } from '../types';
 import { buildDedupCandidates } from './dedup';
 import { downloadDropboxFile } from './dropbox';
-import { sendCompletionEmail, shouldSendCompletionEmail } from './gmail';
+import { getCompletionEmailConfig, sendCompletionEmail, shouldSendCompletionEmail } from './gmail';
 import { HttpError } from './http';
 import { findRecordingJobWithSource, getRecordingJob, getRecordingJobStorageMeta, markJobFailed, normalizeDropboxPath, shouldSkipProcessingForExistingJob, updateRecordingJobStatus } from './jobs';
 import { logEvent } from './logger';
@@ -109,13 +109,21 @@ async function runPostPersistTasksAndEmail(
 
   const emailTasks = imported.normalizedTasks.length ? imported.normalizedTasks : fallbackTasks;
   const completedAt = new Date().toISOString();
+  const completionMailConfig = getCompletionEmailConfig(env);
+
   logEvent('info', 'completion email send started', {
     recordingId: params.job.recordingId,
+    fileName: params.job.fileName,
     pageId: params.persisted.pageId,
+    smtpHost: completionMailConfig.smtpHost,
+    smtpPort: completionMailConfig.smtpPort,
+    toCount: completionMailConfig.to.length,
+    ccCount: completionMailConfig.cc.length,
+    bccCount: completionMailConfig.bcc.length,
   });
   try {
     await sendCompletionEmail(env, {
-      subject: `Interview Memo 完了: ${params.job.fileName}`,
+      subject: `${env.MAIL_SUBJECT_PREFIX ?? 'Interview Memo 完了'}: ${params.job.fileName}`,
       notionPageUrl: buildNotionPageUrl(params.persisted.pageId),
       summary: params.summary ?? '',
       transcript: params.transcriptFullText ?? '',
@@ -129,12 +137,24 @@ async function runPostPersistTasksAndEmail(
     });
     logEvent('info', 'completion email sent', {
       recordingId: params.job.recordingId,
+      fileName: params.job.fileName,
       pageId: params.persisted.pageId,
+      smtpHost: completionMailConfig.smtpHost,
+      smtpPort: completionMailConfig.smtpPort,
+      toCount: completionMailConfig.to.length,
+      ccCount: completionMailConfig.cc.length,
+      bccCount: completionMailConfig.bcc.length,
     });
   } catch (error) {
     logEvent('warn', 'completion email failed', {
       recordingId: params.job.recordingId,
+      fileName: params.job.fileName,
       pageId: params.persisted.pageId,
+      smtpHost: completionMailConfig.smtpHost,
+      smtpPort: completionMailConfig.smtpPort,
+      toCount: completionMailConfig.to.length,
+      ccCount: completionMailConfig.cc.length,
+      bccCount: completionMailConfig.bcc.length,
       details: error instanceof HttpError ? error.details : error instanceof Error ? error.message : String(error),
     });
   }

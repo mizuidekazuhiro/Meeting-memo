@@ -6,7 +6,8 @@ import { buildCompletionEmailMessage, shouldSendCompletionEmail } from '../src/l
 
 test('completion email body contains notion link/summary/transcript/my tasks', () => {
   const message = buildCompletionEmailMessage({
-    to: 'to@example.com',
+    to: ['to@example.com'],
+    cc: ['cc@example.com'],
     from: 'from@example.com',
     subject: 'Interview completed',
     notionPageUrl: 'https://www.notion.so/example',
@@ -18,6 +19,8 @@ test('completion email body contains notion link/summary/transcript/my tasks', (
     completedAt: '2026-04-20T00:00:00.000Z',
   });
 
+  assert.ok(message.includes('To: to@example.com'));
+  assert.ok(message.includes('Cc: cc@example.com'));
   assert.ok(message.includes('https://www.notion.so/example'));
   assert.ok(message.includes('summary text'));
   assert.ok(message.includes('transcript text'));
@@ -28,18 +31,14 @@ test('completion email body contains notion link/summary/transcript/my tasks', (
 test('shouldSendCompletionEmail is true only when enabled and all required envs exist', () => {
   const baseEnv = {
     GMAIL_NOTIFY_ENABLED: 'true',
-    GMAIL_TO: 'to@example.com',
-    GMAIL_FROM: 'from@example.com',
-    GMAIL_OAUTH_CLIENT_ID: 'client-id',
-    GMAIL_OAUTH_CLIENT_SECRET: 'client-secret',
-    GMAIL_OAUTH_REFRESH_TOKEN: 'refresh-token',
+    MAIL_TO: 'to@example.com',
+    MAIL_FROM: 'from@example.com',
+    MAIL_PASSWORD: 'app-password',
   } as any;
 
   assert.equal(shouldSendCompletionEmail(baseEnv), true);
   assert.equal(shouldSendCompletionEmail({ ...baseEnv, GMAIL_NOTIFY_ENABLED: 'false' }), false);
-  assert.equal(shouldSendCompletionEmail({ ...baseEnv, GMAIL_TO: '   ' }), false);
-  assert.equal(shouldSendCompletionEmail({ ...baseEnv, GMAIL_FROM: undefined }), false);
-  assert.equal(shouldSendCompletionEmail({ ...baseEnv, GMAIL_OAUTH_CLIENT_ID: '' }), false);
-  assert.equal(shouldSendCompletionEmail({ ...baseEnv, GMAIL_OAUTH_CLIENT_SECRET: '' }), false);
-  assert.equal(shouldSendCompletionEmail({ ...baseEnv, GMAIL_OAUTH_REFRESH_TOKEN: '' }), false);
+  assert.equal(shouldSendCompletionEmail({ ...baseEnv, MAIL_TO: '   ' }), false);
+  assert.equal(shouldSendCompletionEmail({ ...baseEnv, MAIL_FROM: undefined }), false);
+  assert.equal(shouldSendCompletionEmail({ ...baseEnv, MAIL_PASSWORD: '' }), false);
 });

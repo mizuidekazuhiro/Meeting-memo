@@ -1,8 +1,25 @@
 import type { Env } from '../types';
 import { HttpError } from './http';
 
-const GOOGLE_OAUTH_TOKEN_URL = 'https://oauth2.googleapis.com/token';
-const GMAIL_SEND_URL = 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send';
+interface MailConfig {
+  from: string;
+  password: string;
+  to: string[];
+  cc: string[];
+  bcc: string[];
+  smtpHost: string;
+  smtpPort: number;
+}
+
+interface CompletionEmailInput {
+  notionPageUrl: string;
+  summary: string;
+  transcript: string;
+  myTasks: string[];
+  fileName: string;
+  recordingId: string;
+  completedAt: string;
+}
 
 function isEnabled(value: string | undefined): boolean {
   return value?.toLowerCase() === 'true';
@@ -31,55 +48,63 @@ function escapeHtml(value: string): string {
   });
 }
 
-function toBase64Url(content: string): string {
+function toBase64(content: string): string {
   const utf8 = new TextEncoder().encode(content);
   let binary = '';
   for (const byte of utf8) {
     binary += String.fromCharCode(byte);
   }
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  return btoa(binary);
 }
 
-async function getAccessToken(env: Env): Promise<string> {
-  const clientId = env.GMAIL_OAUTH_CLIENT_ID?.trim();
-  const clientSecret = env.GMAIL_OAUTH_CLIENT_SECRET?.trim();
-  const refreshToken = env.GMAIL_OAUTH_REFRESH_TOKEN?.trim();
-  if (!clientId || !clientSecret || !refreshToken) {
-    throw new HttpError('Gmail OAuth envs are missing.', 500);
-  }
-
-  const response = await fetch(GOOGLE_OAUTH_TOKEN_URL, {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      client_id: clientId,
-      client_secret: clientSecret,
-      refresh_token: refreshToken,
-      grant_type: 'refresh_token',
-    }),
-  });
-
-  if (!response.ok) {
-    throw new HttpError('Failed to refresh Gmail access token.', 502, await response.text());
-  }
-
-  const payload = (await response.json()) as { access_token?: string };
-  if (!payload.access_token) {
-    throw new HttpError('Gmail access token was not returned by OAuth endpoint.', 502, payload);
-  }
-
-  return payload.access_token;
+function parseRecipientList(value: string | undefined): string[] {
+  if (!value) return [];
+  return value
+    .split(/[\n,;]+/)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
 }
 
-function buildCompletionEmailHtml(input: {
-  notionPageUrl: string;
-  summary: string;
-  transcript: string;
-  myTasks: string[];
-  fileName: string;
-  recordingId: string;
-  completedAt: string;
-}): string {
+function parsePort(value: string | undefined, fallback: number): number {
+  if (!value) return fallback;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 65535) return fallback;
+  return parsed;
+}
+
+function uniqueRecipients(recipients: string[]): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const recipient of recipients) {
+    const key = recipient.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(recipient);
+  }
+  return unique;
+}
+
+export function getCompletionEmailConfig(env: Env): MailConfig {
+  const from = env.MAIL_FROM?.trim() ?? '';
+  const password = env.MAIL_PASSWORD?.trim() ?? '';
+  const to = parseRecipientList(env.MAIL_TO);
+
+  if (!from || !password || to.length === 0) {
+    throw new HttpError('SMTP mail envs are missing. Required: MAIL_FROM, MAIL_PASSWORD, MAIL_TO.', 500);
+  }
+
+  return {
+    from,
+    password,
+    to,
+    cc: parseRecipientList(env.MAIL_CC),
+    bcc: parseRecipientList(env.MAIL_BCC),
+    smtpHost: env.SMTP_HOST?.trim() || 'smtp.gmail.com',
+    smtpPort: parsePort(env.SMTP_PORT, 587),
+  };
+}
+
+function buildCompletionEmailHtml(input: CompletionEmailInput): string {
   const myTasksHtml = input.myTasks.length
     ? `<ul>${input.myTasks.map((task) => `<li>${escapeHtml(task)}</li>`).join('')}</ul>`
     : '<p>なし</p>';
@@ -108,52 +133,159 @@ function buildCompletionEmailHtml(input: {
 
 export function shouldSendCompletionEmail(env: Env): boolean {
   return isEnabled(env.GMAIL_NOTIFY_ENABLED)
-    && hasValue(env.GMAIL_TO)
-    && hasValue(env.GMAIL_FROM)
-    && hasValue(env.GMAIL_OAUTH_CLIENT_ID)
-    && hasValue(env.GMAIL_OAUTH_CLIENT_SECRET)
-    && hasValue(env.GMAIL_OAUTH_REFRESH_TOKEN);
+    && hasValue(env.MAIL_TO)
+    && hasValue(env.MAIL_FROM)
+    && hasValue(env.MAIL_PASSWORD);
 }
 
-export function buildCompletionEmailMessage(input: Parameters<typeof buildCompletionEmailHtml>[0] & { to: string; from: string; subject: string }): string {
+export function buildCompletionEmailMessage(
+  input: CompletionEmailInput & { to: string[]; cc?: string[]; from: string; subject: string },
+): string {
   const html = buildCompletionEmailHtml(input);
-  return [
+  const lines = [
     `From: ${input.from}`,
-    `To: ${input.to}`,
+    `To: ${input.to.join(', ')}`,
+  ];
+  if (input.cc && input.cc.length > 0) {
+    lines.push(`Cc: ${input.cc.join(', ')}`);
+  }
+  lines.push(
     `Subject: ${input.subject}`,
     'MIME-Version: 1.0',
     'Content-Type: text/html; charset=UTF-8',
     '',
     html,
-  ].join('\r\n');
+  );
+  return lines.join('\r\n');
+}
+
+interface SmtpClient {
+  sendCommand(command: string, expectedCodes: number[]): Promise<void>;
+  sendData(message: string): Promise<void>;
+  readGreeting(): Promise<void>;
+  startTls(): Promise<void>;
+  close(): Promise<void>;
+}
+
+async function createSmtpClient(hostname: string, port: number): Promise<SmtpClient> {
+  const { connect } = await import('cloudflare:sockets');
+  let socket = connect({ hostname, port }, { secureTransport: 'starttls' });
+  let reader = socket.readable.getReader();
+  let writer = socket.writable.getWriter();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buffered = '';
+
+  const readLine = async (): Promise<string> => {
+    while (true) {
+      const lineBreakIndex = buffered.indexOf('\n');
+      if (lineBreakIndex >= 0) {
+        const line = buffered.slice(0, lineBreakIndex + 1);
+        buffered = buffered.slice(lineBreakIndex + 1);
+        return line.replace(/\r?\n$/, '');
+      }
+      const { value, done } = await reader.read();
+      if (done) {
+        throw new HttpError('SMTP connection closed unexpectedly.', 502);
+      }
+      buffered += decoder.decode(value, { stream: true });
+    }
+  };
+
+  const readResponse = async (expectedCodes: number[]): Promise<void> => {
+    const lines: string[] = [];
+    while (true) {
+      const line = await readLine();
+      lines.push(line);
+      if (!/^\d{3}[\s-]/.test(line)) {
+        throw new HttpError('SMTP returned malformed response.', 502, { line });
+      }
+      if (line[3] === ' ') {
+        const code = Number.parseInt(line.slice(0, 3), 10);
+        if (!expectedCodes.includes(code)) {
+          throw new HttpError('SMTP command failed.', 502, { code, response: lines.join('\n') });
+        }
+        return;
+      }
+    }
+  };
+
+  const sendCommand = async (command: string, expectedCodes: number[]): Promise<void> => {
+    await writer.write(encoder.encode(`${command}\r\n`));
+    await readResponse(expectedCodes);
+  };
+
+  const sendData = async (message: string): Promise<void> => {
+    const stuffed = message.replace(/\r?\n/g, '\r\n').replace(/(^|\r\n)\./g, '$1..');
+    await writer.write(encoder.encode(`${stuffed}\r\n.\r\n`));
+    await readResponse([250]);
+  };
+
+  const readGreeting = async (): Promise<void> => {
+    await readResponse([220]);
+  };
+
+  const startTls = async (): Promise<void> => {
+    await sendCommand('STARTTLS', [220]);
+    const secureSocket = socket.startTls();
+    await writer.close();
+    reader.releaseLock();
+    writer.releaseLock();
+    socket = secureSocket;
+    reader = socket.readable.getReader();
+    writer = socket.writable.getWriter();
+    buffered = '';
+  };
+
+  const close = async (): Promise<void> => {
+    try {
+      await sendCommand('QUIT', [221]);
+    } finally {
+      try {
+        await writer.close();
+      } catch {
+        // no-op
+      }
+      reader.releaseLock();
+      writer.releaseLock();
+      socket.close();
+    }
+  };
+
+  return { sendCommand, sendData, readGreeting, startTls, close };
 }
 
 export async function sendCompletionEmail(
   env: Env,
-  input: Parameters<typeof buildCompletionEmailHtml>[0] & { subject: string },
+  input: CompletionEmailInput & { subject: string },
 ): Promise<void> {
   if (!shouldSendCompletionEmail(env)) {
     return;
   }
 
-  const to = env.GMAIL_TO?.trim();
-  const from = env.GMAIL_FROM?.trim();
-  if (!to || !from) {
-    throw new HttpError('Gmail recipient/sender envs are missing.', 500);
-  }
-
-  const accessToken = await getAccessToken(env);
-  const rawMessage = buildCompletionEmailMessage({ ...input, to, from });
-  const response = await fetch(GMAIL_SEND_URL, {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${accessToken}`,
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({ raw: toBase64Url(rawMessage) }),
+  const config = getCompletionEmailConfig(env);
+  const recipients = uniqueRecipients([...config.to, ...config.cc, ...config.bcc]);
+  const message = buildCompletionEmailMessage({
+    ...input,
+    from: config.from,
+    to: config.to,
+    cc: config.cc,
+    subject: input.subject,
   });
 
-  if (!response.ok) {
-    throw new HttpError('Gmail API send failed.', 502, await response.text());
+  const smtp = await createSmtpClient(config.smtpHost, config.smtpPort);
+  await smtp.readGreeting();
+  await smtp.sendCommand('EHLO meeting-memo.worker', [250]);
+  await smtp.startTls();
+  await smtp.sendCommand('EHLO meeting-memo.worker', [250]);
+  await smtp.sendCommand('AUTH LOGIN', [334]);
+  await smtp.sendCommand(toBase64(config.from), [334]);
+  await smtp.sendCommand(toBase64(config.password), [235]);
+  await smtp.sendCommand(`MAIL FROM:<${config.from}>`, [250]);
+  for (const recipient of recipients) {
+    await smtp.sendCommand(`RCPT TO:<${recipient}>`, [250, 251]);
   }
+  await smtp.sendCommand('DATA', [354]);
+  await smtp.sendData(message);
+  await smtp.close();
 }

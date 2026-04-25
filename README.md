@@ -47,7 +47,7 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 9. Workers が transcript 完了後に要約（summary / tasks）を生成
 10. Workers が Notion に保存（Interview Memo 本体。`Record Type=Interview Memo`）
 11. Workers が `My Tasks` のみを同一 DB（`INBOX_DB_ID`）へ 1件ずつ追加（`Record Type=Task`）
-12. Workers が Gmail API（OAuth refresh token）で完了通知メール送信
+12. Workers が Gmail SMTP（アプリパスワード）で完了通知メール送信
 
 ### Notion My Tasks の任意プロパティ（別ページ化する場合）
 
@@ -115,31 +115,46 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 - `CALLBACK_JOB_LOOKUP_BASE_DELAY_MS`（指数 backoff の基準遅延。既定: `200`）
 - `CALLBACK_JOB_LOOKUP_MAX_DELAY_MS`（指数 backoff の最大遅延。既定: `1600`）
 - `GMAIL_NOTIFY_ENABLED`（`true` の時だけ通知）
-- `GMAIL_TO`
-- `GMAIL_FROM`
-- `GMAIL_OAUTH_CLIENT_ID`
-- `GMAIL_OAUTH_CLIENT_SECRET`
-- `GMAIL_OAUTH_REFRESH_TOKEN`
+- `MAIL_FROM`（送信元 Gmail アドレス）
+- `MAIL_PASSWORD`（Google アプリパスワード）
+- `MAIL_TO`（通知先。カンマ/セミコロン/改行区切り可）
+- `MAIL_CC`（任意）
+- `MAIL_BCC`（任意。ヘッダーには出さず RCPT TO のみ）
+- `MAIL_SUBJECT_PREFIX`（任意。既定: `Interview Memo 完了`）
+- `SMTP_HOST`（任意。既定: `smtp.gmail.com`）
+- `SMTP_PORT`（任意。既定: `587`）
+- 旧方式（非推奨 / 互換メモ）: `GMAIL_OAUTH_CLIENT_ID`, `GMAIL_OAUTH_CLIENT_SECRET`, `GMAIL_OAUTH_REFRESH_TOKEN`
 - 既存 Dropbox / OpenAI / Notion 関連 env
 
 > 重要: 本番/preview/deployed Workers runtime では fallback store を使いません。`RECORDING_JOB_KV` 未設定時は 500 を返します。
 
 ## Gmail 完了通知の設定手順
 
-Interview Memo の Notion 保存完了後に、Gmail API で完了通知メールを送る設定です。
+Interview Memo の Notion 保存完了後に、Gmail SMTP（submission: 587 + STARTTLS）で完了通知メールを送る設定です。
 
-1. Google Cloud で OAuth クライアント（Web application）を作成
-2. Gmail API を有効化
-3. OAuth 同意画面に Gmail 送信ユーザーを追加して consent を完了
-4. `https://developers.google.com/oauthplayground` などで refresh token を発行
-   - scope は `https://www.googleapis.com/auth/gmail.send`
-5. Workers に下記 env を設定
-   - `GMAIL_NOTIFY_ENABLED=true`
-   - `GMAIL_TO`（通知先）
-   - `GMAIL_FROM`（送信元。通常は OAuth ユーザーと同じ Gmail）
-   - `GMAIL_OAUTH_CLIENT_ID`
-   - `GMAIL_OAUTH_CLIENT_SECRET`
-   - `GMAIL_OAUTH_REFRESH_TOKEN`
+Workers に下記 env を設定します。
+
+必須:
+
+- `GMAIL_NOTIFY_ENABLED=true`
+- `MAIL_FROM`（送信元 Gmail アドレス）
+- `MAIL_PASSWORD`（Google アプリパスワード）
+- `MAIL_TO`（送信先メールアドレス）
+
+任意:
+
+- `MAIL_CC`
+- `MAIL_BCC`
+- `MAIL_SUBJECT_PREFIX=Interview Memo 完了`
+- `SMTP_HOST=smtp.gmail.com`
+- `SMTP_PORT=587`
+
+重要:
+
+- `MAIL_PASSWORD` は Gmail の通常ログインパスワードではなく、Google アカウントの **アプリパスワード** です。
+- Google アカウントで 2 段階認証を有効化し、アプリパスワードを発行してください。
+- Cloudflare Workers の Variables and Secrets では `MAIL_PASSWORD` を **Secret** として登録してください。
+- 旧 Gmail API OAuth 方式の `GMAIL_OAUTH_*` は不要です（非推奨）。
 
 補足:
 
