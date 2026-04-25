@@ -5,15 +5,8 @@ const NOTION_API = 'https://api.notion.com/v1';
 const NOTION_VERSION = '2022-06-28';
 const NOTION_TEXT_LIMIT = 1900;
 const TRANSCRIPT_BLOCK_TEXT_LIMIT = 1700;
-const DEFAULT_NOTION_TRANSCRIPT_EXCERPT_CHARS = 4000;
 const TRANSCRIPT_HEADING = 'Transcript';
-const REVIEW_SECTION_HEADINGS = [
-  '面談メモ（完成版）',
-  '固有名詞補正',
-  '未確定事項',
-  '次に取るべき行動',
-  'レビュー情報',
-] as const;
+const FINAL_MEMO_HEADING = '面談メモ（完成版）';
 
 type NotionRichText = Array<{
   type: 'text';
@@ -254,19 +247,14 @@ function transcriptLineFromSegment(segment: TranscriptSegment): string {
   return `[${speaker}] ${text}`.trim();
 }
 
-function getTranscriptExcerptChars(env: Env): number {
-  const parsed = Number.parseInt(env.NOTION_TRANSCRIPT_EXCERPT_CHARS ?? '', 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_NOTION_TRANSCRIPT_EXCERPT_CHARS;
-  return parsed;
-}
-
-function buildTranscriptExcerpt(record: InterviewRecord, excerptChars: number): string {
-  const transcript = record.transcript;
-  if (!transcript) return '';
-  const fullText = transcript.segments.length
-    ? transcript.segments.map((segment) => transcriptLineFromSegment(segment)).join('\n')
-    : transcript.fullText;
-  return fullText.slice(0, excerptChars).trim();
+function richTextChunks(content: string, maxLength = NOTION_TEXT_LIMIT): NotionRichText {
+  const normalized = content.replace(/\r\n/g, '\n').trim();
+  if (!normalized) return richText('');
+  const chunks: NotionRichText = [];
+  for (let index = 0; index < normalized.length; index += maxLength) {
+    chunks.push({ type: 'text', text: { content: normalized.slice(index, index + maxLength) } });
+  }
+  return chunks;
 }
 
 function buildProperties(record: InterviewRecord) {
@@ -291,7 +279,7 @@ function buildProperties(record: InterviewRecord) {
           date: { start: new Date(recordedAt).toISOString() },
         }
       : undefined,
-    Summary: record.insights ? { rich_text: richText(record.insights.summary) } : undefined,
+    Summary: record.insights ? { rich_text: richTextChunks(record.insights.summary) } : undefined,
     'My Tasks': record.insights ? { rich_text: richText(bulletList(record.insights.myTasks)) } : undefined,
     'Other Tasks': record.insights ? { rich_text: richText(bulletList(record.insights.otherTasks)) } : undefined,
     'Dropbox File Id': record.metadata.id ? { rich_text: richText(record.metadata.id) } : undefined,
@@ -317,18 +305,9 @@ export function buildTranscriptBlocks(record: InterviewRecord, options: { excerp
   const transcript = record.transcript;
   if (!transcript) return [];
 
-  const excerptChars = options.excerptChars ?? DEFAULT_NOTION_TRANSCRIPT_EXCERPT_CHARS;
-  const excerpt = buildTranscriptExcerpt(record, excerptChars);
   const transcriptLink = options.transcriptFileUrl?.trim();
-  const fullLength = transcript.fullText.length;
-  const segmentCount = transcript.segments.length;
-
-  const paragraphs = [
-    transcriptLink ? `Transcript全文リンク: ${transcriptLink}` : 'Transcript全文リンク: 未取得',
-    `Transcript fullText length: ${fullLength}`,
-    `Transcript segment count: ${segmentCount}`,
-    excerpt ? `Transcript抜粋 (${Math.min(excerpt.length, excerptChars)} chars):\n${excerpt}` : 'Transcript抜粋: なし',
-  ].flatMap((line) => splitIntoChunks(line, TRANSCRIPT_BLOCK_TEXT_LIMIT));
+  const paragraphs = [transcriptLink ? `Transcript全文リンク: ${transcriptLink}` : 'Transcript全文リンク: 未取得']
+    .flatMap((line) => splitIntoChunks(line, TRANSCRIPT_BLOCK_TEXT_LIMIT));
 
   return [
     { object: 'block', type: 'heading_2', heading_2: { rich_text: titleText(TRANSCRIPT_HEADING) } },
@@ -432,27 +411,6 @@ function collectManagedTranscriptBlockIds(children: NotionBlock[]): string[] {
 
 function headingText(block: NotionBlock): string {
   return block.heading_2?.rich_text?.map((item) => item.plain_text ?? '').join('').trim() ?? '';
-}
-
-function isManagedHeadingBlock(block: NotionBlock): boolean {
-  if (block.type !== 'heading_2') return false;
-  const text = headingText(block);
-  return REVIEW_SECTION_HEADINGS.includes(text as (typeof REVIEW_SECTION_HEADINGS)[number]) || text === TRANSCRIPT_HEADING;
-}
-
-function collectManagedReviewAndTranscriptBlockIds(children: NotionBlock[]): string[] {
-  const ids: string[] = [];
-  for (let index = 0; index < children.length; index += 1) {
-    const block = children[index];
-    if (!isManagedHeadingBlock(block)) continue;
-    ids.push(block.id);
-    for (let cursor = index + 1; cursor < children.length; cursor += 1) {
-      const next = children[cursor];
-      if (isManagedHeadingBlock(next)) break;
-      ids.push(next.id);
-    }
-  }
-  return ids;
 }
 
 function splitMarkdownTableRow(line: string): string[] {
@@ -577,37 +535,30 @@ function markdownParagraphBlocks(content: string): NotionBlockInput[] {
   return blocks;
 }
 
-function buildReviewedMemoBlocks(reviewResult: InterviewReviewResult): NotionBlockInput[] {
-  const sourceUrls = reviewResult.sourceUrls.length
-    ? reviewResult.sourceUrls.map((url) => `- ${url}`).join('\n')
-    : '- なし';
-  const reviewInfo = [
-    `- 人間確認要否: ${reviewResult.humanCheckRequired ? '要確認' : '確認不要'}`,
-    `- 理由: ${reviewResult.humanCheckReason || 'なし'}`,
-    '- 根拠URL:',
-    sourceUrls,
-  ].join('\n');
-
-  const sections: Array<{ title: string; body: string }> = [
-    { title: '面談メモ（完成版）', body: reviewResult.finalMemoMarkdown },
-    { title: '固有名詞補正', body: reviewResult.correctedTermsMarkdown },
-    { title: '未確定事項', body: reviewResult.uncertainItemsMarkdown },
-    { title: '次に取るべき行動', body: reviewResult.nextActionsMarkdown },
-    { title: 'レビュー情報', body: reviewInfo },
-  ];
-
-  return sections.flatMap((section) => [
+function buildFinalMemoBlocks(finalMemo: string, sourceUrls: string[]): NotionBlockInput[] {
+  const blocks: NotionBlockInput[] = [
     {
-      object: 'block' as const,
-      type: 'heading_2' as const,
-      heading_2: { rich_text: titleText(section.title) },
+      object: 'block',
+      type: 'heading_1',
+      heading_1: { rich_text: titleText(FINAL_MEMO_HEADING) },
     },
-    ...markdownParagraphBlocks(section.body),
-  ]);
+    ...markdownParagraphBlocks(finalMemo),
+  ];
+  if (sourceUrls.length) {
+    blocks.push({ object: 'block', type: 'heading_2', heading_2: { rich_text: titleText('参考リンク') } });
+    for (const url of sourceUrls) {
+      blocks.push({
+        object: 'block',
+        type: 'bulleted_list_item',
+        bulleted_list_item: { rich_text: richText(url) },
+      });
+    }
+  }
+  return blocks;
 }
 
 export async function appendTranscriptBlocks(env: Env, pageId: string, record: InterviewRecord, transcriptFileUrl?: string): Promise<void> {
-  const blocks = buildTranscriptBlocks(record, { excerptChars: getTranscriptExcerptChars(env), transcriptFileUrl });
+  const blocks = buildTranscriptBlocks(record, { transcriptFileUrl });
   if (!blocks.length) {
     return;
   }
@@ -627,13 +578,15 @@ function collectManagedReviewBlockIds(children: NotionBlock[]): string[] {
   const ids: string[] = [];
   for (let index = 0; index < children.length; index += 1) {
     const block = children[index];
-    if (block.type !== 'heading_2') continue;
-    const text = headingText(block);
-    if (!REVIEW_SECTION_HEADINGS.includes(text as (typeof REVIEW_SECTION_HEADINGS)[number])) continue;
+    if (block.type !== 'heading_1' && block.type !== 'heading_2') continue;
+    const text = block.type === 'heading_2'
+      ? headingText(block)
+      : ((block as unknown as { heading_1?: { rich_text?: Array<{ plain_text?: string }> } }).heading_1?.rich_text?.map((item) => item.plain_text ?? '').join('').trim() ?? '');
+    if (text !== FINAL_MEMO_HEADING && text !== '参考リンク') continue;
     ids.push(block.id);
     for (let cursor = index + 1; cursor < children.length; cursor += 1) {
       const next = children[cursor];
-      if (next.type === 'heading_2') break;
+      if (next.type === 'heading_1' || next.type === 'heading_2') break;
       ids.push(next.id);
     }
   }
@@ -646,10 +599,20 @@ export async function appendReviewedMemoToNotionPage(env: Env, pageId: string, r
   for (const blockId of managedIds) {
     await deleteBlock(env, blockId);
   }
-  const blocks = [...buildReviewedMemoBlocks(reviewResult)];
+  const blocks = [...buildFinalMemoBlocks(reviewResult.finalMemoMarkdown, reviewResult.sourceUrls)];
   if (blocks.length) {
     await appendBlockChildren(env, pageId, blocks);
   }
+}
+
+export async function writeFinalMemoToNotionPage(env: Env, pageId: string, finalMemo: string, sourceUrls: string[]): Promise<void> {
+  const children = await listBlockChildren(env, pageId);
+  const managedIds = collectManagedReviewBlockIds(children);
+  for (const blockId of managedIds) {
+    await deleteBlock(env, blockId);
+  }
+  const blocks = buildFinalMemoBlocks(finalMemo, sourceUrls);
+  if (blocks.length) await appendBlockChildren(env, pageId, blocks);
 }
 
 export async function appendInterviewReviewFailureToNotionPage(
@@ -658,10 +621,7 @@ export async function appendInterviewReviewFailureToNotionPage(
   input: { message: string; error?: unknown },
 ): Promise<void> {
   const children = await listBlockChildren(env, pageId);
-  const managedIds = collectManagedReviewAndTranscriptBlockIds(children).filter((blockId) => {
-    const block = children.find((item) => item.id === blockId);
-    return block?.type === 'heading_2' && headingText(block) !== TRANSCRIPT_HEADING;
-  });
+  const managedIds = collectManagedReviewBlockIds(children);
   for (const blockId of managedIds) {
     await deleteBlock(env, blockId);
   }
@@ -731,7 +691,7 @@ function splitTaskCandidatesFromText(value: string): string[] {
   return value
     .replace(/\r\n/g, '\n')
     .split('\n')
-    .map((line) => line.replace(/^[\s\-*・\d.)]+/, '').trim())
+    .map((line) => line.replace(/^\s*(?:[-*・]|\d+[.)]?)+\s*/, '').trim())
     .filter(Boolean);
 }
 
@@ -754,12 +714,37 @@ function dedupeTaskTextsInRecording(values: string[]): string[] {
 function normalizeMyTasksInput(myTasks: unknown): string[] {
   if (Array.isArray(myTasks)) {
     const expanded = myTasks.flatMap((item) => (typeof item === 'string' ? splitTaskCandidatesFromText(item) : []));
-    return dedupeTaskTextsInRecording(expanded);
+    return dedupeTaskTextsInRecording(expanded).filter((task) => !['なし', '不明', '未定', '特になし'].includes(task));
   }
   if (typeof myTasks === 'string') {
-    return dedupeTaskTextsInRecording(splitTaskCandidatesFromText(myTasks));
+    return dedupeTaskTextsInRecording(splitTaskCandidatesFromText(myTasks)).filter((task) => !['なし', '不明', '未定', '特になし'].includes(task));
   }
   return [];
+}
+
+function findActionSectionBody(markdown: string): string {
+  const lines = markdown.replace(/\r\n/g, '\n').split('\n');
+  const actionHeading = /^(?:■\s*)?(?:#{1,3}\s*)?(次アクション|次に取るべき行動|Action Items|Next Actions)\s*$/i;
+  const nextHeading = /^(■\s+|#{1,3}\s+|【.+】)/;
+  const start = lines.findIndex((line) => actionHeading.test(line.trim()));
+  if (start < 0) return '';
+  const body: string[] = [];
+  for (let i = start + 1; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (nextHeading.test(line.trim())) break;
+    body.push(line);
+  }
+  return body.join('\n').trim();
+}
+
+export function extractTasksFromNextActionsMarkdown(markdown: string): string[] {
+  return normalizeMyTasksInput(markdown);
+}
+
+export function extractTasksFromFinalMemoMarkdown(markdown: string): string[] {
+  const section = findActionSectionBody(markdown);
+  if (!section) return [];
+  return normalizeMyTasksInput(section);
 }
 
 async function sha256Hex(content: string): Promise<string> {

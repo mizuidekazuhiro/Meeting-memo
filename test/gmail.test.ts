@@ -4,7 +4,7 @@ import * as assert from 'node:assert/strict';
 
 import { buildCompletionEmailMessage, buildCompletionEmailSubject, shouldSendCompletionEmail } from '../src/lib/gmail';
 
-test('completion email body contains notion link/summary/transcript/my tasks', () => {
+test('completion email body contains notion link/final memo/task links and no transcript body', () => {
   const notionPageUrl = 'https://www.notion.so/example';
   const chooseUrl1 = 'https://triage.example.com/move/choose?inbox_page_id=abc123&sig=deadbeef';
   const chooseUrl2 = 'https://triage.example.com/move/choose?inbox_page_id=def456&sig=cafebabe';
@@ -15,18 +15,9 @@ test('completion email body contains notion link/summary/transcript/my tasks', (
     subject: 'Interview completed',
     notionPageUrl,
     transcriptFileUrl: 'https://dropbox.example.com/transcript.txt',
-    summary: 'summary text',
-    transcript: 'transcript text',
+    finalMemo: '完成版メモ本文です',
+    sourceUrls: ['https://example.com'],
     myTasks: [{ taskText: 'task 1', chooseUrl: chooseUrl1 }, { taskText: 'task 2', chooseUrl: chooseUrl2 }],
-    review: {
-      summaryForEmail: 'review summary',
-      correctedTermsMarkdown: 'terms',
-      uncertainItemsMarkdown: 'uncertain',
-      nextActionsMarkdown: 'actions',
-      humanCheckRequired: false,
-      humanCheckReason: 'ok',
-      sourceUrls: ['https://example.com'],
-    },
   });
 
   assert.ok(message.includes('To: to@example.com'));
@@ -40,10 +31,11 @@ test('completion email body contains notion link/summary/transcript/my tasks', (
   assert.ok(!message.includes('<strong>recordingId:</strong>'));
   assert.ok(!message.includes('<strong>completedAt:</strong>'));
   assert.ok(message.includes("font-family:'Yu Gothic UI'"));
-  assert.ok(message.includes('summary text'));
-  assert.ok(message.includes('review summary'));
-  assert.ok(message.includes('terms'));
-  assert.ok(message.includes('transcript text'));
+  assert.ok(message.includes('完成版 面談メモ'));
+  assert.ok(message.includes('完成版メモ本文です'));
+  assert.ok(message.includes('参考リンク'));
+  assert.equal(message.includes('Transcript</h3>'), false);
+  assert.equal(message.includes('Summary</h3>'), false);
   assert.ok(message.includes('task 1'));
   assert.ok(message.includes('task 2'));
   assert.ok(message.includes('タスク処理を選ぶ'));
@@ -59,42 +51,32 @@ test('completion email omits transcript link section when link is not provided',
     from: 'from@example.com',
     subject: 'Interview completed',
     notionPageUrl: 'https://www.notion.so/example',
-    summary: 'summary',
-    transcript: 'transcript',
+    finalMemo: 'memo',
+    sourceUrls: [],
     myTasks: [],
   });
   assert.equal(message.includes('Transcript全文リンク：<a href=""'), false);
+  assert.equal(message.includes('My Tasks'), false);
+  assert.equal(message.includes('参考リンク'), false);
 });
 
-test('subject includes 要確認 prefix when humanCheckRequired=true', () => {
-  const subject = buildCompletionEmailSubject('Interview Memo 完了通知', {
-    summaryForEmail: 'review',
-    correctedTermsMarkdown: '',
-    uncertainItemsMarkdown: '',
-    nextActionsMarkdown: '',
-    humanCheckRequired: true,
-    humanCheckReason: '要確認',
-    sourceUrls: [],
-  });
-  assert.equal(subject, '【要確認】Interview Memo 完了通知');
+test('subject remains unchanged', () => {
+  const subject = buildCompletionEmailSubject('Interview Memo 完了通知');
+  assert.equal(subject, 'Interview Memo 完了通知');
 });
 
-test('subject includes レビュー失敗 prefix when reviewError exists', () => {
-  const subject = buildCompletionEmailSubject('Interview Memo 完了通知', undefined, 'レビュー失敗');
-  assert.equal(subject, '【レビュー失敗】Interview Memo 完了通知');
-
+test('message renders plain subject without review state', () => {
+  const subject = buildCompletionEmailSubject('Interview Memo 完了通知');
   const message = buildCompletionEmailMessage({
     to: ['to@example.com'],
     from: 'from@example.com',
     subject,
     notionPageUrl: 'https://www.notion.so/example',
-    summary: 'summary',
-    transcript: 'transcript',
+    finalMemo: 'memo',
+    sourceUrls: [],
     myTasks: [],
-    reviewError: 'レビュー失敗',
   });
-  assert.ok(message.includes('Subject: 【レビュー失敗】Interview Memo 完了通知'));
-  assert.ok(message.includes('二次レビューは失敗しました。一次要約とTranscriptのみ保存されています。'));
+  assert.ok(message.includes('Subject: Interview Memo 完了通知'));
 });
 
 test('shouldSendCompletionEmail is true only when enabled and all required envs exist', () => {

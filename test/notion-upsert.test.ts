@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 
-import { appendReviewedMemoToNotionPage, buildTranscriptBlocks, importMyTasksToInbox, saveTranscriptLinkToNotion, upsertInterviewFromTranscript } from '../src/lib/notion';
+import { appendReviewedMemoToNotionPage, buildTranscriptBlocks, extractTasksFromFinalMemoMarkdown, extractTasksFromNextActionsMarkdown, importMyTasksToInbox, saveTranscriptLinkToNotion, upsertInterviewFromTranscript } from '../src/lib/notion';
 
 test('upsertInterviewFromTranscript stores insights fields and transcript raw JSON', async () => {
   const originalFetch = global.fetch;
@@ -172,7 +172,7 @@ test('importMyTasksToInbox omits optional source properties that are not in DB s
   assert.equal(pageBodies[0].properties['Source Interview URL'], undefined);
 });
 
-test('appendReviewedMemoToNotionPage adds review sections and does not re-append Transcript', async () => {
+test('appendReviewedMemoToNotionPage writes final memo + source urls and does not re-append Transcript', async () => {
   const originalFetch = global.fetch;
   const appendedChildren: any[] = [];
   global.fetch = (async (input: string, init?: RequestInit) => {
@@ -225,16 +225,13 @@ test('appendReviewedMemoToNotionPage adds review sections and does not re-append
   global.fetch = originalFetch;
 
   const allChildren = appendedChildren.flatMap((payload) => payload.children);
-  const headings = allChildren.filter((block) => block.type === 'heading_2').map((block) => block.heading_2.rich_text[0].text.content);
-  assert.ok(headings.includes('面談メモ（完成版）'));
-  assert.ok(headings.includes('固有名詞補正'));
-  assert.ok(headings.includes('未確定事項'));
-  assert.ok(headings.includes('次に取るべき行動'));
-  assert.equal(headings.includes('Transcript'), false);
-  const h1 = allChildren.find((block) => block.type === 'heading_1');
-  assert.equal(h1.heading_1.rich_text[0].text.content, '面談メモ（二次レビュー）');
-  const nestedH2 = allChildren.find((block) => block.type === 'heading_2' && block.heading_2.rich_text[0].text.content === '結論');
-  assert.ok(nestedH2);
+  const heading1 = allChildren.filter((block) => block.type === 'heading_1').map((block) => block.heading_1.rich_text[0].text.content);
+  const heading2 = allChildren.filter((block) => block.type === 'heading_2').map((block) => block.heading_2.rich_text[0].text.content);
+  assert.ok(heading1.includes('面談メモ（完成版）'));
+  assert.ok(heading2.includes('参考リンク'));
+  assert.equal(heading2.includes('Transcript'), false);
+  const h2Title = allChildren.find((block) => block.type === 'heading_2' && block.heading_2.rich_text[0].text.content === '結論');
+  assert.ok(h2Title);
   const bullet = allChildren.find((block) => block.type === 'bulleted_list_item');
   assert.equal(bullet.bulleted_list_item.rich_text[0].text.content, '四番線の電車は各駅停車で押上行き');
   assert.equal(bullet.bulleted_list_item.rich_text[0].annotations.bold, true);
@@ -247,6 +244,31 @@ test('appendReviewedMemoToNotionPage adds review sections and does not re-append
   assert.equal(plainTextDump.includes('|---|---|'), false);
   assert.equal(plainTextDump.includes('**四番線の電車は各駅停車で押上行き**'), false);
   assert.equal(plainTextDump.includes('## 結論'), false);
+});
+
+test('extractTasksFromNextActionsMarkdown splits markdown bullets', () => {
+  const tasks = extractTasksFromNextActionsMarkdown('- task1\n・ task2\n1. task3\n特になし');
+  assert.deepEqual(tasks, ['task1', 'task2', 'task3']);
+});
+
+test('extractTasksFromFinalMemoMarkdown extracts from 次アクション section', () => {
+  const finalMemo = [
+    '【面談メモ｜鉄鋼業界の現状と展望】',
+    '■ 確認できた内容',
+    '- 市況確認を実施。',
+    '■ 次アクション',
+    '- IR及び大阪周辺の基礎工事・杭打ちの詳細進捗調査を実施。',
+    '- 潤滑油、塗料等資材の調達現況及び価格交渉体制の現場確認を依頼。',
+    '- ベトナム現地の鉄鋼製造企業の生産状況及び市場動向の追加ヒアリング。',
+    '■ 未確認事項',
+    '- 数値の出典確認。',
+  ].join('\n');
+  const tasks = extractTasksFromFinalMemoMarkdown(finalMemo);
+  assert.deepEqual(tasks, [
+    'IR及び大阪周辺の基礎工事・杭打ちの詳細進捗調査を実施。',
+    '潤滑油、塗料等資材の調達現況及び価格交渉体制の現場確認を依頼。',
+    'ベトナム現地の鉄鋼製造企業の生産状況及び市場動向の追加ヒアリング。',
+  ]);
 });
 
 test('buildTranscriptBlocks does not expand full transcript into many notion blocks', () => {
