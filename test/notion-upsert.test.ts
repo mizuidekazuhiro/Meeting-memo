@@ -102,10 +102,16 @@ test('importMyTasksToInbox creates only My Tasks and deduplicates same recording
   global.fetch = originalFetch;
 
   assert.equal(first.importedCount, 2);
+  assert.equal(first.importedTaskItems.length, 2);
+  assert.ok(first.importedTaskItems.every((item) => item.inboxPageId.startsWith('task_')));
+  assert.ok(first.importedTaskItems.every((item) => item.skippedDuplicate === false));
   assert.equal(first.skippedBecauseMissingProperties, 0);
   assert.deepEqual(first.missingProperties, []);
   assert.equal(second.importedCount, 0);
   assert.equal(second.skippedDuplicates, 2);
+  assert.equal(second.importedTaskItems.length, 2);
+  assert.ok(second.importedTaskItems.every((item) => item.inboxPageId === 'existing-task'));
+  assert.ok(second.importedTaskItems.every((item) => item.skippedDuplicate === true));
   assert.ok(pageBodies.every((body) => body.properties['Record Type'].select.name === 'Task'));
   assert.ok(pageBodies.every((body) => body.properties.Source.rich_text[0].text.content === 'meeting_memo'));
   assert.ok(pageBodies.every((body) => body.properties.Name.title[0].text.content !== ''));
@@ -145,7 +151,7 @@ test('importMyTasksToInbox omits optional source properties that are not in DB s
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
   }) as any;
 
-  const env = { NOTION_TOKEN: 'token', INBOX_DB_ID: 'db' } as any;
+  const env = { NOTION_TOKEN: 'token', INBOX_DB_ID: 'db', INBOX_TRIAGE_BASE_URL: 'https://triage.example.com', INBOX_TRIAGE_ACTION_SECRET: 'secret-1' } as any;
   const result = await importMyTasksToInbox(env, {
     recordingId: 'rec-1',
     sourceInterviewPageId: 'interview-page-id',
@@ -154,6 +160,10 @@ test('importMyTasksToInbox omits optional source properties that are not in DB s
   global.fetch = originalFetch;
 
   assert.equal(result.importedCount, 1);
+  assert.equal(result.importedTaskItems.length, 1);
+  assert.ok(result.importedTaskItems[0].chooseUrl?.includes('/move/choose?'));
+  assert.ok(result.importedTaskItems[0].chooseUrl?.includes('inbox_page_id=task_1'));
+  assert.ok(!result.importedTaskItems[0].chooseUrl?.includes('/action/move'));
   assert.equal(result.skippedBecauseMissingProperties, 3);
   assert.deepEqual(result.missingProperties, ['Source Recording ID', 'Source Interview Page ID', 'Source Interview URL']);
   assert.equal(pageBodies.length, 1);

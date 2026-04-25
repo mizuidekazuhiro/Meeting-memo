@@ -6,6 +6,8 @@ import { buildCompletionEmailMessage, shouldSendCompletionEmail } from '../src/l
 
 test('completion email body contains notion link/summary/transcript/my tasks', () => {
   const notionPageUrl = 'https://www.notion.so/example';
+  const chooseUrl1 = 'https://triage.example.com/move/choose?inbox_page_id=abc123&sig=deadbeef';
+  const chooseUrl2 = 'https://triage.example.com/move/choose?inbox_page_id=def456&sig=cafebabe';
   const message = buildCompletionEmailMessage({
     to: ['to@example.com'],
     cc: ['cc@example.com'],
@@ -14,7 +16,7 @@ test('completion email body contains notion link/summary/transcript/my tasks', (
     notionPageUrl,
     summary: 'summary text',
     transcript: 'transcript text',
-    myTasks: ['task 1', 'task 2'],
+    myTasks: [{ taskText: 'task 1', chooseUrl: chooseUrl1 }, { taskText: 'task 2', chooseUrl: chooseUrl2 }],
     fileName: 'meeting.m4a',
     recordingId: 'rec-1',
     completedAt: '2026-04-20T00:00:00.000Z',
@@ -33,6 +35,11 @@ test('completion email body contains notion link/summary/transcript/my tasks', (
   assert.ok(message.includes('transcript text'));
   assert.ok(message.includes('task 1'));
   assert.ok(message.includes('task 2'));
+  assert.ok(message.includes('タスク処理を選ぶ'));
+  assert.ok(message.includes('/move/choose?'));
+  assert.ok(message.includes('href="https://triage.example.com/move/choose?inbox_page_id=abc123&amp;sig=deadbeef"'));
+  assert.ok(message.includes('href="https://triage.example.com/move/choose?inbox_page_id=def456&amp;sig=cafebabe"'));
+  assert.ok(!message.includes('/action/move'));
 });
 
 test('shouldSendCompletionEmail is true only when enabled and all required envs exist', () => {
