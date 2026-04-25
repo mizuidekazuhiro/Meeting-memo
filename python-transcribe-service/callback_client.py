@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import os
 import time
-from urllib.parse import urlparse
-
 import httpx
 
 from config import SETTINGS
@@ -23,11 +21,20 @@ def _retry_delays_sec() -> list[int]:
     return [0, 10, 30, 60]
 
 
-def send_callback(payload: WorkersCallbackPayload, callback_url: str | None = None) -> bool:
+def _extract_finalize_queued(resp: httpx.Response) -> bool | None:
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001
+        return None
+    value = body.get('finalizeQueued') if isinstance(body, dict) else None
+    return value if isinstance(value, bool) else None
+
+
+def send_callback(payload: WorkersCallbackPayload, callback_url: str | None = None) -> tuple[bool, bool | None]:
     final_url = callback_url or SETTINGS.workers_callback_url
     if not final_url:
         log_event(logger, 'warning', 'callback skipped', reason='WORKERS_CALLBACK_URL is not configured')
-        return False
+        return False, None
 
     max_attempts = len(_retry_delays_sec())
     timeout = _timeout_config()
@@ -93,7 +100,7 @@ def send_callback(payload: WorkersCallbackPayload, callback_url: str | None = No
                     maxAttempts=max_attempts,
                     httpStatus=resp.status_code,
                 )
-                return False
+                return False, None
 
             success_event = 'callback_retry_succeeded' if attempt > 1 else 'callback_attempt_succeeded'
             log_event(
@@ -107,8 +114,9 @@ def send_callback(payload: WorkersCallbackPayload, callback_url: str | None = No
                 httpStatus=resp.status_code,
                 elapsedSeconds=elapsed,
                 responseBodyPreview=body_preview,
+                finalizeQueued=_extract_finalize_queued(resp),
             )
-            return True
+            return True, _extract_finalize_queued(resp)
         except Exception as exc:  # noqa: BLE001
             elapsed = round(time.perf_counter() - started_at, 3)
             timeout_type = None
@@ -145,90 +153,5 @@ def send_callback(payload: WorkersCallbackPayload, callback_url: str | None = No
                     exceptionType=type(exc).__name__,
                     exceptionMessage=str(exc),
                 )
-                return False
-    return False
-
-
-def derive_finalize_url(callback_url: str | None) -> str | None:
-    if not callback_url:
-        return None
-    parsed = urlparse(callback_url)
-    if not parsed.scheme or not parsed.netloc:
-        return None
-    if parsed.path.endswith('/api/interviews/transcription-callback'):
-        return f'{parsed.scheme}://{parsed.netloc}/api/interviews/finalize'
-    return None
-
-
-def resolve_finalize_url(callback_url: str | None) -> str | None:
-    configured = SETTINGS.workers_finalize_url.strip()
-    if configured:
-        return configured
-    fallback = SETTINGS.workers_callback_url.strip()
-    return derive_finalize_url(callback_url) or derive_finalize_url(fallback)
-
-
-def send_finalize(recording_id: str, callback_url: str | None = None) -> tuple[bool, str | None]:
-    final_url = resolve_finalize_url(callback_url)
-    if not final_url:
-        log_event(logger, 'warning', 'finalize_skipped_no_url', recordingId=recording_id, finalizeUrl=None)
-        return False, None
-
-    timeout = _timeout_config()
-    started_at = time.perf_counter()
-    log_event(
-        logger,
-        'info',
-        'finalize_attempt_started',
-        recordingId=recording_id,
-        finalizeUrl=final_url,
-        connectTimeoutSeconds=timeout.connect,
-        readTimeoutSeconds=timeout.read,
-    )
-    try:
-        resp = httpx.post(
-            final_url,
-            json={'recordingId': recording_id, 'force': False},
-            headers={'x-webhook-secret': SETTINGS.workers_callback_token},
-            timeout=timeout,
-        )
-        elapsed = round(time.perf_counter() - started_at, 3)
-        body_preview = preview_text(resp.text, max_len=250)
-        if resp.status_code >= 400:
-            log_event(
-                logger,
-                'warning',
-                'finalize_attempt_failed',
-                recordingId=recording_id,
-                finalizeUrl=final_url,
-                httpStatus=resp.status_code,
-                elapsedSeconds=elapsed,
-                responseBodyPreview=body_preview,
-            )
-            return False, final_url
-        log_event(
-            logger,
-            'info',
-            'finalize_attempt_succeeded',
-            recordingId=recording_id,
-            finalizeUrl=final_url,
-            httpStatus=resp.status_code,
-            elapsedSeconds=elapsed,
-            responseBodyPreview=body_preview,
-        )
-        return True, final_url
-    except Exception as exc:  # noqa: BLE001
-        elapsed = round(time.perf_counter() - started_at, 3)
-        log_event(
-            logger,
-            'warning',
-            'finalize_attempt_failed',
-            recordingId=recording_id,
-            finalizeUrl=final_url,
-            httpStatus=None,
-            elapsedSeconds=elapsed,
-            responseBodyPreview=preview_text(str(exc), max_len=250),
-            exceptionType=type(exc).__name__,
-            exceptionMessage=str(exc),
-        )
-        return False, final_url
+                return False, None
+    return False, None

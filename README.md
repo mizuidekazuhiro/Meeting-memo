@@ -44,12 +44,9 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 6. Python API が Dropbox から直接取得、`ffprobe` / `ffmpeg` で安全分割
 7. Python API が `gpt-4o-transcribe-diarize` へ `chunking_strategy` を指定して chunkIndex 順に送信
 8. Python API が transcript を chunkIndex 順で結合して Workers callback
-9. Workers が transcript 完了後に要約（summary / tasks）を生成
-10. Workers が Notion に保存（Interview Memo 本体。`Record Type=Interview Memo`）
-11. Workers が二次レビュー（`gpt-5.4-mini` + 任意でWeb検索）を実行
-12. Workers が Notion ページ本文へ完成版メモ/固有名詞補正/未確定事項/次アクション/レビュー情報を追記
-13. Workers が `My Tasks` のみを同一 DB（`INBOX_DB_ID`）へ 1件ずつ追加（`Record Type=Task`）
-14. Workers が Gmail SMTP（アプリパスワード）で完了通知メール送信（レビュー結果を本文に記載）
+9. Workers callback (`/api/interviews/transcription-callback`) は transcript と callback state を保存し、`FINALIZE_QUEUE` に `recordingId` を投入して `202 Accepted` を返す（軽量受信専用）
+10. Cloudflare Queue Consumer が重い finalize（summary / 二次レビュー / Notion追記 / My Tasks登録 / メール送信）を実行
+11. `/api/interviews/job-status` の `finalizeStatus=completed` を最終完了判定とする（callback成功だけでは完了ではない）
 
 ### 二次レビュー機能（重要）
 
@@ -127,6 +124,9 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 - `PYTHON_TRANSCRIBE_API_URL`（ベースURL）
 - `PYTHON_TRANSCRIBE_API_TOKEN`
 - `RECORDING_JOB_KV`（**本番必須**。recording job 永続化用 KV バインディング）
+- `FINALIZE_QUEUE`（Cloudflare Queues producer binding）
+- Queue名: `meeting-memo-finalize`
+- Dead Letter Queue名: `meeting-memo-finalize-dlq`
 - `ALLOW_IN_MEMORY_RECORDING_JOB_STORE`（テスト専用。`true` の時だけ in-memory fallback を許可）
 - `CALLBACK_JOB_LOOKUP_MAX_ATTEMPTS`（callback lookup 最大試行回数。既定: `6`）
 - `CALLBACK_JOB_LOOKUP_BASE_DELAY_MS`（指数 backoff の基準遅延。既定: `200`）
@@ -258,14 +258,15 @@ Python API 実行環境には `ffmpeg` と `ffprobe` が必要です。
 
 ### 新しい設計
 
-- `/api/interviews/transcription-callback` は **軽量受信専用**（認証・payload検証・job state保存・`202 Accepted` 返却）
+- `/api/interviews/transcription-callback` は **軽量受信専用**（認証・payload検証・job state保存・`FINALIZE_QUEUE`投入・`202 Accepted`返却）
 - callback受信では `ctx.waitUntil(finalizeInterviewJob(...))` を起動しない
-- Summary / 2次レビュー / Notion反映 / メール送信 / My Tasks登録は `POST /api/interviews/finalize` が担当
-- Python(Railway) は callback 成功後に `POST /api/interviews/finalize` を実行して完了させる
-- callback 成功は最終完了ではない（`overallStatus=completed` にはならない）
-- `finalizeStatus=succeeded`（Python）および Workers 側 `finalizeStatus=completed` のときのみ全体完了
+- callback受信では `/api/interviews/finalize` をHTTPで呼ばない
+- Summary / 二次レビュー / Notion反映 / My Tasks登録 / メール送信は Queue Consumer が実行
+- callback成功は最終完了ではない
+- 最終完了判定は Workers 側 `finalizeStatus=completed`
 - 手動復旧API:
   - `POST /api/interviews/finalize` `{ "recordingId": "...", "force": false }`
+  - `POST /api/interviews/finalize/enqueue` `{ "recordingId": "...", "force": false }`（推奨）
   - `POST /api/interviews/resend-email` `{ "recordingId": "...", "force": true }`
   - `GET /api/interviews/job-status?recordingId=...`
 - Railway(Python) 手動callback再送API:
@@ -313,6 +314,23 @@ Python API 実行環境には `ffmpeg` と `ffprobe` が必要です。
 
 - `CALLBACK_CONNECT_TIMEOUT_SEC`（既定: 10秒）
 - `CALLBACK_READ_TIMEOUT_SEC`（既定: 60秒）
-- `WORKERS_FINALIZE_URL`（任意。未設定時は `WORKERS_CALLBACK_URL` またはリクエスト `callbackUrl` から `/api/interviews/finalize` を導出）
 - callback送信は `0s -> 10s -> 30s -> 60s` の指数バックオフで再試行
 - 全失敗時は completed 扱いにせず、`transcribed_callback_failed` 状態で保持
+
+## Cloudflare Queue 作成・デプロイ手順
+
+1. Queue作成（既に存在する場合は再作成不要）
+   - `wrangler queues create meeting-memo-finalize`
+   - `wrangler queues create meeting-memo-finalize-dlq`
+2. `wrangler.toml` に Queue producer / consumer 設定を反映
+3. デプロイ
+   - `wrangler deploy`
+4. 動作確認
+   - 録音をアップロード
+   - Railwayで `callback_attempt_succeeded` を確認
+   - Workersで `finalize_queue_enqueue_succeeded` を確認
+   - Workersで `finalize_queue_message_started` を確認
+   - Workersで `summary_generation_completed` を確認
+   - Workersで `review_completed` を確認
+   - Workersで `finalize_completed` を確認
+   - `/api/interviews/job-status` で `finalizeStatus: completed` を確認

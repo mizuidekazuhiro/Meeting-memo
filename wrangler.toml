@@ -25,3 +25,14 @@ INBOX_TRIAGE_BASE_URL = "https://notion-inbox-triage.kazuhiro-mizuide.workers.de
 [[kv_namespaces]]
 binding = "RECORDING_JOB_KV"
 id = "a6760676704e4a1fac83ddff1b16222d"
+
+[[queues.producers]]
+binding = "FINALIZE_QUEUE"
+queue = "meeting-memo-finalize"
+
+[[queues.consumers]]
+queue = "meeting-memo-finalize"
+max_batch_size = 1
+max_batch_timeout = 5
+max_retries = 3
+dead_letter_queue = "meeting-memo-finalize-dlq"

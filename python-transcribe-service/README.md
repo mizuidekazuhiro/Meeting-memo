@@ -8,7 +8,7 @@
 - Workers が Dropbox 保存成功 metadata を起点に処理
 - 長時間音声（または Workers 側で安全判定できない音声）だけをこの API に委譲
 - 本サービスが Dropbox 直接取得 / ffprobe / ffmpeg chunking / OpenAI diarized transcription を担当
-- 文字起こし結果を Workers callback へ返却
+- 文字起こし結果を Workers callback へ返却（このサービスは finalize 完了まで待たない）
 
 ## エンドポイント
 
@@ -58,6 +58,7 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 - OpenAI SDK 側で `Unexpected audio response format: diarized_json` warning が出ても、normalize 層で返却型差分を吸収して処理継続
 - chunkIndex 順に transcript を merge
 - callback 失敗はログ化するが、transcription 本体成功は失敗扱いにしない（`callbackSucceeded` で返す）
+- callback 成功後の最終化は Cloudflare Queues 上で Workers が処理するため、Python 側 `overallStatus` は `callback_delivered_finalize_*` で管理する
 - `/jobs/transcribe` はバックグラウンド実行だが、ジョブ内部は同期パイプラインのため長時間音声では完了まで時間がかかる
 - chunk 単位（chunkIndex / ffprobe metadata / OpenAI request-response要約）の構造化ログで原因追跡できる
 

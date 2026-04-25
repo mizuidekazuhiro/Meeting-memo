@@ -483,6 +483,12 @@ export async function persistTranscriptionCallback(env: Env, payload: RecordingJ
     transcript: payload.transcript,
     sourceDurationSec: payload.sourceDurationSec,
     finalizeStatus: 'pending',
+    finalizeQueuedAt: undefined,
+    finalizeStartedAt: undefined,
+    finalizeCompletedAt: undefined,
+    finalizeFailedAt: undefined,
+    finalizeAttemptCount: 0,
+    finalizeSource: 'callback',
     lastError: undefined,
   });
 
@@ -496,7 +502,7 @@ export async function persistTranscriptionCallback(env: Env, payload: RecordingJ
 
   return {
     action: 'processed',
-    reason: 'Callback accepted and persisted. Finalization must be triggered separately.',
+    reason: 'Callback accepted and persisted. Finalization is queued separately.',
     dedupCandidates: buildDedupCandidates(job.request, { id: job.dropboxFileId, path_lower: job.dropboxPathLower, name: job.fileName }),
   };
 }
@@ -542,8 +548,15 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
     });
   }
 
-  logEvent('info', 'finalize_started', { recordingId, force, forceEmail });
-  await updateRecordingJobStatus(env, { recordingId }, 'finalizing', { finalizeStatus: 'running', lastError: undefined });
+  const finalizeStartedAt = new Date().toISOString();
+  logEvent('info', 'finalize_started', { recordingId, force, forceEmail, finalizeStartedAt });
+  await updateRecordingJobStatus(env, { recordingId }, 'finalizing', {
+    finalizeStatus: 'running',
+    finalizeStartedAt,
+    finalizeSource: job.finalizeSource ?? 'manual',
+    finalizeAttemptCount: (job.finalizeAttemptCount ?? 0) + 1,
+    lastError: undefined,
+  });
 
   try {
     const current = (await getRecordingJob(env, { recordingId }))!;
@@ -605,14 +618,36 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
 
     if (shouldRunInterviewReview(env) && (!mutable.reviewCompletedAt || force)) {
       logEvent('info', 'review_started', { recordingId });
-      const review = await reviewInterviewWithWebSearch(env, { transcript: mutable.transcript!, insights, title: mutable.fileName, fileName: mutable.fileName, notionPageUrl: pageId ? buildNotionPageUrl(pageId) : undefined });
-      reviewResult = review;
-      if (pageId) {
-        await appendReviewedMemoToNotionPage(env, pageId, review, ensureInterviewRecord(mutable, mutable.transcript!, insights));
+      try {
+        const review = await reviewInterviewWithWebSearch(env, { transcript: mutable.transcript!, insights, title: mutable.fileName, fileName: mutable.fileName, notionPageUrl: pageId ? buildNotionPageUrl(pageId) : undefined });
+        reviewResult = review;
+        if (pageId) {
+          await appendReviewedMemoToNotionPage(env, pageId, review, ensureInterviewRecord(mutable, mutable.transcript!, insights));
+        }
+        await updateRecordingJobStatus(env, { recordingId }, 'transcribed', { reviewCompletedAt: new Date().toISOString() });
+        mutable = (await getRecordingJob(env, { recordingId }))!;
+        logEvent('info', 'review_completed', { recordingId });
+      } catch (error) {
+        logEvent('error', 'review_failed', {
+          recordingId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+        if (pageId) {
+          try {
+            await appendInterviewReviewFailureToNotionPage(env, pageId, {
+              message: error instanceof Error ? error.message : String(error),
+              error,
+            });
+          } catch (notionError) {
+            logEvent('warn', 'review_failure_append_failed', {
+              recordingId,
+              notionPageId: pageId,
+              message: notionError instanceof Error ? notionError.message : String(notionError),
+            });
+          }
+        }
+        throw error;
       }
-      await updateRecordingJobStatus(env, { recordingId }, 'transcribed', { reviewCompletedAt: new Date().toISOString() });
-      mutable = (await getRecordingJob(env, { recordingId }))!;
-      logEvent('info', 'review_completed', { recordingId });
     } else if (!shouldRunInterviewReview(env)) {
       logEvent('info', 'review_skipped_not_configured', { recordingId });
     }
@@ -678,19 +713,26 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
 
     const canSendEmail = shouldSendCompletionEmail(env);
     if (!canSendEmail) {
-      logEvent('warn', 'email_skipped_missing_config', { recordingId });
+      logEvent('warn', 'email_send_failed', { recordingId, reason: 'email configuration missing' });
     } else if (!mutable.emailSentAt || force || forceEmail) {
       logEvent('info', 'email_send_started', { recordingId, fileName: mutable.fileName, notionPageUrl: mutable.notionPageUrl ?? null });
-      await sendCompletionEmail(env, {
-        subject: env.MAIL_SUBJECT_PREFIX ?? 'Interview Memo 完了通知',
-        notionPageUrl: mutable.notionPageUrl ?? (pageId ? buildNotionPageUrl(pageId) : ''),
-        summary: insights?.summary ?? '',
-        transcript: mutable.transcript?.fullText ?? '',
-        myTasks: [],
-      });
-      await updateRecordingJobStatus(env, { recordingId }, 'transcribed', { emailSentAt: new Date().toISOString() });
-      logEvent('info', 'email_send_completed', { recordingId });
-      mutable = (await getRecordingJob(env, { recordingId }))!;
+      try {
+        await sendCompletionEmail(env, {
+          subject: env.MAIL_SUBJECT_PREFIX ?? 'Interview Memo 完了通知',
+          notionPageUrl: mutable.notionPageUrl ?? (pageId ? buildNotionPageUrl(pageId) : ''),
+          summary: insights?.summary ?? '',
+          transcript: mutable.transcript?.fullText ?? '',
+          myTasks: [],
+        });
+        await updateRecordingJobStatus(env, { recordingId }, 'transcribed', { emailSentAt: new Date().toISOString() });
+        logEvent('info', 'email_send_completed', { recordingId });
+        mutable = (await getRecordingJob(env, { recordingId }))!;
+      } catch (error) {
+        logEvent('warn', 'email_send_failed', {
+          recordingId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
     } else {
       logEvent('info', 'email_skipped_already_sent', { recordingId, emailSentAt: mutable.emailSentAt });
     }
@@ -698,6 +740,7 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
     await updateRecordingJobStatus(env, { recordingId }, 'completed', {
       summaryWrittenAt: mutable.summaryWrittenAt ?? new Date().toISOString(),
       finalizeStatus: 'completed',
+      finalizeCompletedAt: new Date().toISOString(),
       callbackStatus: 'succeeded',
       lastError: undefined,
     });
@@ -705,7 +748,12 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
     return { ok: true, status: 'completed' };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await updateRecordingJobStatus(env, { recordingId }, 'failed', { finalizeStatus: 'failed', lastError: message });
+    logEvent('error', 'finalize_failed', { recordingId, message });
+    await updateRecordingJobStatus(env, { recordingId }, 'failed', {
+      finalizeStatus: 'failed',
+      finalizeFailedAt: new Date().toISOString(),
+      lastError: message,
+    });
     throw error;
   }
 }
@@ -723,6 +771,12 @@ export async function getInterviewJobStatus(env: Env, recordingId: string): Prom
     reviewCompletedAt: job.reviewCompletedAt,
     emailSentAt: job.emailSentAt,
     finalizeStatus: job.finalizeStatus,
+    finalizeQueuedAt: job.finalizeQueuedAt,
+    finalizeStartedAt: job.finalizeStartedAt,
+    finalizeCompletedAt: job.finalizeCompletedAt,
+    finalizeFailedAt: job.finalizeFailedAt,
+    finalizeAttemptCount: job.finalizeAttemptCount,
+    finalizeSource: job.finalizeSource,
     lastError: job.lastError,
     notionPageId: job.notionPageId,
     notionPageUrl: job.notionPageUrl,

@@ -48,6 +48,7 @@ function makeEnv(kv: MockKv, overrides: Record<string, unknown> = {}) {
     OPENAI_API_KEY: 'openai-test',
     INTERVIEW_REVIEW_ENABLED: 'false',
     RECORDING_JOB_KV: kv,
+    FINALIZE_QUEUE: { send: async () => undefined },
     ...overrides,
   } as any;
 }
@@ -168,7 +169,8 @@ test('callback endpoint returns 202, stores callback state, and does not schedul
   const { createRecordingJob, upsertRecordingJob, getRecordingJob } = jobsMod;
 
   const kv = new MockKv();
-  const env = makeEnv(kv);
+  const queueMessages: any[] = [];
+  const env = makeEnv(kv, { FINALIZE_QUEUE: { send: async (message: unknown) => { queueMessages.push(message); } } });
   const job = createRecordingJob({ request: { fileName: 'a.m4a' }, dropboxFileId: 'id:1', dropboxPathLower: '/apps/meetingmemo/inbox/a.m4a', fileName: 'a.m4a' });
   await upsertRecordingJob(env, job);
 
@@ -189,8 +191,10 @@ test('callback endpoint returns 202, stores callback state, and does not schedul
   assert.equal(response.status, 202);
   assert.equal(updated?.status, 'callback_received');
   assert.equal(updated?.callbackStatus, 'received');
+  assert.equal(queueMessages.length, 1);
   const body = await response.json();
-  assert.equal(body.reason, 'Callback accepted and persisted. Finalization must be triggered separately.');
+  assert.equal(body.reason, 'Callback accepted, persisted, and finalize job enqueued.');
+  assert.equal(body.finalizeQueued, true);
   assert.ok(calls.includes('callback_ack_returned'));
   assert.ok(!calls.includes('finalize-called'));
 });
@@ -211,6 +215,27 @@ test('callback persistence path stores transcript payload and remains lightweigh
   assert.equal(updated?.status, 'callback_received');
   assert.equal(updated?.transcript?.fullText, 'hello world');
   assert.equal(updated?.finalizeStatus, 'pending');
+});
+
+test('callback returns error when queue enqueue fails', async () => {
+  const { workerMod, jobsMod } = await loadDeps();
+  const worker = workerMod.default;
+  const { createRecordingJob, upsertRecordingJob } = jobsMod;
+
+  const kv = new MockKv();
+  const env = makeEnv(kv, {
+    FINALIZE_QUEUE: { send: async () => { throw new Error('queue down'); } },
+  });
+  const job = createRecordingJob({ request: { fileName: 'queue-fail.m4a' }, dropboxFileId: 'id:qf', dropboxPathLower: '/apps/meetingmemo/inbox/queue-fail.m4a', fileName: 'queue-fail.m4a' });
+  await upsertRecordingJob(env, job);
+
+  const response = await worker.fetch(new Request('https://example.com/api/interviews/transcription-callback', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-webhook-secret': env.INTERVIEW_WEBHOOK_SECRET },
+    body: JSON.stringify(transcriptPayload({ recordingId: job.recordingId })),
+  }), env, { waitUntil: () => undefined });
+
+  assert.equal(response.status, 500);
 });
 
 test('finalize endpoint forwards recordingId to finalizeInterviewJob', async () => {
@@ -237,6 +262,32 @@ test('finalize endpoint forwards recordingId to finalizeInterviewJob', async () 
   const body = await response.json();
   assert.equal(body.ok, true);
   assert.deepEqual(calls, [{ recordingId: 'rec-finalize', force: false }]);
+});
+
+test('finalize enqueue endpoint enqueues only', async () => {
+  const { workerMod, processingMod } = await loadDeps();
+  const worker = workerMod.default;
+  const kv = new MockKv();
+  const sent: any[] = [];
+  const env = makeEnv(kv, { FINALIZE_QUEUE: { send: async (message: any) => sent.push(message) } });
+
+  const originalFinalize = processingMod.finalizeInterviewJob;
+  let finalizeCalls = 0;
+  processingMod.finalizeInterviewJob = (async () => {
+    finalizeCalls += 1;
+    return { ok: true, status: 'completed' };
+  }) as any;
+
+  const response = await worker.fetch(new Request('https://example.com/api/interviews/finalize/enqueue', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-webhook-secret': env.INTERVIEW_WEBHOOK_SECRET },
+    body: JSON.stringify({ recordingId: 'rec-enqueue', force: false }),
+  }), env, { waitUntil: () => undefined });
+  processingMod.finalizeInterviewJob = originalFinalize;
+
+  assert.equal(response.status, 202);
+  assert.equal(sent.length, 1);
+  assert.equal(finalizeCalls, 0);
 });
 
 test('finalizeInterviewJob executes transcript -> summary -> email and marks completed', async () => {
@@ -493,4 +544,57 @@ test('callback not found still returns lookup error', async () => {
       return true;
     },
   );
+});
+
+test('queue handler calls finalizeInterviewJob and acknowledges on success', async () => {
+  const { workerMod, processingMod } = await loadDeps();
+  const worker = workerMod.default;
+
+  const calls: Array<{ recordingId: string; force: boolean }> = [];
+  const originalFinalize = processingMod.finalizeInterviewJob;
+  processingMod.finalizeInterviewJob = (async (_env: any, recordingId: string, options: { force?: boolean }) => {
+    calls.push({ recordingId, force: options.force === true });
+    return { ok: true, status: 'completed' };
+  }) as any;
+
+  let acked = 0;
+  let retried = 0;
+  await worker.queue({
+    messages: [{
+      body: { recordingId: 'rec-queue-ok', force: false, source: 'callback', enqueuedAt: new Date().toISOString() },
+      ack: () => { acked += 1; },
+      retry: () => { retried += 1; },
+      attempts: 1,
+    }],
+  }, makeEnv(new MockKv()));
+  processingMod.finalizeInterviewJob = originalFinalize;
+
+  assert.deepEqual(calls, [{ recordingId: 'rec-queue-ok', force: false }]);
+  assert.equal(acked, 1);
+  assert.equal(retried, 0);
+});
+
+test('queue handler marks retry on finalize failure', async () => {
+  const { workerMod, processingMod } = await loadDeps();
+  const worker = workerMod.default;
+
+  const originalFinalize = processingMod.finalizeInterviewJob;
+  processingMod.finalizeInterviewJob = (async () => {
+    throw new Error('queue finalize failed');
+  }) as any;
+
+  let acked = 0;
+  let retried = 0;
+  await worker.queue({
+    messages: [{
+      body: { recordingId: 'rec-queue-fail', force: false, source: 'retry', enqueuedAt: new Date().toISOString() },
+      ack: () => { acked += 1; },
+      retry: () => { retried += 1; },
+      attempts: 2,
+    }],
+  }, makeEnv(new MockKv()));
+  processingMod.finalizeInterviewJob = originalFinalize;
+
+  assert.equal(acked, 0);
+  assert.equal(retried, 1);
 });
