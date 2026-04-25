@@ -43,6 +43,7 @@ def test_transcribe_job_success_and_processing_seconds(monkeypatch):
 
     class SuccessPayload:
         recordingId = 'rec-1'
+        transcript = type('Transcript', (), {'fullText': 'hello', 'segments': []})()
 
     class SuccessService:
         def process(self, job, source_bytes):
@@ -84,7 +85,7 @@ def test_transcribe_job_success_and_processing_seconds(monkeypatch):
     assert isinstance(body['processingSeconds'], float)
 
 
-def test_transcribe_job_callback_failure_keeps_completed(monkeypatch):
+def test_transcribe_job_callback_failure_marks_callback_failed(monkeypatch):
     import main
 
     class FakeDropbox:
@@ -93,6 +94,7 @@ def test_transcribe_job_callback_failure_keeps_completed(monkeypatch):
 
     class SuccessPayload:
         recordingId = 'rec-cb-fail'
+        transcript = type('Transcript', (), {'fullText': 'hello', 'segments': []})()
 
     class SuccessService:
         def process(self, job, source_bytes):
@@ -121,7 +123,7 @@ def test_transcribe_job_callback_failure_keeps_completed(monkeypatch):
     status_response = client.get('/jobs/transcribe/rec-cb-fail', headers={'authorization': f'Bearer {token}'})
     assert status_response.status_code == 200
     body = status_response.json()
-    assert body['status'] == 'completed'
+    assert body['status'] == 'callback_failed'
     assert body['callbackSucceeded'] is False
 
 

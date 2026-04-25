@@ -7,12 +7,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException
+from pydantic import BaseModel
 
 from auth import require_bearer_token
 from callback_client import send_callback
 from dropbox_client import DropboxClient
 from logging_utils import configure_logging, get_logger, log_event, preview_text
-from models import TranscriptionJobRequest
+from models import TranscriptionJobRequest, WorkersCallbackPayload
 from transcription_service import TranscriptionProcessingError, TranscriptionService
 
 configure_logging()
@@ -31,7 +32,15 @@ class JobState:
     callback_succeeded: bool | None = None
     error: str | None = None
     processing_seconds: float | None = None
+    callback_status: str = 'pending'
+    transcription_status: str = 'pending'
+    overall_status: str = 'queued'
     updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    payload: WorkersCallbackPayload | None = None
+
+
+class CallbackRetryRequest(BaseModel):
+    callbackUrl: str | None = None
 
 
 job_states: dict[str, JobState] = {}
@@ -51,53 +60,44 @@ def update_job_state(recording_id: str, status: str, **kwargs) -> JobState:
 
 
 def _process_job_async(job: TranscriptionJobRequest) -> None:
-    update_job_state(job.recordingId, 'running')
+    update_job_state(job.recordingId, 'running', transcription_status='running', overall_status='running', callback_status='pending')
     started_at = time.perf_counter()
-    log_event(
-        logger,
-        'info',
-        'transcribe lifecycle start',
-        recordingId=job.recordingId,
-        dropboxFileId=job.dropboxFileId,
-        dropboxPathLower=job.dropboxPathLower,
-        fileName=job.fileName,
-        callbackUrlOverride=bool(job.callbackUrl),
-        processingMode='async-background',
-    )
+    log_event(logger, 'info', 'transcription_started', recordingId=job.recordingId, dropboxFileId=job.dropboxFileId, dropboxPathLower=job.dropboxPathLower, fileName=job.fileName)
     try:
         source = dropbox.download_file(job.dropboxFileId, job.dropboxPathLower)
         payload = service.process(job, source)
+        log_event(logger, 'info', 'transcript_merge_completed', recordingId=job.recordingId, transcriptLength=len(payload.transcript.fullText), segmentCount=len(payload.transcript.segments))
+
         callback_succeeded = send_callback(payload, callback_url=job.callbackUrl)
         elapsed = round(time.perf_counter() - started_at, 3)
-        update_job_state(job.recordingId, 'completed', callback_succeeded=callback_succeeded, error=None, processing_seconds=elapsed)
         if callback_succeeded:
-            log_event(
-                logger,
-                'info',
-                'callback completed',
-                recordingId=job.recordingId,
-                callbackSucceeded=True,
-                callbackUrlOverride=bool(job.callbackUrl),
+            update_job_state(
+                job.recordingId,
+                'completed',
+                payload=payload,
+                callback_succeeded=True,
+                callback_status='succeeded',
+                transcription_status='transcribed',
+                overall_status='completed',
+                error=None,
+                processing_seconds=elapsed,
             )
-        else:
-            log_event(
-                logger,
-                'warning',
-                'callback failed but transcription marked successful',
-                recordingId=job.recordingId,
-                callbackSucceeded=False,
-                callbackUrlOverride=bool(job.callbackUrl),
-                retryAttempted=False,
-                reason='send_callback returned False',
-            )
-        log_event(
-            logger,
-            'info',
-            'transcribe lifecycle complete',
-            recordingId=job.recordingId,
-            status='completed',
-            processingSeconds=elapsed,
+            log_event(logger, 'info', 'callback_attempt_succeeded', recordingId=job.recordingId)
+            log_event(logger, 'info', 'lifecycle_completed', recordingId=job.recordingId, transcriptionStatus='transcribed', callbackStatus='succeeded', overallStatus='completed', processingSeconds=elapsed)
+            return
+
+        update_job_state(
+            job.recordingId,
+            'callback_failed',
+            payload=payload,
+            callback_succeeded=False,
+            callback_status='failed',
+            transcription_status='transcribed',
+            overall_status='transcribed_callback_failed',
+            error='callback delivery failed after retries',
+            processing_seconds=elapsed,
         )
+        log_event(logger, 'warning', 'lifecycle_finished_with_callback_failed', recordingId=job.recordingId, transcriptionStatus='transcribed', callbackStatus='failed', overallStatus='transcribed_callback_failed', processingSeconds=elapsed)
     except Exception as exc:  # noqa: BLE001
         elapsed = round(time.perf_counter() - started_at, 3)
         phase = 'unknown'
@@ -107,7 +107,7 @@ def _process_job_async(job: TranscriptionJobRequest) -> None:
             phase = exc.source
             failed_chunk_index = exc.chunk_index
             status_code = exc.external_status_code
-        update_job_state(job.recordingId, 'failed', error=str(exc), callback_succeeded=False, processing_seconds=elapsed)
+        update_job_state(job.recordingId, 'failed', error=str(exc), callback_succeeded=False, callback_status='failed', transcription_status='failed', overall_status='failed', processing_seconds=elapsed)
         log_event(
             logger,
             'error',
@@ -131,41 +131,38 @@ def health() -> dict[str, bool]:
 @app.post('/jobs/transcribe', dependencies=[Depends(require_bearer_token)], status_code=202)
 def transcribe_job(job: TranscriptionJobRequest) -> dict[str, object]:
     request_started_at = time.perf_counter()
-    log_event(
-        logger,
-        'info',
-        'jobs/transcribe request accepted',
-        recordingId=job.recordingId,
-        callbackUrlOverride=bool(job.callbackUrl),
-        processingMode='async-background',
-        note='Long audio can take a long time because processing is synchronous inside the worker thread.',
-    )
+    log_event(logger, 'info', 'jobs/transcribe request accepted', recordingId=job.recordingId, callbackUrlOverride=bool(job.callbackUrl), processingMode='async-background')
     with job_states_lock:
         state = job_states.get(job.recordingId)
         if state and state.status in {'queued', 'running'}:
             elapsed = round(time.perf_counter() - request_started_at, 3)
-            log_event(logger, 'info', 'jobs/transcribe request deduplicated', recordingId=job.recordingId, status=state.status, requestSeconds=elapsed)
-            return {
-                'ok': True,
-                'recordingId': job.recordingId,
-                'status': state.status,
-                'accepted': True,
-                'requestSeconds': elapsed,
-                'processingSeconds': state.processing_seconds,
-            }
+            return {'ok': True, 'recordingId': job.recordingId, 'status': state.status, 'accepted': True, 'requestSeconds': elapsed, 'processingSeconds': state.processing_seconds}
 
     updated = update_job_state(job.recordingId, 'queued', attempts=(state.attempts + 1 if state else 1), callback_succeeded=None, error=None)
     executor.submit(_process_job_async, job)
     elapsed = round(time.perf_counter() - request_started_at, 3)
-    log_event(logger, 'info', 'jobs/transcribe request finished', recordingId=job.recordingId, status=updated.status, requestSeconds=elapsed)
-    return {
-        'ok': True,
-        'recordingId': job.recordingId,
-        'status': updated.status,
-        'accepted': True,
-        'requestSeconds': elapsed,
-        'processingSeconds': updated.processing_seconds,
-    }
+    return {'ok': True, 'recordingId': job.recordingId, 'status': updated.status, 'accepted': True, 'requestSeconds': elapsed, 'processingSeconds': updated.processing_seconds}
+
+
+@app.post('/jobs/{recording_id}/callback/retry', dependencies=[Depends(require_bearer_token)])
+def retry_callback(recording_id: str, body: CallbackRetryRequest) -> dict[str, object]:
+    with job_states_lock:
+        state = job_states.get(recording_id)
+    if not state:
+        raise HTTPException(status_code=404, detail={'message': 'recordingId not found', 'recordingId': recording_id})
+    if not state.payload:
+        raise HTTPException(status_code=400, detail={'message': 'transcription payload not found for callback retry', 'recordingId': recording_id})
+
+    log_event(logger, 'info', 'callback_retry_started', recordingId=recording_id, manual=True)
+    callback_succeeded = send_callback(state.payload, callback_url=body.callbackUrl)
+    if callback_succeeded:
+        updated = update_job_state(recording_id, 'completed', callback_succeeded=True, callback_status='succeeded', overall_status='completed', error=None)
+        log_event(logger, 'info', 'callback_retry_succeeded', recordingId=recording_id, manual=True)
+        return {'ok': True, 'recordingId': recording_id, 'status': updated.status, 'callbackStatus': updated.callback_status, 'overallStatus': updated.overall_status}
+
+    updated = update_job_state(recording_id, 'callback_failed', callback_succeeded=False, callback_status='failed', overall_status='transcribed_callback_failed', error='manual callback retry failed')
+    log_event(logger, 'warning', 'callback_retry_failed', recordingId=recording_id, manual=True)
+    return {'ok': False, 'recordingId': recording_id, 'status': updated.status, 'callbackStatus': updated.callback_status, 'overallStatus': updated.overall_status}
 
 
 @app.get('/jobs/transcribe/{recording_id}', dependencies=[Depends(require_bearer_token)])
@@ -175,12 +172,8 @@ def get_transcribe_job_status(recording_id: str) -> dict[str, object]:
     if not state:
         raise HTTPException(status_code=404, detail={'message': 'recordingId not found', 'recordingId': recording_id})
 
-    detail: dict[str, object] | None = None
-    if state.error:
-        detail = {'message': 'transcription job failed', 'recordingId': state.recording_id}
-
     if state.status == 'failed':
-        raise HTTPException(status_code=500, detail=detail or {'message': 'transcription job failed', 'recordingId': state.recording_id})
+        raise HTTPException(status_code=500, detail={'message': 'transcription job failed', 'recordingId': state.recording_id})
 
     return {
         'ok': True,
@@ -188,6 +181,9 @@ def get_transcribe_job_status(recording_id: str) -> dict[str, object]:
         'status': state.status,
         'attempts': state.attempts,
         'callbackSucceeded': state.callback_succeeded,
+        'callbackStatus': state.callback_status,
+        'transcriptionStatus': state.transcription_status,
+        'overallStatus': state.overall_status,
         'error': state.error,
         'processingSeconds': state.processing_seconds,
         'updatedAt': state.updated_at,

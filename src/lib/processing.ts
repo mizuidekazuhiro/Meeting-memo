@@ -1,4 +1,4 @@
-import type { DropboxFileMetadata, Env, IntakeRequest, ProcessInterviewResult, RecordingJob, RecordingJobCallbackPayload } from '../types';
+import type { DropboxFileMetadata, Env, IntakeRequest, InterviewInsights, ProcessInterviewResult, RecordingJob, RecordingJobCallbackPayload, TranscriptResult } from '../types';
 import { buildDedupCandidates } from './dedup';
 import { downloadDropboxFile } from './dropbox';
 import { getCompletionEmailConfig, sendCompletionEmail, shouldSendCompletionEmail } from './gmail';
@@ -425,331 +425,206 @@ export async function processUploadedInterview(
 }
 
 export async function persistTranscriptionCallback(env: Env, payload: RecordingJobCallbackPayload): Promise<ProcessInterviewResult> {
-  const recordingId = payload.recordingId?.trim();
-  const dropboxFileId = payload.dropboxFileId?.trim();
-  const rawDropboxPathLower = payload.dropboxPathLower;
-  const dropboxPathLower = normalizeDropboxPath(payload.dropboxPathLower);
-  const fileName = payload.fileName?.trim();
-  const storageMeta = getRecordingJobStorageMeta(env);
-  const retryConfig = buildCallbackLookupRetryConfig(env);
-
-  logEvent('info', 'recording job lookup started', {
-    event: 'recording job lookup started',
-    recordingId: recordingId ?? null,
-    dropboxFileId: dropboxFileId ?? null,
-    dropboxPathLower: dropboxPathLower ?? null,
-    fileName: fileName ?? null,
-    requestId: payload.requestId ?? null,
-    rawValues: {
+  const lookup = await findRecordingJobWithSource(env, {
+    recordingId: payload.recordingId?.trim(),
+    dropboxFileId: payload.dropboxFileId?.trim(),
+    dropboxPathLower: normalizeDropboxPath(payload.dropboxPathLower),
+  });
+  const job = lookup.job;
+  if (!job) {
+    logEvent('error', 'callback_payload_invalid', {
       recordingId: payload.recordingId ?? null,
       dropboxFileId: payload.dropboxFileId ?? null,
-      dropboxPathLower: rawDropboxPathLower ?? null,
-      fileName: payload.fileName ?? null,
-    },
-    normalizedValues: {
-      recordingId: recordingId ?? null,
-      dropboxFileId: dropboxFileId ?? null,
-      dropboxPathLower: dropboxPathLower ?? null,
-      fileName: fileName ?? null,
-    },
-    retryConfig,
-    storageType: storageMeta.storageType,
-    storageModeDecision: storageMeta.storageModeDecision,
+      dropboxPathLower: payload.dropboxPathLower ?? null,
+    });
+    throw new HttpError('Recording job not found for callback.', 404, { phase: 'lookup_job' });
+  }
+
+  const now = new Date().toISOString();
+  await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'callback_received', {
+    callbackStatus: 'received',
+    callbackReceivedAt: now,
+    transcript: payload.transcript,
+    sourceDurationSec: payload.sourceDurationSec,
+    finalizeStatus: 'pending',
+    lastError: undefined,
   });
 
-  let lookup: Awaited<ReturnType<typeof findRecordingJobWithSource>> | null = null;
-  let lastAttempt = 0;
-  let totalWaitMs = 0;
-  const lastTriedSources: string[] = [];
-
-  for (let attempt = 1; attempt <= retryConfig.maxAttempts; attempt += 1) {
-    const waitedMs = getRetryDelayMs(attempt, retryConfig);
-    if (waitedMs > 0) {
-      await waitMs(waitedMs);
-      totalWaitMs += waitedMs;
-    }
-
-    logEvent('info', 'recording job lookup attempt', {
-      event: 'recording job lookup attempt',
-      attempt,
-      waitedMs,
-      totalWaitMs,
-      recordingId: recordingId ?? null,
-      dropboxFileId: dropboxFileId ?? null,
-      dropboxPathLower: dropboxPathLower ?? null,
-      fileName: fileName ?? null,
-      requestId: payload.requestId ?? null,
-      storageType: storageMeta.storageType,
-      storageModeDecision: storageMeta.storageModeDecision,
-    });
-
-    lookup = await findRecordingJobWithSource(env, { recordingId, dropboxFileId, dropboxPathLower });
-    lastAttempt = attempt;
-    lastTriedSources.push(lookup.source ?? 'none');
-    if (lookup.job) break;
-  }
-
-  const job = lookup?.job;
-  if (!job) {
-    const transcriptPreview = payload.transcript?.fullText ? payload.transcript.fullText.slice(0, 512) : '';
-    logEvent('error', 'recording job lookup not found', {
-      event: 'recording job lookup not found',
-      recordingId: recordingId ?? null,
-      dropboxFileId: dropboxFileId ?? null,
-      dropboxPathLower: dropboxPathLower ?? null,
-      fileName: fileName ?? null,
-      requestId: payload.requestId ?? null,
-      transcriptPreview,
-      transcriptPreviewLength: transcriptPreview.length,
-      transcriptSegmentCount: payload.transcript?.segments?.length ?? 0,
-      attempts: lastAttempt,
-      totalWaitMs,
-      lastTriedSources,
-      storageType: storageMeta.storageType,
-      storageModeDecision: storageMeta.storageModeDecision,
-    });
-    throw new HttpError('Recording job not found for callback.', 404, {
-      phase: 'lookup_job',
-      attempts: lastAttempt,
-      totalWaitMs,
-      recordingId: recordingId ?? null,
-      dropboxFileId: dropboxFileId ?? null,
-      dropboxPathLower: dropboxPathLower ?? null,
-    });
-  }
-
-  logEvent('info', 'recording job lookup hit', {
-    foundBy: lookup?.source,
-    attempts: lastAttempt,
-    totalWaitMs,
+  logEvent('info', 'callback_state_saved', {
     recordingId: job.recordingId,
     fileName: job.fileName,
-    requestId: payload.requestId ?? null,
-    internalKey: `recordingJob:recordingId:${job.recordingId}`,
     dropboxFileId: job.dropboxFileId,
     dropboxPathLower: job.dropboxPathLower,
-    storageType: storageMeta.storageType,
-    storageModeDecision: storageMeta.storageModeDecision,
+    callbackReceivedAt: now,
   });
-
-  if (job.status === 'persisted' && job.callbackStatus === 'persisted') {
-    logEvent('info', 'callback duplicate ignored', {
-      recordingId: job.recordingId,
-      fileName: job.fileName,
-      requestId: payload.requestId ?? null,
-      dropboxFileId: job.dropboxFileId,
-      dropboxPathLower: job.dropboxPathLower,
-      status: job.status,
-      storageType: storageMeta.storageType,
-      storageModeDecision: storageMeta.storageModeDecision,
-      callbackPersistedOrSkipped: 'skipped',
-    });
-    return {
-      action: 'processed',
-      reason: 'Duplicate callback ignored because recording job is already persisted.',
-      dedupCandidates: buildDedupCandidates(job.request, {
-        id: job.dropboxFileId,
-        path_lower: job.dropboxPathLower,
-        name: job.fileName,
-      }),
-    };
-  }
-
-  const metadata: DropboxFileMetadata = {
-    id: job.dropboxFileId,
-    path_lower: job.dropboxPathLower ?? dropboxPathLower,
-    name: job.fileName || fileName || 'unknown-audio',
-    size: job.sourceBytes,
-    client_modified: job.clientModified,
-    server_modified: job.serverModified,
-  };
-
-  logEvent('info', 'callback phase started', {
-    phase: 'persist_transcript',
-    recordingId: job.recordingId,
-    fileName: job.fileName,
-    requestId: payload.requestId ?? null,
-    dropboxFileId: job.dropboxFileId,
-    dropboxPathLower: job.dropboxPathLower,
-    storageType: storageMeta.storageType,
-    storageModeDecision: storageMeta.storageModeDecision,
-  });
-  try {
-    await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'transcribed', {
-      transcript: payload.transcript,
-      sourceDurationSec: payload.sourceDurationSec,
-      callbackStatus: 'received',
-    });
-  } catch (error) {
-    await markJobFailed(env, { recordingId: job.recordingId }, error instanceof Error ? error.message : 'callback failed', { callbackStatus: 'failed' });
-    throw error;
-  }
-
-  let insights;
-  let summaryError: string | undefined;
-  let summaryErrorDetails: unknown;
-  let summaryRaw: unknown;
-  try {
-    insights = await summarizeInterview(env, payload.transcript);
-  } catch (error) {
-    summaryError = error instanceof Error ? error.message : 'summary generation failed';
-    summaryErrorDetails = error instanceof HttpError ? error.details : error;
-    summaryRaw = error instanceof HttpError && error.details && typeof error.details === 'object' && 'payload' in (error.details as Record<string, unknown>)
-      ? (error.details as Record<string, unknown>).payload
-      : undefined;
-    logEvent('warn', 'summary generation recovered with transcript-only persistence', {
-      recordingId: job.recordingId,
-      fileName: job.fileName,
-      requestId: payload.requestId ?? null,
-      dropboxFileId: job.dropboxFileId,
-      dropboxPathLower: job.dropboxPathLower,
-      details: summaryErrorDetails,
-    });
-  }
-
-  let persisted: Awaited<ReturnType<typeof upsertInterviewFromTranscript>>;
-  try {
-    persisted = await upsertInterviewFromTranscript(env, job.request, metadata, payload.transcript, insights, {
-      errorMessage: summaryError,
-      summaryRaw: insights?.raw ?? summaryRaw,
-      summaryErrorMessage: summaryError,
-      summaryErrorDetails,
-    });
-  } catch (error) {
-    await markJobFailed(env, { recordingId: job.recordingId }, error instanceof Error ? error.message : 'callback failed', { callbackStatus: 'failed' });
-    logEvent('error', 'notion persistence failed', {
-      recordingId: job.recordingId,
-      fileName: job.fileName,
-      requestId: payload.requestId ?? null,
-      dropboxFileId: job.dropboxFileId,
-      dropboxPathLower: job.dropboxPathLower,
-      details: error instanceof HttpError ? error.details : error,
-    });
-    throw error;
-  }
-
-  let reviewResult: InterviewReviewResult | undefined;
-  let reviewError: string | undefined;
-  try {
-    if (shouldRunInterviewReview(env)) {
-      reviewResult = await reviewInterviewWithWebSearch(env, {
-        transcript: payload.transcript,
-        insights,
-        title: persisted.record.title,
-        fileName: metadata.name,
-        notionPageUrl: persisted.pageId ? buildNotionPageUrl(persisted.pageId) : undefined,
-      });
-      if (persisted.pageId) {
-        await updateInterviewRecordProperties(env, persisted.pageId, persisted.record);
-        await appendReviewedMemoToNotionPage(env, persisted.pageId, reviewResult, persisted.record);
-      }
-      persisted.record.insights = {
-        summary: reviewResult.summaryForEmail || persisted.record.insights?.summary || '',
-        myTasks: reviewResult.myTasks.length
-          ? reviewResult.myTasks
-          : persisted.record.insights?.myTasks ?? [],
-        otherTasks: reviewResult.otherTasks.length
-          ? reviewResult.otherTasks
-          : persisted.record.insights?.otherTasks ?? [],
-        ambiguities: persisted.record.insights?.ambiguities ?? [],
-        raw: {
-          ...(persisted.record.insights?.raw && typeof persisted.record.insights.raw === 'object' ? persisted.record.insights.raw as Record<string, unknown> : {}),
-          review: reviewResult.raw ?? reviewResult,
-        },
-      };
-    }
-  } catch (error) {
-    reviewError = '二次レビューは失敗しました。一次要約とTranscriptのみ保存されています。';
-    const reviewFailureMessage = '二次レビュー失敗。一次要約とTranscriptのみ保存。';
-    persisted.record.errorMessage = persisted.record.errorMessage
-      ? `${persisted.record.errorMessage}\n${reviewFailureMessage}`
-      : reviewFailureMessage;
-    logEvent('warn', 'interview review failed; continuing with primary summary', {
-      recordingId: job.recordingId,
-      fileName: job.fileName,
-      details: error instanceof HttpError ? error.details : error instanceof Error ? error.message : String(error),
-    });
-    try {
-      if (persisted.pageId) {
-        await updateInterviewRecordProperties(env, persisted.pageId, persisted.record);
-        await appendInterviewReviewFailureToNotionPage(env, persisted.pageId, {
-          message: '二次レビュー失敗。一次要約とTranscriptのみ保存。',
-          error,
-        });
-      }
-    } catch (notionError) {
-      logEvent('warn', 'failed to append review failure note to Notion', {
-        recordingId: job.recordingId,
-        fileName: job.fileName,
-        details: notionError instanceof Error ? notionError.message : String(notionError),
-      });
-    }
-  }
-
-  await runPostPersistTasksAndEmail(env, {
-    job,
-    persisted,
-    transcriptFullText: payload.transcript.fullText,
-    summary: persisted.record.insights?.summary ?? insights?.summary,
-    review: reviewResult,
-    reviewError,
-  });
-
-  logEvent('info', 'callback phase started', {
-    phase: 'update_status',
-    recordingId: job.recordingId,
-    fileName: job.fileName,
-    requestId: payload.requestId ?? null,
-    dropboxFileId: job.dropboxFileId,
-    dropboxPathLower: job.dropboxPathLower,
-    storageType: storageMeta.storageType,
-    storageModeDecision: storageMeta.storageModeDecision,
-  });
-  try {
-    await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'persisted', {
-      transcript: payload.transcript,
-      sourceDurationSec: payload.sourceDurationSec,
-      callbackStatus: 'persisted',
-      errorMessage: summaryError,
-    });
-    logEvent('info', 'recording job status updated', {
-      recordingId: job.recordingId,
-      fileName: job.fileName,
-      requestId: payload.requestId ?? null,
-      status: 'persisted',
-      callbackStatus: 'persisted',
-      dropboxFileId: job.dropboxFileId,
-      dropboxPathLower: job.dropboxPathLower,
-      storageType: storageMeta.storageType,
-      storageModeDecision: storageMeta.storageModeDecision,
-    });
-  } catch (error) {
-    logEvent('warn', 'status update failed after notion persisted', {
-      recordingId: job.recordingId,
-      fileName: job.fileName,
-      requestId: payload.requestId ?? null,
-      dropboxFileId: job.dropboxFileId,
-      dropboxPathLower: job.dropboxPathLower,
-      details: error instanceof HttpError ? error.details : error,
-    });
-    return {
-      action: 'processed',
-      reason: summaryError
-        ? 'Python API callback persisted transcript to Notion (summary failed, status update failed after Notion persistence).'
-        : 'Python API callback persisted to Notion; status update failed after Notion persistence.',
-      pageId: persisted.pageId,
-      created: persisted.created,
-      dedupCandidates: buildDedupCandidates(job.request, metadata),
-      record: persisted.record,
-    };
-  }
 
   return {
     action: 'processed',
-    reason: summaryError ? 'Python API callback transcript persisted to Notion, summary failed.' : 'Python API callback persisted to Notion.',
-    pageId: persisted.pageId,
-    created: persisted.created,
-    dedupCandidates: buildDedupCandidates(job.request, metadata),
-    record: persisted.record,
+    reason: 'Callback accepted and persisted. Finalization is deferred.',
+    dedupCandidates: buildDedupCandidates(job.request, { id: job.dropboxFileId, path_lower: job.dropboxPathLower, name: job.fileName }),
   };
+}
+
+function ensureInterviewRecord(job: RecordingJob, transcript: TranscriptResult, insights?: InterviewInsights) {
+  return {
+    title: job.fileName ? `Interview Memo ${new Date().toISOString().slice(0, 10)} - ${job.fileName}` : 'Interview Memo',
+    dedupKey: job.dropboxFileId ? `dropbox:id:${job.dropboxFileId}` : `fallback:${job.fileName}`,
+    metadata: {
+      id: job.dropboxFileId,
+      path_lower: job.dropboxPathLower,
+      name: job.fileName,
+      size: job.sourceBytes,
+      client_modified: job.clientModified,
+      server_modified: job.serverModified,
+    },
+    request: job.request,
+    transcript,
+    insights,
+    processingStatus: 'persisted' as const,
+    errorMessage: job.errorMessage,
+  };
+}
+
+export async function finalizeInterviewJob(env: Env, recordingId: string, options: { force?: boolean; forceEmail?: boolean } = {}): Promise<{ ok: boolean; status: string }> {
+  const force = options.force === true;
+  const forceEmail = options.forceEmail === true;
+  const job = await getRecordingJob(env, { recordingId });
+  if (!job) throw new HttpError('Recording job not found.', 404, { recordingId });
+
+  if (job.finalizeStatus === 'completed' && !force && !forceEmail) {
+    logEvent('info', 'finalize_skipped_already_completed', { recordingId });
+    return { ok: true, status: 'already_completed' };
+  }
+
+  if (job.transcriptWrittenAt || job.summaryWrittenAt || job.reviewCompletedAt || job.emailSentAt) {
+    logEvent('info', 'finalize_resume_detected', {
+      recordingId,
+      transcriptWrittenAt: job.transcriptWrittenAt ?? null,
+      summaryWrittenAt: job.summaryWrittenAt ?? null,
+      reviewCompletedAt: job.reviewCompletedAt ?? null,
+      emailSentAt: job.emailSentAt ?? null,
+    });
+  }
+
+  logEvent('info', 'finalize_started', { recordingId, force, forceEmail });
+  await updateRecordingJobStatus(env, { recordingId }, 'finalizing', { finalizeStatus: 'running', lastError: undefined });
+
+  const current = (await getRecordingJob(env, { recordingId }))!;
+  if (!current.transcript) {
+    await updateRecordingJobStatus(env, { recordingId }, 'failed', { finalizeStatus: 'failed', lastError: 'Transcript missing' });
+    throw new HttpError('Transcript missing.', 400, { recordingId });
+  }
+
+  let mutable = current;
+  let pageId = mutable.notionPageId;
+
+  if (!mutable.transcriptWrittenAt || force) {
+    logEvent('info', 'notion_transcript_append_started', { recordingId, fileName: mutable.fileName });
+    const persisted = await upsertInterviewFromTranscript(env, mutable.request, {
+      id: mutable.dropboxFileId,
+      path_lower: mutable.dropboxPathLower,
+      name: mutable.fileName,
+      size: mutable.sourceBytes,
+      client_modified: mutable.clientModified,
+      server_modified: mutable.serverModified,
+    }, mutable.transcript);
+    pageId = persisted.pageId;
+    const now = new Date().toISOString();
+    await updateRecordingJobStatus(env, { recordingId }, 'transcribed', {
+      transcriptWrittenAt: now,
+      notionPageId: pageId,
+      notionPageUrl: pageId ? buildNotionPageUrl(pageId) : undefined,
+    });
+    logEvent('info', 'notion_transcript_append_completed', { recordingId, notionPageId: pageId ?? null, notionPageUrl: pageId ? buildNotionPageUrl(pageId) : null });
+    mutable = (await getRecordingJob(env, { recordingId }))!;
+  } else {
+    logEvent('info', 'notion_transcript_append_skipped_already_written', { recordingId, transcriptWrittenAt: mutable.transcriptWrittenAt });
+  }
+
+  let insights = mutable.transcript ? await summarizeInterview(env, mutable.transcript) : undefined;
+  if (!mutable.summaryWrittenAt || force) {
+    try {
+      logEvent('info', 'summary_generation_started', { recordingId });
+      insights = await summarizeInterview(env, mutable.transcript!);
+      if (pageId) {
+        const record = ensureInterviewRecord(mutable, mutable.transcript!, insights);
+        await updateInterviewRecordProperties(env, pageId, record);
+      }
+      await updateRecordingJobStatus(env, { recordingId }, 'transcribed', { summaryWrittenAt: new Date().toISOString() });
+      logEvent('info', 'summary_generation_completed', { recordingId });
+      mutable = (await getRecordingJob(env, { recordingId }))!;
+    } catch (error) {
+      logEvent('error', 'summary_generation_failed', { recordingId, message: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+  }
+
+  if (shouldRunInterviewReview(env) && (!mutable.reviewCompletedAt || force)) {
+    try {
+      logEvent('info', 'review_started', { recordingId });
+      const review = await reviewInterviewWithWebSearch(env, { transcript: mutable.transcript!, insights, title: mutable.fileName, fileName: mutable.fileName, notionPageUrl: pageId ? buildNotionPageUrl(pageId) : undefined });
+      if (pageId) {
+        await appendReviewedMemoToNotionPage(env, pageId, review, ensureInterviewRecord(mutable, mutable.transcript!, insights));
+      }
+      await updateRecordingJobStatus(env, { recordingId }, 'transcribed', { reviewCompletedAt: new Date().toISOString() });
+      mutable = (await getRecordingJob(env, { recordingId }))!;
+      logEvent('info', 'review_completed', { recordingId });
+    } catch (error) {
+      logEvent('error', 'review_failed', { recordingId, message: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+  } else if (!shouldRunInterviewReview(env)) {
+    logEvent('info', 'review_skipped_not_configured', { recordingId });
+  }
+
+  const canSendEmail = shouldSendCompletionEmail(env);
+  if (!canSendEmail) {
+    logEvent('warn', 'email_skipped_missing_config', { recordingId });
+  } else if (!mutable.emailSentAt || force || forceEmail) {
+    try {
+      logEvent('info', 'email_send_started', { recordingId, fileName: mutable.fileName, notionPageUrl: mutable.notionPageUrl ?? null });
+      await sendCompletionEmail(env, {
+        subject: env.MAIL_SUBJECT_PREFIX ?? 'Interview Memo 完了通知',
+        notionPageUrl: mutable.notionPageUrl ?? (pageId ? buildNotionPageUrl(pageId) : ''),
+        summary: insights?.summary ?? '',
+        transcript: mutable.transcript?.fullText ?? '',
+        myTasks: [],
+      });
+      await updateRecordingJobStatus(env, { recordingId }, 'transcribed', { emailSentAt: new Date().toISOString() });
+      logEvent('info', 'email_send_completed', { recordingId });
+      mutable = (await getRecordingJob(env, { recordingId }))!;
+    } catch (error) {
+      logEvent('error', 'email_send_failed', { recordingId, message: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+  } else {
+    logEvent('info', 'email_skipped_already_sent', { recordingId, emailSentAt: mutable.emailSentAt });
+  }
+
+  await updateRecordingJobStatus(env, { recordingId }, 'completed', { finalizeStatus: 'completed', callbackStatus: 'succeeded', lastError: undefined });
+  logEvent('info', 'finalize_completed', { recordingId });
+  return { ok: true, status: 'completed' };
+}
+
+export async function getInterviewJobStatus(env: Env, recordingId: string): Promise<Record<string, unknown>> {
+  const job = await getRecordingJob(env, { recordingId });
+  if (!job) throw new HttpError('Recording job not found.', 404, { recordingId });
+  return {
+    recordingId: job.recordingId,
+    fileName: job.fileName,
+    status: job.status,
+    callbackReceivedAt: job.callbackReceivedAt,
+    transcriptWrittenAt: job.transcriptWrittenAt,
+    summaryWrittenAt: job.summaryWrittenAt,
+    reviewCompletedAt: job.reviewCompletedAt,
+    emailSentAt: job.emailSentAt,
+    finalizeStatus: job.finalizeStatus,
+    lastError: job.lastError,
+    notionPageId: job.notionPageId,
+    notionPageUrl: job.notionPageUrl,
+  };
+}
+
+export async function resendInterviewEmail(env: Env, recordingId: string, force = true): Promise<{ ok: boolean; status: string }> {
+  return finalizeInterviewJob(env, recordingId, { force: false, forceEmail: force });
 }
