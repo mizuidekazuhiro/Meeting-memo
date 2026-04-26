@@ -92,6 +92,61 @@ function hasNonEmptyMarkdown(value: string | undefined): boolean {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
+const MEMO_COMPLETION_TASK_PATTERNS: RegExp[] = [
+  /文字起こし/i,
+  /transcript/i,
+  /トランスクリプト/i,
+  /誤変換/i,
+  /固有名詞/i,
+  /notion/i,
+  /議事録/i,
+  /面談メモ/i,
+  /メモを完成/i,
+  /参考リンク/i,
+  /出典確認/i,
+  /要約/i,
+  /本文/i,
+  /補足確認/i,
+  /human\s*check/i,
+  /人間確認/i,
+];
+
+const GENERIC_TASK_PATTERNS: RegExp[] = [
+  /^(確認する|検討する|調整する|対応する|確認が必要)$/i,
+];
+
+function getMyTaskFilterReason(task: string): 'memo_completion_task' | 'generic_task_without_object' | undefined {
+  const normalized = task.trim();
+  if (!normalized) return undefined;
+  if (MEMO_COMPLETION_TASK_PATTERNS.some((pattern) => pattern.test(normalized))) return 'memo_completion_task';
+  if (GENERIC_TASK_PATTERNS.some((pattern) => pattern.test(normalized))) return 'generic_task_without_object';
+  return undefined;
+}
+
+export function filterMyTasksForUserActions(
+  myTasks: string[] | undefined,
+  context: { recordingId?: string; taskSource?: string } = {},
+): string[] {
+  if (!Array.isArray(myTasks)) return [];
+  const filtered: string[] = [];
+  for (const rawTask of myTasks) {
+    const task = typeof rawTask === 'string' ? rawTask.trim() : '';
+    if (!task) continue;
+    const reason = getMyTaskFilterReason(task);
+    if (reason) {
+      logEvent('info', 'my_task_filtered_out', {
+        reason,
+        originalTask: task,
+        recordingId: context.recordingId,
+        taskSource: context.taskSource,
+      });
+      continue;
+    }
+    filtered.push(task);
+  }
+  return filtered;
+}
+
 function selectFinalMemo(params: {
   review?: InterviewReviewResult;
   insights?: InterviewInsights;
@@ -105,20 +160,33 @@ function selectFinalMemo(params: {
 function selectFinalMyTaskInput(params: {
   review?: InterviewReviewResult;
   insights?: InterviewInsights;
+  recordingId?: string;
 }): { taskSource: string; myTasks: string[] } {
   if (params.review) {
     if (hasNonEmptyTaskText(params.review.myTasks)) {
-      return { taskSource: 'review.myTasks', myTasks: params.review.myTasks };
+      return {
+        taskSource: 'review.myTasks',
+        myTasks: filterMyTasksForUserActions(params.review.myTasks, { recordingId: params.recordingId, taskSource: 'review.myTasks' }),
+      };
     }
     if (hasNonEmptyMarkdown(params.review.nextActionsMarkdown)) {
-      return { taskSource: 'review.nextActionsMarkdown', myTasks: extractTasksFromNextActionsMarkdown(params.review.nextActionsMarkdown) };
+      return {
+        taskSource: 'review.nextActionsMarkdown',
+        myTasks: filterMyTasksForUserActions(extractTasksFromNextActionsMarkdown(params.review.nextActionsMarkdown), { recordingId: params.recordingId, taskSource: 'review.nextActionsMarkdown' }),
+      };
     }
     if (hasNonEmptyMarkdown(params.review.finalMemoMarkdown)) {
-      return { taskSource: 'review.finalMemoMarkdown.nextActions', myTasks: extractTasksFromFinalMemoMarkdown(params.review.finalMemoMarkdown) };
+      return {
+        taskSource: 'review.finalMemoMarkdown.nextActions',
+        myTasks: filterMyTasksForUserActions(extractTasksFromFinalMemoMarkdown(params.review.finalMemoMarkdown), { recordingId: params.recordingId, taskSource: 'review.finalMemoMarkdown.nextActions' }),
+      };
     }
   }
   if (hasNonEmptyTaskText(params.insights?.myTasks)) {
-    return { taskSource: 'insights.myTasks', myTasks: params.insights?.myTasks ?? [] };
+    return {
+      taskSource: 'insights.myTasks',
+      myTasks: filterMyTasksForUserActions(params.insights?.myTasks ?? [], { recordingId: params.recordingId, taskSource: 'insights.myTasks' }),
+    };
   }
   return { taskSource: 'none', myTasks: [] };
 }
@@ -135,7 +203,11 @@ async function runPostPersistTasksAndEmail(
   },
 ): Promise<void> {
   if (!params.persisted.pageId) return;
-  const fallbackTasks = normalizeEmailTasks(params.persisted.record.insights?.myTasks);
+  const filteredPersistedMyTasks = filterMyTasksForUserActions(params.persisted.record.insights?.myTasks, {
+    recordingId: params.job.recordingId,
+    taskSource: 'persisted.insights.myTasks',
+  });
+  const fallbackTasks = normalizeEmailTasks(filteredPersistedMyTasks);
   const finalMemoSelection = selectFinalMemo({ review: params.review, insights: params.persisted.record.insights });
 
   let imported = {
@@ -156,7 +228,7 @@ async function runPostPersistTasksAndEmail(
     imported = await importMyTasksToInbox(env, {
       recordingId: params.job.recordingId,
       sourceInterviewPageId: params.persisted.pageId,
-      myTasks: params.persisted.record.insights?.myTasks,
+      myTasks: filteredPersistedMyTasks,
     });
     logEvent('info', 'my task import finished', {
       recordingId: params.job.recordingId,
@@ -415,9 +487,10 @@ export async function processUploadedInterview(
           }
           persisted.record.insights = {
             summary: reviewResult.summaryForEmail || persisted.record.insights?.summary || '',
-            myTasks: reviewResult.myTasks.length
-              ? reviewResult.myTasks
-              : persisted.record.insights?.myTasks ?? [],
+            myTasks: filterMyTasksForUserActions(
+              reviewResult.myTasks.length ? reviewResult.myTasks : persisted.record.insights?.myTasks ?? [],
+              { recordingId: job.recordingId, taskSource: reviewResult.myTasks.length ? 'review.myTasks' : 'insights.myTasks' },
+            ),
             otherTasks: reviewResult.otherTasks.length
               ? reviewResult.otherTasks
               : persisted.record.insights?.otherTasks ?? [],
@@ -700,7 +773,7 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
       logEvent('info', 'notion_final_memo_write_completed', { recordingId, notionPageId: pageId, finalMemoLength: finalMemoSelected.finalMemo.length, sourceUrlCount: sourceUrls.length });
       const recordForSummary = ensureInterviewRecord(mutable, mutable.transcript!, {
         summary: finalMemoSelected.finalMemo,
-        myTasks: insights?.myTasks ?? [],
+        myTasks: filterMyTasksForUserActions(insights?.myTasks ?? [], { recordingId, taskSource: 'insights.myTasks' }),
         otherTasks: insights?.otherTasks ?? [],
         ambiguities: insights?.ambiguities ?? [],
         raw: insights?.raw,
@@ -712,6 +785,7 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
       const selectedFinalTasks = selectFinalMyTaskInput({
         review: reviewResult,
         insights,
+        recordingId,
       });
       logEvent('info', 'final_my_task_extract_started', {
         recordingId,
