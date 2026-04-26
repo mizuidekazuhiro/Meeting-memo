@@ -172,6 +172,54 @@ test('importMyTasksToInbox omits optional source properties that are not in DB s
   assert.equal(pageBodies[0].properties['Source Interview URL'], undefined);
 });
 
+test('importMyTasksToInbox does not create chooseUrl when INBOX_TRIAGE_BASE_URL is missing', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = (async (input: string, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url.endsWith('/databases/db') && (init?.method ?? 'GET') === 'GET') {
+      return new Response(JSON.stringify({ properties: { Name: {}, Source: {}, 'Record Type': {}, 'Imported At': {}, 'Dedup Key': {} } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/databases/') && url.endsWith('/query')) {
+      return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.endsWith('/pages')) {
+      return new Response(JSON.stringify({ id: 'task_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+  const result = await importMyTasksToInbox({ NOTION_TOKEN: 'token', INBOX_DB_ID: 'db', INBOX_TRIAGE_ACTION_SECRET: 'secret-1' } as any, {
+    recordingId: 'rec-1',
+    sourceInterviewPageId: 'interview-page-id',
+    myTasks: ['first task'],
+  });
+  global.fetch = originalFetch;
+  assert.equal(result.importedTaskItems[0].chooseUrl, undefined);
+});
+
+test('importMyTasksToInbox does not create chooseUrl when INBOX_TRIAGE_ACTION_SECRET is missing', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = (async (input: string, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url.endsWith('/databases/db') && (init?.method ?? 'GET') === 'GET') {
+      return new Response(JSON.stringify({ properties: { Name: {}, Source: {}, 'Record Type': {}, 'Imported At': {}, 'Dedup Key': {} } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/databases/') && url.endsWith('/query')) {
+      return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.endsWith('/pages')) {
+      return new Response(JSON.stringify({ id: 'task_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+  const result = await importMyTasksToInbox({ NOTION_TOKEN: 'token', INBOX_DB_ID: 'db', INBOX_TRIAGE_BASE_URL: 'https://triage.example.com' } as any, {
+    recordingId: 'rec-1',
+    sourceInterviewPageId: 'interview-page-id',
+    myTasks: ['first task'],
+  });
+  global.fetch = originalFetch;
+  assert.equal(result.importedTaskItems[0].chooseUrl, undefined);
+});
+
 test('appendReviewedMemoToNotionPage writes final memo + source urls and does not re-append Transcript', async () => {
   const originalFetch = global.fetch;
   const appendedChildren: any[] = [];

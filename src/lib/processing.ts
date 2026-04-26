@@ -115,11 +115,16 @@ const GENERIC_TASK_PATTERNS: RegExp[] = [
   /^(確認する|検討する|調整する|対応する|確認が必要)$/i,
 ];
 
-function getMyTaskFilterReason(task: string): 'memo_completion_task' | 'generic_task_without_object' | undefined {
+const NON_USER_OWNER_PATTERNS: RegExp[] = [
+  /^(先方|相手|相手方|顧客|お客様|クライアント|取引先|ベンダー|社外|先方担当)\s*(が|に)/,
+];
+
+function getMyTaskFilterReason(task: string): 'memo_completion_task' | 'generic_task_without_object' | 'non_user_owner_task' | undefined {
   const normalized = task.trim();
   if (!normalized) return undefined;
   if (MEMO_COMPLETION_TASK_PATTERNS.some((pattern) => pattern.test(normalized))) return 'memo_completion_task';
   if (GENERIC_TASK_PATTERNS.some((pattern) => pattern.test(normalized))) return 'generic_task_without_object';
+  if (NON_USER_OWNER_PATTERNS.some((pattern) => pattern.test(normalized))) return 'non_user_owner_task';
   return undefined;
 }
 

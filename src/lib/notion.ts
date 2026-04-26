@@ -1,5 +1,6 @@
 import type { Env, InterviewRecord, InterviewReviewResult, NotionPageMatch, TranscriptSegment } from '../types';
 import { HttpError } from './http';
+import { logEvent } from './logger';
 
 const NOTION_API = 'https://api.notion.com/v1';
 const NOTION_VERSION = '2022-06-28';
@@ -837,6 +838,26 @@ export async function importMyTasksToInbox(
     skippedDuplicate?: boolean;
   }> = [];
   const actionSecret = env.INBOX_TRIAGE_ACTION_SECRET?.trim();
+  const triageBaseUrl = env.INBOX_TRIAGE_BASE_URL?.trim();
+
+  const buildChooseUrl = async (inboxPageId: string | undefined, taskText: string): Promise<string | undefined> => {
+    if (!inboxPageId) {
+      logEvent('info', 'task_choose_url_skipped_missing_inbox_page_id', { recordingId: input.recordingId, taskText });
+      return undefined;
+    }
+    if (!triageBaseUrl) {
+      logEvent('info', 'task_choose_url_skipped_missing_base_url', { recordingId: input.recordingId, inboxPageId, taskText });
+      return undefined;
+    }
+    if (!actionSecret) {
+      logEvent('info', 'task_choose_url_skipped_missing_secret', { recordingId: input.recordingId, inboxPageId, taskText });
+      return undefined;
+    }
+    const signature = await signInboxPageId(inboxPageId, actionSecret);
+    const chooseUrl = buildInboxTriageChooseUrl(triageBaseUrl, inboxPageId, signature);
+    logEvent('info', 'task_choose_url_created', { recordingId: input.recordingId, inboxPageId, taskText });
+    return chooseUrl;
+  };
 
   for (const taskText of normalizedTasks) {
     const taskHash = await sha256Hex(taskText);
@@ -844,11 +865,11 @@ export async function importMyTasksToInbox(
     const existing = await findPageByDedupKey(env, dedupKey);
     if (existing) {
       skippedDuplicates += 1;
-      const signature = actionSecret ? await signInboxPageId(existing.id, actionSecret) : undefined;
+      const chooseUrl = await buildChooseUrl(existing.id, taskText);
       importedTaskItems.push({
         taskText,
         inboxPageId: existing.id,
-        chooseUrl: signature ? buildInboxTriageChooseUrl(env.INBOX_TRIAGE_BASE_URL, existing.id, signature) : undefined,
+        chooseUrl,
         skippedDuplicate: true,
       });
       continue;
@@ -870,11 +891,11 @@ export async function importMyTasksToInbox(
     });
     importedCount += 1;
     skippedBecauseMissingProperties += missingProperties.length;
-    const createdSignature = actionSecret ? await signInboxPageId(created.id, actionSecret) : undefined;
+    const chooseUrl = await buildChooseUrl(created.id, taskText);
     importedTaskItems.push({
       taskText,
       inboxPageId: created.id,
-      chooseUrl: createdSignature ? buildInboxTriageChooseUrl(env.INBOX_TRIAGE_BASE_URL, created.id, createdSignature) : undefined,
+      chooseUrl,
       skippedDuplicate: false,
     });
   }
