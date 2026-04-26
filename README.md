@@ -58,6 +58,9 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 - `sourceUrls` はメールとNotion本文の「参考リンク」に表示します（空ならセクション自体を非表示）。
 - Summaryプロパティには URL / Transcript を含めず、`finalMemo` を先頭から保存します。
 - My Tasks 抽出優先順位は `review.myTasks` → `review.nextActionsMarkdown` → `review.finalMemoMarkdown内の次アクション` → `insights.myTasks` です。
+- My Tasks は「ユーザー本人（当社側）が次に実務で行うアクション」のみを保持します。
+- 面談メモ完成・誤変換確認・Notion補足編集などメモ整備タスクは My Tasks / Other Tasks から除外します。
+- 不明点やメモ品質確認は `ambiguities` / `humanCheckRequired` 側で扱います（My Tasks へは入れません）。
 - Web検索結果は補助情報です。低確度/不明は人間確認が必要です。
 - `humanCheckRequired=true` の主な条件:
   - 低確度または不明項目が1つでもある
