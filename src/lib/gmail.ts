@@ -19,19 +19,6 @@ interface CompletionEmailInput {
   myTasks: Array<{ taskText: string; chooseUrl?: string }>;
 }
 
-function stripMarkdownForEmail(value: string): string {
-  return value
-    .replace(/\r\n/g, '\n')
-    .replace(/```[\s\S]*?```/g, '')
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '$1')
-    .replace(/\*\*(.*?)\*\*/g, '$1')
-    .replace(/^\s*#{1,6}\s*/gm, '')
-    .replace(/^\s*[-*]\s+/gm, '・')
-    .replace(/^\s*\d+\.\s+/gm, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
 function isEnabled(value: string | undefined): boolean {
   return value?.toLowerCase() === 'true';
 }
@@ -57,6 +44,83 @@ function escapeHtml(value: string): string {
         return matched;
     }
   });
+}
+
+const MEMO_TITLE_PATTERNS: RegExp[] = [
+  /^完成版\s*面談メモ$/i,
+  /^面談メモ（完成版）$/i,
+  /^#\s*完成版\s*面談メモ$/i,
+  /^##\s*完成版\s*面談メモ$/i,
+  /^#\s*面談メモ（完成版）$/i,
+  /^##\s*面談メモ（完成版）$/i,
+];
+
+function normalizeTaskTextForEmail(value: string): string {
+  return value
+    .replace(/\r\n/g, '\n')
+    .replace(/^\s*(?:[-*・]|\d+[.)]?)\s+/, '')
+    .trim();
+}
+
+function linkifyText(value: string): string {
+  const escaped = escapeHtml(value);
+  return escaped.replace(/(https?:\/\/[^\s<]+)/g, (url) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`);
+}
+
+function stripLeadingMemoTitle(value: string): string {
+  const lines = value.replace(/\r\n/g, '\n').split('\n');
+  let cursor = 0;
+  while (cursor < lines.length && lines[cursor].trim().length === 0) cursor += 1;
+  if (cursor < lines.length && MEMO_TITLE_PATTERNS.some((pattern) => pattern.test(lines[cursor].trim()))) {
+    lines.splice(cursor, 1);
+  }
+  return lines.join('\n').trim();
+}
+
+function renderFinalMemoHtml(markdown: string): string {
+  const source = stripLeadingMemoTitle(markdown ?? '');
+  if (!source) return '<p style="margin:0;">（内容なし）</p>';
+  const lines = source.replace(/\r\n/g, '\n').split('\n');
+  const html: string[] = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const line = lines[index].trim();
+    if (!line) {
+      index += 1;
+      continue;
+    }
+    const heading = line.match(/^#{1,3}\s+(.+)$/);
+    if (heading) {
+      const level = line.startsWith('###') ? 'h4' : line.startsWith('##') ? 'h3' : 'h2';
+      html.push(`<${level} style="margin:20px 0 8px 0;font-size:${level === 'h2' ? '19px' : level === 'h3' ? '17px' : '16px'};line-height:1.5;">${linkifyText(heading[1].trim())}</${level}>`);
+      index += 1;
+      continue;
+    }
+    if (/^(?:[-*]\s+|・\s*)/.test(line)) {
+      const items: string[] = [];
+      while (index < lines.length) {
+        const listLine = lines[index].trim();
+        const listMatch = listLine.match(/^(?:[-*]\s+|・\s*)(.+)$/);
+        if (!listMatch) break;
+        items.push(`<li style="margin:6px 0;">${linkifyText(listMatch[1].trim())}</li>`);
+        index += 1;
+      }
+      html.push(`<ul style="margin:10px 0 14px 0;padding-left:20px;">${items.join('')}</ul>`);
+      continue;
+    }
+
+    const paragraphLines: string[] = [];
+    while (index < lines.length) {
+      const textLine = lines[index].trim();
+      if (!textLine || /^#{1,3}\s+/.test(textLine) || /^(?:[-*]\s+|・\s*)/.test(textLine)) break;
+      paragraphLines.push(linkifyText(textLine));
+      index += 1;
+    }
+    html.push(`<p style="margin:0 0 12px 0;line-height:1.8;">${paragraphLines.join('<br />')}</p>`);
+  }
+
+  return html.join('');
 }
 
 function toBase64(content: string): string {
@@ -116,15 +180,15 @@ export function getCompletionEmailConfig(env: Env): MailConfig {
 }
 
 function buildCompletionEmailHtml(input: CompletionEmailInput): string {
-  const finalMemo = stripMarkdownForEmail(input.finalMemo ?? '');
+  const finalMemoHtml = renderFinalMemoHtml(input.finalMemo ?? '');
   const sourceUrlsInput = Array.isArray(input.sourceUrls) ? input.sourceUrls : [];
   const myTasksHtml = input.myTasks.length
-    ? `<ul style="padding-left:20px;margin:0;">${input.myTasks.map((task) => {
+    ? `<div style="display:flex;flex-direction:column;gap:12px;">${input.myTasks.map((task) => {
       const buttonHtml = task.chooseUrl
-        ? `<div style="margin-top:8px;"><a href="${escapeHtml(task.chooseUrl)}" target="_blank" rel="noopener noreferrer" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;padding:8px 12px;border-radius:8px;font-size:13px;">タスク処理を選ぶ</a></div>`
+        ? `<div style="margin-top:10px;"><a href="${escapeHtml(task.chooseUrl)}" target="_blank" rel="noopener noreferrer" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;padding:9px 13px;border-radius:8px;font-size:13px;">処理を選ぶ</a></div>`
         : '';
-      return `<li style="margin-bottom:12px;"><div>${escapeHtml(stripMarkdownForEmail(task.taskText))}</div>${buttonHtml}</li>`;
-    }).join('')}</ul>`
+      return `<div style="border:1px solid #dbe3f0;border-radius:10px;padding:12px;"><div style="line-height:1.7;">${escapeHtml(normalizeTaskTextForEmail(task.taskText))}</div>${buttonHtml}</div>`;
+    }).join('')}</div>`
     : '';
   const notionPageUrl = escapeHtml(input.notionPageUrl);
   const sourceUrls = [
@@ -135,12 +199,6 @@ function buildCompletionEmailHtml(input: CompletionEmailInput): string {
   const myTasksSection = input.myTasks.length
     ? `<h3 style="margin:16px 0 8px 0;font-size:16px;">次アクション</h3>${myTasksHtml}`
     : '';
-  const taskActionsSection = `<h3 style="margin:16px 0 8px 0;font-size:16px;">タスク処理を選ぶ</h3>
-        <ul style="padding-left:20px;margin:0;">
-          <li>My Tasksを抽出する</li>
-          <li>Notion Inboxに分割登録する</li>
-          <li>後で確認する</li>
-        </ul>`;
 
   return `<!DOCTYPE html>
 <html lang="ja">
@@ -155,11 +213,9 @@ function buildCompletionEmailHtml(input: CompletionEmailInput): string {
         </p>
         ${input.transcriptFileUrl ? `<p style="margin:0 0 12px 0;">Transcript全文リンク：<a href="${escapeHtml(input.transcriptFileUrl)}" target="_blank" rel="noopener noreferrer">Transcript全文リンク</a></p>` : ''}
         <h3 style="margin:16px 0 8px 0;font-size:16px;">完成版 面談メモ</h3>
-        <p style="white-space:pre-wrap;margin:0;">${escapeHtml(finalMemo)}</p>
+        <div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:14px 14px 10px 14px;">${finalMemoHtml}</div>
         ${myTasksSection}
         ${sourceSection}
-        ${taskActionsSection}
-        <p style="margin:16px 0 0 0;">Notionで補足確認：詳細な文字起こしや補足はNotionページで確認してください。</p>
       </div>
     </div>
   </body>

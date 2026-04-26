@@ -15,12 +15,13 @@ test('ケースA: 固有名詞/誤変換などメモ整備タスクは My Tasks 
 test('ケースB: ユーザー側の実務アクションは My Tasks に残る', () => {
   const result = filterMyTasksForUserActions([
     '社内で価格条件を確認して回答する',
+    '社内で確認して回答します',
   ]);
-  assert.deepEqual(result, ['社内で価格条件を確認して回答する']);
+  assert.deepEqual(result, ['社内で価格条件を確認して回答する', '社内で確認して回答します']);
 });
 
 test('ケースC: 先方側タスクが otherTasks にある想定でも My Tasks には入らない', () => {
-  const myTasks = filterMyTasksForUserActions([]);
+  const myTasks = filterMyTasksForUserActions(['先方が資料を送る']);
   const otherTasks = ['先方が資料を送る'];
   assert.deepEqual(myTasks, []);
   assert.deepEqual(otherTasks, ['先方が資料を送る']);

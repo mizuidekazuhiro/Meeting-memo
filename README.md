@@ -60,6 +60,8 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 - My Tasks 抽出優先順位は `review.myTasks` → `review.nextActionsMarkdown` → `review.finalMemoMarkdown内の次アクション` → `insights.myTasks` です。
 - My Tasks は「ユーザー本人（当社側）が次に実務で行うアクション」のみを保持します。
 - 面談メモ完成・誤変換確認・Notion補足編集などメモ整備タスクは My Tasks / Other Tasks から除外します。
+- 完了メールの「次アクション」は My Tasks がある場合のみ表示し、各タスクを見やすいカード形式で表示します。
+- 完了メール末尾の固定説明セクション（「タスク処理を選ぶ」「My Tasksを抽出する」など）は表示しません。
 - 不明点やメモ品質確認は `ambiguities` / `humanCheckRequired` 側で扱います（My Tasks へは入れません）。
 - Web検索結果は補助情報です。低確度/不明は人間確認が必要です。
 - `humanCheckRequired=true` の主な条件:
@@ -197,6 +199,7 @@ Workers に下記 env を設定します。
 - 同一 `recordingId` ですでに `notificationSentAt` が保存済みの場合、完了通知メールは再送しません。
 - `My Tasks` 取込が失敗しても、Interview Memo 本体が Notion 保存済みならメール送信は継続します（warning ログのみ）。
 - `INBOX_TRIAGE_BASE_URL` と `INBOX_TRIAGE_ACTION_SECRET` が設定されている場合、完了通知メールの My Tasks 各項目に `/move/choose` への「タスク処理を選ぶ」ボタンを表示します。
+- `/move/choose` リンクは `inbox_page_id` を `INBOX_TRIAGE_ACTION_SECRET`（=`notion-inbox-triage` 側 `ACTION_SECRET`）で HMAC-SHA256 署名した `sig` を付与して生成されます。
 
 ## Recording callback の lookup 仕様
 
