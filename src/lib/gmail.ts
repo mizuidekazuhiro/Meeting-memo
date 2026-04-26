@@ -84,6 +84,10 @@ function renderFinalMemoHtml(markdown: string): string {
   const html: string[] = [];
   let index = 0;
 
+  const isBulletLine = (value: string): boolean => /^(?:[-*]\s+|・\s*)/.test(value);
+  const orderedMatch = (value: string): RegExpMatchArray | null => value.match(/^(\d+)[.)]\s+(.+)$/);
+  const headingFromNumberLine = (value: string): RegExpMatchArray | null => value.match(/^(\d+)[.)]\s*(.+)$/);
+
   while (index < lines.length) {
     const line = lines[index].trim();
     if (!line) {
@@ -97,7 +101,7 @@ function renderFinalMemoHtml(markdown: string): string {
       index += 1;
       continue;
     }
-    if (/^(?:[-*]\s+|・\s*)/.test(line)) {
+    if (isBulletLine(line)) {
       const items: string[] = [];
       while (index < lines.length) {
         const listLine = lines[index].trim();
@@ -109,11 +113,50 @@ function renderFinalMemoHtml(markdown: string): string {
       html.push(`<ul style="margin:10px 0 14px 0;padding-left:20px;">${items.join('')}</ul>`);
       continue;
     }
+    const orderedStart = orderedMatch(line);
+    if (orderedStart) {
+      let probe = index;
+      let consecutiveOrderedCount = 0;
+      while (probe < lines.length && orderedMatch(lines[probe].trim())) {
+        consecutiveOrderedCount += 1;
+        probe += 1;
+      }
+      if (consecutiveOrderedCount >= 2) {
+        const items: string[] = [];
+        while (index < lines.length) {
+          const orderedLine = lines[index].trim();
+          const listMatch = orderedMatch(orderedLine);
+          if (!listMatch) break;
+          items.push(`<li style="margin:6px 0;">${linkifyText(listMatch[2].trim())}</li>`);
+          index += 1;
+        }
+        html.push(`<ol style="margin:10px 0 14px 0;padding-left:22px;">${items.join('')}</ol>`);
+        continue;
+      }
+    }
+    const numberedHeading = headingFromNumberLine(line);
+    if (numberedHeading) {
+      html.push(`<h3 style="font-size:16px;margin:18px 0 10px 0;line-height:1.6;font-weight:600;">${linkifyText(`${numberedHeading[1]}. ${numberedHeading[2].trim()}`)}</h3>`);
+      index += 1;
+      continue;
+    }
+    if (orderedStart) {
+      const items: string[] = [];
+      while (index < lines.length) {
+        const orderedLine = lines[index].trim();
+        const listMatch = orderedMatch(orderedLine);
+        if (!listMatch) break;
+        items.push(`<li style="margin:6px 0;">${linkifyText(listMatch[2].trim())}</li>`);
+        index += 1;
+      }
+      html.push(`<ol style="margin:10px 0 14px 0;padding-left:22px;">${items.join('')}</ol>`);
+      continue;
+    }
 
     const paragraphLines: string[] = [];
     while (index < lines.length) {
       const textLine = lines[index].trim();
-      if (!textLine || /^#{1,3}\s+/.test(textLine) || /^(?:[-*]\s+|・\s*)/.test(textLine)) break;
+      if (!textLine || /^#{1,3}\s+/.test(textLine) || isBulletLine(textLine) || orderedMatch(textLine) || headingFromNumberLine(textLine)) break;
       paragraphLines.push(linkifyText(textLine));
       index += 1;
     }
@@ -183,39 +226,41 @@ function buildCompletionEmailHtml(input: CompletionEmailInput): string {
   const finalMemoHtml = renderFinalMemoHtml(input.finalMemo ?? '');
   const sourceUrlsInput = Array.isArray(input.sourceUrls) ? input.sourceUrls : [];
   const myTasksHtml = input.myTasks.length
-    ? `<div style="display:flex;flex-direction:column;gap:12px;">${input.myTasks.map((task) => {
+    ? `<div style="display:flex;flex-direction:column;gap:10px;">${input.myTasks.map((task) => {
       const buttonHtml = task.chooseUrl
-        ? `<div style="margin-top:10px;"><a href="${escapeHtml(task.chooseUrl)}" target="_blank" rel="noopener noreferrer" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;padding:9px 13px;border-radius:8px;font-size:13px;">処理を選ぶ</a></div>`
+        ? `<div style="margin-top:8px;"><a href="${escapeHtml(task.chooseUrl)}" target="_blank" rel="noopener noreferrer" style="display:inline-block;padding:6px 10px;border-radius:6px;background:#2563eb;color:#ffffff;text-decoration:none;font-size:13px;">処理を選ぶ</a></div>`
         : '';
-      return `<div style="border:1px solid #dbe3f0;border-radius:10px;padding:12px;"><div style="line-height:1.7;">${escapeHtml(normalizeTaskTextForEmail(task.taskText))}</div>${buttonHtml}</div>`;
+      return `<div style="border:1px solid #d0d7de;border-radius:8px;padding:12px 14px;background:#ffffff;"><p style="margin:0 0 8px 0;font-weight:600;line-height:1.7;">${escapeHtml(normalizeTaskTextForEmail(task.taskText))}</p>${buttonHtml}</div>`;
     }).join('')}</div>`
     : '';
   const notionPageUrl = escapeHtml(input.notionPageUrl);
   const sourceUrls = [
     `<li><a href="${notionPageUrl}" target="_blank" rel="noopener noreferrer">Notionページを開く</a></li>`,
-    ...sourceUrlsInput.map((url) => `<li><a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a></li>`),
+    ...sourceUrlsInput.map((url, idx) => `<li style="margin:0 0 8px 0;"><a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">参考資料 ${idx + 1} を開く</a></li>`),
   ].join('');
-  const sourceSection = `<h3 style="margin:16px 0 8px 0;font-size:16px;">参考リンク</h3><ul style="padding-left:20px;margin:0;">${sourceUrls}</ul>`;
+  const sourceSection = `<h2 style="font-size:18px;margin:24px 0 12px 0;padding-bottom:6px;border-bottom:1px solid #d0d7de;">参考リンク</h2><ul style="padding-left:20px;margin:0;">${sourceUrls}</ul>`;
   const myTasksSection = input.myTasks.length
-    ? `<h3 style="margin:16px 0 8px 0;font-size:16px;">次アクション</h3>${myTasksHtml}`
+    ? `<h2 style="font-size:18px;margin:24px 0 12px 0;padding-bottom:6px;border-bottom:1px solid #d0d7de;">次アクション</h2>${myTasksHtml}<h2 style="font-size:18px;margin:24px 0 12px 0;padding-bottom:6px;border-bottom:1px solid #d0d7de;">タスク処理を選ぶ</h2><p style="margin:0 0 10px 0;">各アクションの「処理を選ぶ」から処理先を選択できます。</p>`
     : '';
+  const notionSection = `<h2 style="font-size:18px;margin:24px 0 12px 0;padding-bottom:6px;border-bottom:1px solid #d0d7de;">Notionで補足確認</h2><p style="margin:0 0 12px 0;"><a href="${notionPageUrl}" target="_blank" rel="noopener noreferrer">Notion ページを開く</a></p>`;
 
   return `<!DOCTYPE html>
 <html lang="ja">
-  <body style="margin:0;padding:0;background:#f5f7fb;font-family:'Yu Gothic','Yu Gothic UI',-apple-system,BlinkMacSystemFont,'Segoe UI','Hiragino Kaku Gothic ProN','Meiryo',Arial,sans-serif;color:#1f2937;">
-    <div style="max-width:680px;margin:0 auto;padding:16px;">
-      <div style="background:#ffffff;border-radius:12px;padding:20px;line-height:1.7;">
-        <h2 style="margin:0 0 12px 0;font-size:20px;">Interview Memo 完了通知</h2>
+  <body style="margin:0;padding:0;background:#f8fafc;font-family:'Yu Gothic UI','Yu Gothic',Meiryo,Arial,sans-serif;font-size:15px;line-height:1.7;color:#1f2933;">
+    <div style="max-width:880px;margin:0 auto;padding:24px;">
+      <div style="background:#ffffff;border-radius:12px;padding:20px;">
+        <h2 style="font-size:18px;margin:0 0 12px 0;padding-bottom:6px;border-bottom:1px solid #d0d7de;">Meeting Memo作成完了</h2>
         <p style="margin:0 0 12px 0;">Interview Memo の文字起こしと要約が完了しました。</p>
         <p style="margin:0 0 12px 0;">
           Notion ページ：
           <a href="${notionPageUrl}" target="_blank" rel="noopener noreferrer">Notion ページを開く</a>
         </p>
         ${input.transcriptFileUrl ? `<p style="margin:0 0 12px 0;">Transcript全文リンク：<a href="${escapeHtml(input.transcriptFileUrl)}" target="_blank" rel="noopener noreferrer">Transcript全文リンク</a></p>` : ''}
-        <h3 style="margin:16px 0 8px 0;font-size:16px;">完成版 面談メモ</h3>
-        <div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:14px 14px 10px 14px;">${finalMemoHtml}</div>
+        <h2 style="font-size:18px;margin:24px 0 12px 0;padding-bottom:6px;border-bottom:1px solid #d0d7de;">完成版 面談メモ</h2>
+        <div style="background:#ffffff;border:1px solid #d0d7de;border-radius:10px;padding:14px 14px 10px 14px;">${finalMemoHtml}</div>
         ${myTasksSection}
         ${sourceSection}
+        ${notionSection}
       </div>
     </div>
   </body>
