@@ -19,6 +19,19 @@ interface CompletionEmailInput {
   myTasks: Array<{ taskText: string; chooseUrl?: string }>;
 }
 
+function stripMarkdownForEmail(value: string): string {
+  return value
+    .replace(/\r\n/g, '\n')
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '$1')
+    .replace(/\*\*(.*?)\*\*/g, '$1')
+    .replace(/^\s*#{1,6}\s*/gm, '')
+    .replace(/^\s*[-*]\s+/gm, '・')
+    .replace(/^\s*\d+\.\s+/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 function isEnabled(value: string | undefined): boolean {
   return value?.toLowerCase() === 'true';
 }
@@ -103,23 +116,13 @@ export function getCompletionEmailConfig(env: Env): MailConfig {
 }
 
 function buildCompletionEmailHtml(input: CompletionEmailInput): string {
-  const finalMemo = input.finalMemo ?? '';
-  const sourceUrlsInput = Array.isArray(input.sourceUrls) ? input.sourceUrls : [];
+  const finalMemo = stripMarkdownForEmail(input.finalMemo ?? '');
   const myTasksHtml = input.myTasks.length
-    ? `<ul style="padding-left:20px;margin:0;">${input.myTasks.map((task) => {
-      const buttonHtml = task.chooseUrl
-        ? `<div style="margin-top:8px;"><a href="${escapeHtml(task.chooseUrl)}" target="_blank" rel="noopener noreferrer" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;padding:8px 12px;border-radius:8px;font-size:13px;">タスク処理を選ぶ</a></div>`
-        : '';
-      return `<li style="margin-bottom:12px;"><div>${escapeHtml(task.taskText)}</div>${buttonHtml}</li>`;
-    }).join('')}</ul>`
+    ? `<div style="white-space:pre-wrap;margin:0;">${input.myTasks.map((task) => `・${escapeHtml(stripMarkdownForEmail(task.taskText))}`).join('\n')}</div>`
     : '';
   const notionPageUrl = escapeHtml(input.notionPageUrl);
-  const sourceUrls = sourceUrlsInput.length
-    ? `<h3 style="margin:16px 0 8px 0;font-size:16px;">参考リンク</h3>
-        <ul style="padding-left:20px;margin:0;">${sourceUrlsInput.map((url) => `<li><a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a></li>`).join('')}</ul>`
-    : '';
   const myTasksSection = input.myTasks.length
-    ? `<h3 style="margin:16px 0 8px 0;font-size:16px;">My Tasks</h3>${myTasksHtml}`
+    ? `<h3 style="margin:16px 0 8px 0;font-size:16px;">次アクション</h3>${myTasksHtml}`
     : '';
 
   return `<!DOCTYPE html>
@@ -136,8 +139,8 @@ function buildCompletionEmailHtml(input: CompletionEmailInput): string {
         ${input.transcriptFileUrl ? `<p style="margin:0 0 12px 0;">Transcript全文リンク：<a href="${escapeHtml(input.transcriptFileUrl)}" target="_blank" rel="noopener noreferrer">Transcript全文リンク</a></p>` : ''}
         <h3 style="margin:16px 0 8px 0;font-size:16px;">完成版 面談メモ</h3>
         <p style="white-space:pre-wrap;margin:0;">${escapeHtml(finalMemo)}</p>
-        ${sourceUrls}
         ${myTasksSection}
+        <p style="margin:16px 0 0 0;">Notion ページで補足説明・参考リンクを確認してください。</p>
       </div>
     </div>
   </body>
