@@ -15,8 +15,13 @@ test('completion email body keeps readable final memo structure and per-task act
     subject: 'Interview completed',
     notionPageUrl,
     transcriptFileUrl: 'https://dropbox.example.com/transcript.txt',
-    finalMemo: '# 完成版 面談メモ\n1. 面談の主題\n- 配当方針を巡る認識整理\n・ ジョイントベンチャー運営上の論点整理\n* 拠点統合と現場運営の進め方\n\n2. 確認事項\n1. 事業再編の時期を再確認する\n2. 実施責任者を確定する\n\n通常段落 https://example.com/docs',
-    sourceUrls: ['https://example.com'],
+    finalMemo: '# 完成版 面談メモ\n1. 面談の主題\n- **配当方針を巡る認識整理**\n・ ジョイントベンチャー運営上の論点整理\n* 拠点統合と現場運営の進め方\n\n2. 確認事項\n## Next Steps / アクション\n| # | アクション | 担当 | 期限 | 補足 |\n|---|---|---|---|---|\n| 1 | 事業再編の時期を再確認する | 不明 | 不明 | 先方確認 |\n| 2 | 実施責任者を確定する | 田中 | 2026-05-10 | 役割整理 |\n\n通常段落 https://example.com/docs',
+    sourceUrls: [
+      'https://www.notion.so/example',
+      { url: 'https://example.com/report-2026', title: '東京製鐵、2026年3月期決算説明資料' },
+      { url: 'https://example.com/no-title' },
+      { url: 'https://example.com/no-title' },
+    ],
     myTasks: [{ taskText: 'task 1', chooseUrl: chooseUrl1 }, { taskText: 'task 2', chooseUrl: chooseUrl2 }],
   });
 
@@ -37,12 +42,14 @@ test('completion email body keeps readable final memo structure and per-task act
   assert.ok(message.includes('1. 面談の主題'));
   assert.ok(message.includes('<ul style='));
   assert.ok(message.includes('<li style='));
-  assert.ok(message.includes('<ol style='));
   assert.ok(message.includes('href="https://example.com/docs"'));
   assert.ok(message.includes('参考リンク'));
-  assert.ok(message.includes('Notionページを開く'));
-  assert.ok(message.includes('href="https://example.com"'));
-  assert.ok(message.includes('参考資料 1 を開く'));
+  assert.equal(message.includes('参考リンク</h2><ul style="padding-left:20px;margin:0;"><li><a href="https://www.notion.so/example"'), false);
+  assert.ok(message.includes('href="https://example.com/report-2026"'));
+  assert.ok(message.includes('東京製鐵、2026年3月期決算説明資料'));
+  assert.ok(message.includes('href="https://example.com/no-title"'));
+  assert.ok(message.includes('no title'));
+  assert.equal((message.match(/https:\/\/example\.com\/no-title/g) ?? []).length, 1);
   assert.equal(message.includes('Transcript</h3>'), false);
   assert.equal(message.includes('Summary</h3>'), false);
   assert.ok(message.includes('次アクション'));
@@ -59,6 +66,14 @@ test('completion email body keeps readable final memo structure and per-task act
   assert.equal((message.match(/完成版 面談メモ/g) ?? []).length, 1);
   assert.ok(!message.includes('/action/move'));
   assert.equal(message.includes('\n#'), false);
+  assert.ok(message.includes('<strong>配当方針を巡る認識整理</strong>'));
+  assert.equal(message.includes('**配当方針を巡る認識整理**'), false);
+  assert.ok(message.includes('<table style="border-collapse:collapse;'));
+  assert.ok(message.includes('<th style="border:1px solid #ddd;padding:8px;text-align:left;white-space:nowrap;">アクション</th>'));
+  assert.ok(message.includes('担当'));
+  assert.ok(message.includes('期限'));
+  assert.ok(message.includes('補足'));
+  assert.equal(message.includes('| # | アクション | 担当 | 期限 | 補足 |'), false);
 });
 
 test('completion email omits transcript link section when link is not provided', () => {
