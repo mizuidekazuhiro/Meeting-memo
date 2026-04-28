@@ -347,6 +347,55 @@ test('finalizeInterviewJob executes transcript -> summary -> email and marks com
   assert.ok(fetchMock.stats.transcriptUploads >= 1);
 });
 
+test('diarization OFF stores Dropbox transcript without speaker labels', async () => {
+  const { jobsMod, processingMod, gmailMod } = await loadDeps();
+  const { createRecordingJob, upsertRecordingJob } = jobsMod;
+  const { persistTranscriptionCallback, finalizeInterviewJob } = processingMod;
+
+  const kv = new MockKv();
+  const env = makeEnv(kv, { GMAIL_NOTIFY_ENABLED: 'false', TRANSCRIBE_DIARIZATION_ENABLED: 'false' });
+  const job = createRecordingJob({ request: { fileName: 'nolabel.m4a' }, dropboxFileId: 'id:nl', dropboxPathLower: '/apps/meetingmemo/inbox/nolabel.m4a', fileName: 'nolabel.m4a' });
+  await upsertRecordingJob(env, job);
+  await persistTranscriptionCallback(env, {
+    recordingId: job.recordingId,
+    transcript: {
+      fullText: '[A] hello\n[B] world',
+      segments: [{ speaker: 'A', text: 'hello' }, { speaker: 'B', text: 'world' }],
+      raw: {},
+    },
+  } as any);
+
+  const originalFetch = global.fetch;
+  let uploadedText = '';
+  global.fetch = (async (input: string, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    if (url.includes('/2/files/upload')) {
+      uploadedText = typeof init?.body === 'string' ? init.body : '';
+      return new Response(JSON.stringify({ id: 'id:transcript', path_lower: '/apps/meetingmemo/transcripts/a.txt' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/2/sharing/list_shared_links')) return new Response(JSON.stringify({ links: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/2/sharing/create_shared_link_with_settings')) return new Response(JSON.stringify({ url: 'https://dropbox.example.com/transcript' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/v1/responses')) return new Response(JSON.stringify({ output_text: JSON.stringify({ summary: '要約', myTasks: [], otherTasks: [], ambiguities: [] }) }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.endsWith('/pages') && init?.method === 'POST') return new Response(JSON.stringify({ id: 'page_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/pages/') && init?.method === 'PATCH') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/pages/') && init?.method === 'GET') return new Response(JSON.stringify({ properties: { 'Transcript Link': { type: 'url' } } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/children?')) return new Response(JSON.stringify({ results: [], has_more: false, next_cursor: null }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/databases/') && url.endsWith('/query')) return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('/databases/db') && init?.method === 'GET') return new Response(JSON.stringify({ properties: {} }), { status: 200, headers: { 'content-type': 'application/json' } });
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+
+  const originalSend = gmailMod.sendCompletionEmail;
+  gmailMod.sendCompletionEmail = (async () => undefined) as any;
+  await finalizeInterviewJob(env, job.recordingId);
+  gmailMod.sendCompletionEmail = originalSend;
+  global.fetch = originalFetch;
+
+  assert.equal(uploadedText.includes('[A]'), false);
+  assert.equal(uploadedText.includes('[B]'), false);
+});
+
 test('finalize resumes from partial state and skips transcript append when transcriptWrittenAt exists', async () => {
   const { jobsMod, processingMod, gmailMod } = await loadDeps();
   const { createRecordingJob, upsertRecordingJob, getRecordingJob } = jobsMod;

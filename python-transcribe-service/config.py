@@ -20,6 +20,8 @@ class Settings:
     primary_audio_format: str = os.getenv('PRIMARY_AUDIO_FORMAT', 'm4a').lower()
     fallback_audio_format: str = os.getenv('FALLBACK_AUDIO_FORMAT', 'wav').lower()
     enable_audio_fallback: bool = os.getenv('ENABLE_AUDIO_FALLBACK', 'true').lower() == 'true'
+    transcribe_diarization_enabled: bool = os.getenv('TRANSCRIBE_DIARIZATION_ENABLED', 'false').lower() == 'true'
+    transcribe_language: str = os.getenv('TRANSCRIBE_LANGUAGE', 'ja')
     ffmpeg_path: str = os.getenv('FFMPEG_PATH', 'ffmpeg')
     ffprobe_path: str = os.getenv('FFPROBE_PATH', 'ffprobe')
     tmp_dir: str = os.getenv('TMP_DIR', '/tmp')

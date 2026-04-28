@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 import { Blob } from 'node:buffer';
 
-import { createChunkPlan, validateChunk, transcribeWithDiarization, buildChunkLogMeta, summarizeInterview, normalizeAudioMimeType, reviewInterviewWithWebSearch } from '../src/lib/openai';
+import { createChunkPlan, validateChunk, transcribeWithDiarization, buildChunkLogMeta, summarizeInterview, normalizeAudioMimeType, resolveTranscriptionLanguage, reviewInterviewWithWebSearch } from '../src/lib/openai';
 import { HttpError } from '../src/lib/http';
 
 const env = { OPENAI_API_KEY: 'test' } as any;
@@ -433,4 +433,58 @@ test('reviewInterviewWithWebSearch disables web search tool when configured fals
   });
   global.fetch = originalFetch;
   assert.deepEqual(tools, []);
+});
+
+test('TRANSCRIBE_DIARIZATION_ENABLED defaults to false and forces ja language', async () => {
+  const source = makeTestWav(60);
+  const calls: any[] = [];
+  await transcribeWithDiarization({ OPENAI_API_KEY: 'test' } as any, source, 'meeting.wav', undefined, {
+    uploadChunk: async (_env, _chunk, _hint, options) => {
+      calls.push(options);
+      return { fullText: 'テスト', segments: [], raw: {} };
+    },
+  });
+  assert.equal(calls[0].diarizationEnabled, false);
+  assert.equal(calls[0].language, 'ja');
+});
+
+test('TRANSCRIBE_DIARIZATION_ENABLED=true enables diarization mode', async () => {
+  const source = makeTestWav(60);
+  const calls: any[] = [];
+  await transcribeWithDiarization({ OPENAI_API_KEY: 'test', TRANSCRIBE_DIARIZATION_ENABLED: 'true' } as any, source, 'meeting.wav', undefined, {
+    uploadChunk: async (_env, _chunk, _hint, options) => {
+      calls.push(options);
+      return { fullText: '[A] テスト', segments: [{ speaker: 'A', text: 'テスト' } as any], raw: {} };
+    },
+  });
+  assert.equal(calls[0].diarizationEnabled, true);
+});
+
+test('TRANSCRIBE_DIARIZATION_ENABLED=false keeps diarization disabled', async () => {
+  const source = makeTestWav(60);
+  const calls: any[] = [];
+  await transcribeWithDiarization({ OPENAI_API_KEY: 'test', TRANSCRIBE_DIARIZATION_ENABLED: 'false' } as any, source, 'meeting.wav', undefined, {
+    uploadChunk: async (_env, _chunk, _hint, options) => {
+      calls.push(options);
+      return { fullText: 'テスト', segments: [], raw: {} };
+    },
+  });
+  assert.equal(calls[0].diarizationEnabled, false);
+});
+
+test('language resolution prioritizes request.languageHint over env', () => {
+  const resolved = resolveTranscriptionLanguage('en', 'ja');
+  assert.equal(resolved.language, 'en');
+  assert.equal(resolved.fallbackReason, 'request');
+});
+
+test('language resolution falls back to env then default ja on invalid inputs', () => {
+  const envFallback = resolveTranscriptionLanguage('english', 'en');
+  assert.equal(envFallback.language, 'en');
+  assert.equal(envFallback.fallbackReason, 'env');
+  const defaultFallback = resolveTranscriptionLanguage('jp', 'auto');
+  assert.equal(defaultFallback.language, 'ja');
+  assert.equal(defaultFallback.fallbackReason, 'default');
+  assert.equal(defaultFallback.invalidLanguageHint, 'jp');
+  assert.equal(defaultFallback.invalidEnvLanguage, 'auto');
 });

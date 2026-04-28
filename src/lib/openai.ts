@@ -3,7 +3,21 @@ import { HttpError } from './http';
 import { logEvent } from './logger';
 
 const OPENAI_API = 'https://api.openai.com/v1';
-const DEFAULT_TRANSCRIBE_MODEL = 'gpt-4o-transcribe-diarize';
+const DEFAULT_DIARIZATION_MODEL = 'gpt-4o-transcribe-diarize';
+const DEFAULT_STANDARD_TRANSCRIBE_MODEL = 'gpt-4o-transcribe';
+const DEFAULT_JAPANESE_TRANSCRIBE_PROMPT = [
+  'これは日本語の社内会議音声です。',
+  '明確な英単語・略語・会社名以外は日本語として文字起こししてください。',
+  '相槌、聞き取り不能な断片、意味のない英語風フレーズは無理に英語化しないでください。',
+  '業界用語、会社名、略称、数値が多く含まれます。',
+].join('\n');
+const DEFAULT_ENGLISH_TRANSCRIBE_PROMPT = [
+  'This is an English business meeting audio.',
+  'Transcribe in English.',
+  'Preserve company names, abbreviations, numbers, technical terms, and business context.',
+  'Do not invent unclear content. Mark unclear parts as [inaudible] where necessary.',
+].join('\n');
+const SUPPORTED_TRANSCRIBE_LANGUAGES = new Set(['ja', 'en']);
 export const MAX_TRANSCRIPTION_BYTES = 24 * 1024 * 1024;
 export const MAX_TRANSCRIBE_DURATION_SEC = 1400;
 // Keep chunks around 10-12 minutes so we stay well under the 1400s model limit
@@ -100,7 +114,47 @@ type GenerateChunkOptions = { preferredFormat: AudioFormat };
 
 type AudioChunkGenerator = (source: Blob, sourceMeta: SourceAudioMetadata, plan: ChunkPlanEntry, options: GenerateChunkOptions) => Promise<PreparedTranscriptionChunk>;
 
-type UploadChunkFn = (env: Env, chunk: PreparedTranscriptionChunk, languageHint?: string) => Promise<TranscriptResult>;
+type TranscribeOptions = {
+  diarizationEnabled: boolean;
+  language: string;
+  prompt?: string;
+  requestedLanguageHint?: string;
+  envLanguage?: string;
+  languageFallbackReason?: 'request' | 'env' | 'default';
+  invalidLanguageHint?: string;
+  invalidEnvLanguage?: string;
+};
+
+type UploadChunkFn = (env: Env, chunk: PreparedTranscriptionChunk, languageHint?: string, options?: TranscribeOptions) => Promise<TranscriptResult>;
+
+function normalizeLanguageCandidate(value?: string): string | undefined {
+  if (!value) return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return undefined;
+  return normalized;
+}
+
+export function resolveTranscriptionLanguage(languageHint?: string, envLanguage?: string): {
+  language: 'ja' | 'en';
+  fallbackReason: 'request' | 'env' | 'default';
+  invalidLanguageHint?: string;
+  invalidEnvLanguage?: string;
+} {
+  const normalizedHint = normalizeLanguageCandidate(languageHint);
+  if (normalizedHint && SUPPORTED_TRANSCRIBE_LANGUAGES.has(normalizedHint)) {
+    return { language: normalizedHint as 'ja' | 'en', fallbackReason: 'request' };
+  }
+  const normalizedEnv = normalizeLanguageCandidate(envLanguage);
+  if (normalizedEnv && SUPPORTED_TRANSCRIBE_LANGUAGES.has(normalizedEnv)) {
+    return { language: normalizedEnv as 'ja' | 'en', fallbackReason: 'env', invalidLanguageHint: normalizedHint && !SUPPORTED_TRANSCRIBE_LANGUAGES.has(normalizedHint) ? normalizedHint : undefined };
+  }
+  return {
+    language: 'ja',
+    fallbackReason: 'default',
+    invalidLanguageHint: normalizedHint && !SUPPORTED_TRANSCRIBE_LANGUAGES.has(normalizedHint) ? normalizedHint : undefined,
+    invalidEnvLanguage: normalizedEnv && !SUPPORTED_TRANSCRIBE_LANGUAGES.has(normalizedEnv) ? normalizedEnv : undefined,
+  };
+}
 
 function asSpeakerLabel(segment: DiarizedSegmentLike): string {
   const rawSpeaker = segment.speaker ?? segment.speaker_label ?? segment.speaker_id;
@@ -462,15 +516,21 @@ function shouldFallbackToWav(error: unknown): boolean {
     && (details.param === 'file' || /corrupted|unsupported|invalid_value|file/i.test(responseText));
 }
 
-async function uploadPreparedChunk(env: Env, chunk: PreparedTranscriptionChunk, languageHint?: string): Promise<TranscriptResult> {
-  const model = env.OPENAI_MODEL_TRANSCRIBE ?? DEFAULT_TRANSCRIBE_MODEL;
+async function uploadPreparedChunk(env: Env, chunk: PreparedTranscriptionChunk, languageHint?: string, options?: TranscribeOptions): Promise<TranscriptResult> {
+  const diarizationEnabled = options?.diarizationEnabled ?? true;
+  const model = env.OPENAI_MODEL_TRANSCRIBE
+    ?? (diarizationEnabled ? DEFAULT_DIARIZATION_MODEL : DEFAULT_STANDARD_TRANSCRIBE_MODEL);
   const form = new FormData();
   const uploadBlob = chunk.blob.type === chunk.mimeType ? chunk.blob : new Blob([chunk.blob], { type: chunk.mimeType });
   form.append('file', uploadBlob, chunk.fileName);
   form.append('model', model);
-  form.append('response_format', 'diarized_json');
-  form.append('chunking_strategy', 'auto');
-  if (languageHint) form.append('language', languageHint);
+  if (diarizationEnabled) {
+    form.append('response_format', 'diarized_json');
+    form.append('chunking_strategy', 'auto');
+  }
+  const language = options?.language || languageHint;
+  if (language) form.append('language', language);
+  if (!diarizationEnabled && options?.prompt) form.append('prompt', options.prompt);
   const response = await fetch(`${OPENAI_API}/audio/transcriptions`, { method: 'POST', headers: { authorization: `Bearer ${env.OPENAI_API_KEY}` }, body: form });
   if (!response.ok) {
     const responseText = await readResponseTextSafely(response);
@@ -481,7 +541,7 @@ async function uploadPreparedChunk(env: Env, chunk: PreparedTranscriptionChunk, 
   return mapTranscriptPayload((await response.json()) as OpenAiDiarizedTranscript);
 }
 
-async function transcribeChunkWithFallback(env: Env, source: Blob, sourceMeta: SourceAudioMetadata, plan: ChunkPlanEntry, languageHint: string | undefined, chunkGenerator: AudioChunkGenerator, uploadChunk: UploadChunkFn, context: Record<string, unknown>): Promise<TranscriptResult> {
+async function transcribeChunkWithFallback(env: Env, source: Blob, sourceMeta: SourceAudioMetadata, plan: ChunkPlanEntry, languageHint: string | undefined, chunkGenerator: AudioChunkGenerator, uploadChunk: UploadChunkFn, context: Record<string, unknown>, options: TranscribeOptions): Promise<TranscriptResult> {
   let chunk = await validateChunk(await chunkGenerator(source, sourceMeta, plan, { preferredFormat: PRIMARY_AUDIO_FORMAT }));
   if (!chunk.validationPassed) {
     logEvent('error', 'chunk validation failed', { ...context, fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, strategy: chunk.strategy, extension: chunk.extension, originalMimeType: chunk.originalMimeType, normalizedMimeType: chunk.mimeType, validationErrors: chunk.validationErrors });
@@ -489,7 +549,7 @@ async function transcribeChunkWithFallback(env: Env, source: Blob, sourceMeta: S
   }
   logEvent('info', 'openai.transcription.chunk', { ...context, ...buildChunkLogMeta(sourceMeta, chunk) });
   try {
-    return await uploadChunk(env, chunk, languageHint);
+    return await uploadChunk(env, chunk, languageHint, options);
   } catch (error) {
     if (!shouldFallbackToWav(error) || chunk.extension === '.wav') throw error;
     logEvent('warn', 'chunk upload failed with m4a, fallback to wav', { ...context, fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, details: error instanceof HttpError ? error.details : error });
@@ -500,7 +560,7 @@ async function transcribeChunkWithFallback(env: Env, source: Blob, sourceMeta: S
     }
     logEvent('info', 'fallback wav upload started', { ...context, ...buildChunkLogMeta(sourceMeta, fallbackChunk) });
     try {
-      const result = await uploadChunk(env, fallbackChunk, languageHint);
+      const result = await uploadChunk(env, fallbackChunk, languageHint, options);
       logEvent('info', 'fallback wav upload succeeded', { ...context, fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount });
       return result;
     } catch (fallbackError) {
@@ -535,6 +595,19 @@ export function buildChunkLogMeta(sourceMeta: SourceAudioMetadata, chunk: Prepar
 export async function transcribeWithDiarization(env: Env, audio: Blob, fileName: string, languageHint?: string, deps: { chunkGenerator?: AudioChunkGenerator; uploadChunk?: UploadChunkFn; recordingId?: string; dropboxFileId?: string; dropboxPathLower?: string } = {}): Promise<TranscriptResult> {
   const chunkGenerator = deps.chunkGenerator ?? defaultChunkGenerator;
   const uploadChunk = deps.uploadChunk ?? uploadPreparedChunk;
+  const diarizationEnabled = env.TRANSCRIBE_DIARIZATION_ENABLED?.toLowerCase() === 'true';
+  const resolvedLanguage = resolveTranscriptionLanguage(languageHint, env.TRANSCRIBE_LANGUAGE);
+  const language = resolvedLanguage.language;
+  const transcribeOptions: TranscribeOptions = {
+    diarizationEnabled,
+    language,
+    prompt: diarizationEnabled ? undefined : (language === 'ja' ? DEFAULT_JAPANESE_TRANSCRIBE_PROMPT : DEFAULT_ENGLISH_TRANSCRIBE_PROMPT),
+    requestedLanguageHint: languageHint,
+    envLanguage: env.TRANSCRIBE_LANGUAGE,
+    languageFallbackReason: resolvedLanguage.fallbackReason,
+    invalidLanguageHint: resolvedLanguage.invalidLanguageHint,
+    invalidEnvLanguage: resolvedLanguage.invalidEnvLanguage,
+  };
 
   let sourceMeta: SourceAudioMetadata;
   try {
@@ -553,7 +626,17 @@ export async function transcribeWithDiarization(env: Env, audio: Blob, fileName:
   }
 
   const context = { recordingId: deps.recordingId, fileName, dropboxFileId: deps.dropboxFileId, dropboxPathLower: deps.dropboxPathLower };
-  logEvent('info', 'openai.transcription.plan', { ...context, sourceDurationSec: sourceMeta.durationSec, sourceBytes: sourceMeta.bytes, chunkCount: plan.entries.length, targetChunkDurationSec: TARGET_CHUNK_DURATION_SEC, maxModelDurationSec: MAX_TRANSCRIBE_DURATION_SEC, primaryAudioFormat: PRIMARY_AUDIO_FORMAT, fallbackAudioFormat: FALLBACK_AUDIO_FORMAT });
+  if (resolvedLanguage.invalidLanguageHint || resolvedLanguage.invalidEnvLanguage) {
+    logEvent('warn', 'transcription_language_invalid_value', {
+      ...context,
+      requestLanguageHint: languageHint,
+      envLanguage: env.TRANSCRIBE_LANGUAGE,
+      invalidLanguageHint: resolvedLanguage.invalidLanguageHint,
+      invalidEnvLanguage: resolvedLanguage.invalidEnvLanguage,
+      resolvedLanguage: language,
+    });
+  }
+  logEvent('info', 'openai.transcription.plan', { ...context, sourceDurationSec: sourceMeta.durationSec, sourceBytes: sourceMeta.bytes, chunkCount: plan.entries.length, targetChunkDurationSec: TARGET_CHUNK_DURATION_SEC, maxModelDurationSec: MAX_TRANSCRIBE_DURATION_SEC, primaryAudioFormat: PRIMARY_AUDIO_FORMAT, fallbackAudioFormat: FALLBACK_AUDIO_FORMAT, diarizationEnabled, requestLanguageHint: languageHint, envLanguage: env.TRANSCRIBE_LANGUAGE, resolvedLanguage: language, languageFallbackReason: resolvedLanguage.fallbackReason, promptEnabled: Boolean(transcribeOptions.prompt), model: env.OPENAI_MODEL_TRANSCRIBE ?? (diarizationEnabled ? DEFAULT_DIARIZATION_MODEL : DEFAULT_STANDARD_TRANSCRIBE_MODEL) });
 
   if (!plan.requiresSplit) {
     const chunk = await validateChunk({ blob: audio, fileName, extension: sourceMeta.extension || extensionForFileName(fileName), mimeType: sourceMeta.mimeType, originalMimeType: sourceMeta.originalMimeType ?? sourceMeta.mimeType, bytes: sourceMeta.bytes, codec: sourceMeta.codec, container: sourceMeta.container, sampleRate: sourceMeta.sampleRate, channels: sourceMeta.channels, estimatedDurationSec: sourceMeta.durationSec ?? 0, actualDurationSec: sourceMeta.durationSec, strategy: 'single-original', validationPassed: false, validationErrors: [], chunkIndex: 0, chunkCount: 1, startOffsetMs: 0, endOffsetMs: Math.round((sourceMeta.durationSec ?? 0) * 1000) });
@@ -562,14 +645,14 @@ export async function transcribeWithDiarization(env: Env, audio: Blob, fileName:
       throw new HttpError('chunk validation failed', 500, { fileName, chunkIndex: 1, chunkCount: 1, strategy: chunk.strategy, extension: chunk.extension, format: chunk.extension, originalMimeType: chunk.originalMimeType, normalizedMimeType: chunk.mimeType, validationErrors: chunk.validationErrors });
     }
     logEvent('info', 'openai.transcription.chunk', { ...context, ...buildChunkLogMeta(sourceMeta, chunk) });
-    return uploadChunk(env, chunk, languageHint);
+    return uploadChunk(env, chunk, languageHint, transcribeOptions);
   }
 
   const results: TranscriptResult[] = [];
   let accumulatedOffsetMs = 0;
   for (const entry of plan.entries) {
     try {
-      const result = await transcribeChunkWithFallback(env, audio, sourceMeta, entry, languageHint, chunkGenerator, uploadChunk, context);
+      const result = await transcribeChunkWithFallback(env, audio, sourceMeta, entry, languageHint, chunkGenerator, uploadChunk, context, transcribeOptions);
       const baseOffset = accumulatedOffsetMs || entry.startOffsetMs;
       results.push(applyOffsetToTranscript(result, baseOffset));
       accumulatedOffsetMs = baseOffset + getChunkDurationMs(result, entry.estimatedDurationSec);
@@ -735,6 +818,7 @@ export async function reviewInterviewWithWebSearch(
               text: [
                 'あなたは面談メモの二次レビュー担当です。',
                 'Transcriptと一次要約を読み、必要に応じてWeb検索で固有名詞・会社名・人物名・略称を確認してください。',
+                '最終成果は「短い要約」ではなく、社内検討・上席共有に使える詳細な完成版面談メモです。',
                 '不明な事項を推測で埋めてはいけません。',
                 '事実、推測、提案を分けて明記してください。',
                 '金額、株式比率、株主間協定、契約条件、会計処理、法務論点は断定しないでください。',
@@ -748,15 +832,16 @@ export async function reviewInterviewWithWebSearch(
                 '不確実という理由だけでタスクを生成しないでください。',
                 'myTasks の各項目は具体的な動詞句で、目的語と業務目的を含めてください。抽象的な「確認する」「検討する」単体は禁止です。',
                 'humanCheckRequired は次の場合 true: 確度が低または不明を含む、金額/株式比率/株主間協定/会計/法務論点がある、誤変換が多い、Web検索とTranscriptが矛盾しうる、sourceUrls空かつ固有名詞補正あり。',
-                'finalMemoMarkdown は以下のプレーンテキスト構成を厳守: 「完成版 面談メモ」「補足説明」の2部構成。',
-                '完成版 面談メモは社内共有用の報告調。体言止め中心。説明調・解説調・外部資料検証調を避ける。',
-                '完成版 面談メモには URL・Markdown記号（#, ##, ###, **, [text](url), ```）を含めない。',
-                '完成版 面談メモは「1. 面談の主題 2. 確認事項 3. 主要論点 4. 示唆 5. 次アクション」の順。',
-                '補足説明は「1. 要確認事項 2. 聞き取り不明語 3. 外部資料で確認した内容 4. 参考リンク」の順。',
-                '不明事項・聞き取り不明語・外部確認事項・リンクは補足説明へ分離し、完成版に混在させない。',
+                'finalMemoMarkdown は Markdown で出力し、先頭を必ず「# 完成版 面談メモ」にする。',
+                'Transcript内の複数テーマは必ず案件別に章分けし、各章は「## 1. テーマ名」「### (1) 論点名」の粒度で記載する。',
+                '固有名詞・数値・背景・発言ニュアンス・示唆・決定事項・未決事項・要確認事項を落とさない。',
+                '「Well」「I don\'t know」「Oh okay」「I can\'t breathe」等の英語風ノイズは除外する。IRR/ROIC/AWS/DC/MMK/MBS/MVC/NPS/TFE等の略語は保持する。',
+                'finalMemoMarkdown の末尾に「## 決定事項」「## 未決事項・要確認事項」「## Next Steps / アクション」を必ず含める。',
+                'Next Steps は必ず Markdown 表で「| # | アクション | 担当 | 期限 | 補足 |」の列構成にする。担当不明・期限不明は「不明」と明記する。',
+                '本文は2,000〜5,000字目安。情報量が多い場合は超過可。抽象化しすぎない。',
                 '既知用語の一般説明は不要。',
-                'nextActionsMarkdown は箇条書きのみ。各行先頭は「・」。URLやMarkdown記号を含めない。',
-                'summaryForEmail は「完成版 面談メモ」の要点のみ。補足説明やリンクを含めない。',
+                'nextActionsMarkdown は finalMemoMarkdown の Next Steps 表から抽出し、各行先頭「・」の箇条書きで出力する。',
+                'summaryForEmail は finalMemoMarkdown と原則同一内容を返す。省略する場合も案件別論点と Next Steps は必ず残す。',
               ].join(' '),
             }],
           },

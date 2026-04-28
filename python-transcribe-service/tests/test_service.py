@@ -119,6 +119,7 @@ def test_merge_results_corrects_inverted_timestamps():
 
 def test_transcribe_file_passes_chunking_strategy(monkeypatch, tmp_path):
     monkeypatch.setenv('DIARIZATION_CHUNKING_STRATEGY', 'auto')
+    monkeypatch.setenv('TRANSCRIBE_DIARIZATION_ENABLED', 'true')
 
     import importlib
     import config
@@ -147,6 +148,7 @@ def test_transcribe_file_passes_chunking_strategy(monkeypatch, tmp_path):
 
 def test_transcribe_file_raises_when_chunking_strategy_missing(monkeypatch, tmp_path):
     monkeypatch.setenv('DIARIZATION_CHUNKING_STRATEGY', '')
+    monkeypatch.setenv('TRANSCRIBE_DIARIZATION_ENABLED', 'true')
 
     import importlib
     import config
@@ -167,6 +169,7 @@ def test_transcribe_file_raises_when_chunking_strategy_missing(monkeypatch, tmp_
 
 def test_transcribe_file_wraps_normalize_runtime_error(monkeypatch, tmp_path):
     monkeypatch.setenv('DIARIZATION_CHUNKING_STRATEGY', 'auto')
+    monkeypatch.setenv('TRANSCRIBE_DIARIZATION_ENABLED', 'true')
 
     import importlib
     import config
@@ -192,6 +195,7 @@ def test_transcribe_file_wraps_normalize_runtime_error(monkeypatch, tmp_path):
 
 def test_transcribe_file_accepts_json_string_payload(monkeypatch, tmp_path):
     monkeypatch.setenv('DIARIZATION_CHUNKING_STRATEGY', 'auto')
+    monkeypatch.setenv('TRANSCRIBE_DIARIZATION_ENABLED', 'true')
 
     import importlib
     import config
@@ -210,3 +214,80 @@ def test_transcribe_file_accepts_json_string_payload(monkeypatch, tmp_path):
 
     result = service.transcribe_file(audio_path, language_hint='ja', chunk_index=0, audio_format='wav')
     assert result.fullText == 'ok'
+
+
+def test_transcribe_file_uses_standard_model_when_diarization_disabled(monkeypatch, tmp_path):
+    monkeypatch.setenv('TRANSCRIBE_DIARIZATION_ENABLED', 'false')
+    monkeypatch.setenv('TRANSCRIBE_LANGUAGE', 'ja')
+
+    import importlib
+    import config
+    import transcription_service
+
+    importlib.reload(config)
+    importlib.reload(transcription_service)
+
+    monkeypatch.setattr(transcription_service, 'ffprobe_metadata', _stub_ffprobe)
+    service = transcription_service.TranscriptionService()
+    fake = _FakeOpenAI()
+    service.openai = fake
+
+    audio_path = tmp_path / 'sample.wav'
+    audio_path.write_bytes(b'RIFF')
+    service.transcribe_file(audio_path, language_hint=None, chunk_index=0, audio_format='wav')
+
+    kwargs = fake.audio.transcriptions.calls[0]
+    assert kwargs['model'] == 'gpt-4o-transcribe'
+    assert kwargs['language'] == 'ja'
+    assert kwargs['response_format'] == 'json'
+    assert 'chunking_strategy' not in kwargs
+    assert 'prompt' in kwargs
+
+
+def test_transcribe_file_prefers_request_language_hint_en(monkeypatch, tmp_path):
+    monkeypatch.setenv('TRANSCRIBE_DIARIZATION_ENABLED', 'false')
+    monkeypatch.setenv('TRANSCRIBE_LANGUAGE', 'ja')
+
+    import importlib
+    import config
+    import transcription_service
+
+    importlib.reload(config)
+    importlib.reload(transcription_service)
+
+    monkeypatch.setattr(transcription_service, 'ffprobe_metadata', _stub_ffprobe)
+    service = transcription_service.TranscriptionService()
+    fake = _FakeOpenAI()
+    service.openai = fake
+
+    audio_path = tmp_path / 'sample.wav'
+    audio_path.write_bytes(b'RIFF')
+    service.transcribe_file(audio_path, language_hint='en', chunk_index=0, audio_format='wav')
+
+    kwargs = fake.audio.transcriptions.calls[0]
+    assert kwargs['language'] == 'en'
+    assert 'English business meeting audio' in kwargs['prompt']
+
+
+def test_transcribe_file_invalid_language_hint_falls_back(monkeypatch, tmp_path):
+    monkeypatch.setenv('TRANSCRIBE_DIARIZATION_ENABLED', 'false')
+    monkeypatch.setenv('TRANSCRIBE_LANGUAGE', 'auto')
+
+    import importlib
+    import config
+    import transcription_service
+
+    importlib.reload(config)
+    importlib.reload(transcription_service)
+
+    monkeypatch.setattr(transcription_service, 'ffprobe_metadata', _stub_ffprobe)
+    service = transcription_service.TranscriptionService()
+    fake = _FakeOpenAI()
+    service.openai = fake
+
+    audio_path = tmp_path / 'sample.wav'
+    audio_path.write_bytes(b'RIFF')
+    service.transcribe_file(audio_path, language_hint='jp', chunk_index=0, audio_format='wav')
+
+    kwargs = fake.audio.transcriptions.calls[0]
+    assert kwargs['language'] == 'ja'
