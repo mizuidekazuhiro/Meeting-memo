@@ -6,7 +6,7 @@ import { HttpError } from './http';
 import { findRecordingJobWithSource, getRecordingJob, getRecordingJobStorageMeta, markJobFailed, normalizeDropboxPath, shouldSkipProcessingForExistingJob, updateRecordingJobStatus } from './jobs';
 import { logEvent } from './logger';
 import { appendInterviewReviewFailureToNotionPage, extractTasksFromFinalMemoMarkdown, extractTasksFromNextActionsMarkdown, importMyTasksToInbox, saveTranscriptLinkToNotion, updateInterviewRecordProperties, upsertInterviewFromTranscript, writeFinalMemoToNotionPage } from './notion';
-import { inspectAudioSource, MAX_TRANSCRIBE_DURATION_SEC, reviewInterviewWithWebSearch, summarizeInterview, transcribeWithDiarization } from './openai';
+import { inspectAudioSource, MAX_TRANSCRIBE_DURATION_SEC, resolveTranscriptionLanguage, reviewInterviewWithWebSearch, summarizeInterview, transcribeWithDiarization } from './openai';
 import type { InterviewReviewResult } from '../types';
 
 
@@ -39,11 +39,57 @@ function buildNotionPageUrl(pageId: string): string {
   return `https://www.notion.so/${pageId.replace(/-/g, '')}`;
 }
 
-function renderTranscriptText(transcript: TranscriptResult): string {
+export function renderTranscriptText(transcript: TranscriptResult): string {
   if (transcript.segments.length) {
     return transcript.segments.map((segment) => `[${segment.speaker || 'speaker_unknown'}] ${segment.text ?? ''}`.trim()).join('\n');
   }
   return transcript.fullText;
+}
+
+const SPEAKER_LABEL_PATTERN = /^\s*\[[^\]]+\]\s*/;
+const ENGLISH_NOISE_PATTERNS = [
+  /\bwell\b/gi,
+  /\bi don't know\b/gi,
+  /\boh okay\b/gi,
+  /\bi can't breathe\b/gi,
+];
+
+function isDiarizationEnabled(env: Env): boolean {
+  return env.TRANSCRIBE_DIARIZATION_ENABLED?.toLowerCase() === 'true';
+}
+
+function removeSpeakerLabel(text: string): string {
+  return text.replace(SPEAKER_LABEL_PATTERN, '').trim();
+}
+
+function removeEnglishNoise(text: string): { cleanedText: string; removedCount: number } {
+  let next = text;
+  let removedCount = 0;
+  for (const pattern of ENGLISH_NOISE_PATTERNS) {
+    const matches = next.match(pattern);
+    if (matches) removedCount += matches.length;
+    next = next.replace(pattern, ' ');
+  }
+  return { cleanedText: next.replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim(), removedCount };
+}
+
+export function sanitizeTranscriptForMemo(transcript: TranscriptResult, language: 'ja' | 'en' = 'ja'): { transcript: TranscriptResult; noiseRemovedCount: number } {
+  const shouldRemoveEnglishNoise = language === 'ja';
+  if (transcript.segments.length === 0) {
+    const base = removeSpeakerLabel(transcript.fullText);
+    const cleaned = shouldRemoveEnglishNoise ? removeEnglishNoise(base) : { cleanedText: base, removedCount: 0 };
+    return { transcript: { ...transcript, fullText: cleaned.cleanedText }, noiseRemovedCount: cleaned.removedCount };
+  }
+  const cleanedSegments = transcript.segments
+    .map((segment) => ({ ...segment, text: removeSpeakerLabel(segment.text || '') }))
+    .map((segment) => {
+      const cleaned = shouldRemoveEnglishNoise ? removeEnglishNoise(segment.text) : { cleanedText: segment.text, removedCount: 0 };
+      return { ...segment, text: cleaned.cleanedText, _removed: cleaned.removedCount };
+    })
+    .filter((segment) => segment.text.length > 0);
+  const noiseRemovedCount = cleanedSegments.reduce((sum, segment) => sum + ((segment as any)._removed ?? 0), 0);
+  const segments = cleanedSegments.map(({ _removed: _ignored, ...segment }) => segment as typeof transcript.segments[number]);
+  return { transcript: { ...transcript, segments, fullText: segments.map((segment) => segment.text).join('\n\n') }, noiseRemovedCount };
 }
 
 async function writeTranscriptTextToDropbox(
@@ -62,7 +108,7 @@ async function writeTranscriptTextToDropbox(
     `generatedAt: ${new Date().toISOString()}`,
     '',
     'full transcript text:',
-    renderTranscriptText(job.transcript),
+    isDiarizationEnabled(env) ? renderTranscriptText(job.transcript) : job.transcript.fullText,
   ].join('\n');
   const uploaded = await uploadTextFileToDropbox(env, transcriptFilePath, transcriptBody);
   const shared = await getOrCreateDropboxSharedLink(env, transcriptFilePath);
@@ -90,6 +136,21 @@ function normalizeEmailTasks(myTasks: string[] | undefined): Array<{ taskText: s
 
 function hasNonEmptyMarkdown(value: string | undefined): boolean {
   return typeof value === 'string' && value.trim().length > 0;
+}
+
+function countMatches(text: string, pattern: RegExp): number {
+  const matches = text.match(pattern);
+  return matches ? matches.length : 0;
+}
+
+export function buildFinalMemoStats(finalMemo: string): Record<string, number> {
+  return {
+    outputChars: finalMemo.length,
+    extractedThemeCount: countMatches(finalMemo, /^##\s+\d+\./gm),
+    extractedActionCount: countMatches(finalMemo, /^\|\s*\d+\s*\|/gm),
+    numericCount: countMatches(finalMemo, /\d+(?:\.\d+)?(?:%|億|万|千|円|人|社|件|年|ヶ月|か月|日|t|トン)?/g),
+    properNounCount: countMatches(finalMemo, /[A-Z]{2,}(?:\/[A-Z]{2,})*|[一-龥]{2,}(?:製鋼|製鉄|本部|部|社|案件|Steel)/g),
+  };
 }
 
 const MEMO_COMPLETION_TASK_PATTERNS: RegExp[] = [
@@ -435,13 +496,33 @@ export async function processUploadedInterview(
         dropboxFileId: job.dropboxFileId,
         dropboxPathLower: job.dropboxPathLower,
       });
+      const resolved = resolveTranscriptionLanguage(request.languageHint, env.TRANSCRIBE_LANGUAGE);
+      logEvent('info', 'transcription_completed', {
+        recordingId: job.recordingId,
+        model: env.OPENAI_MODEL_TRANSCRIBE ?? (isDiarizationEnabled(env) ? 'gpt-4o-transcribe-diarize' : 'gpt-4o-transcribe'),
+        diarizationEnabled: isDiarizationEnabled(env),
+        requestLanguageHint: request.languageHint,
+        envLanguage: env.TRANSCRIBE_LANGUAGE,
+        resolvedLanguage: resolved.language,
+        promptEnabled: !isDiarizationEnabled(env),
+        transcriptLength: transcript.fullText.length,
+        segmentCount: transcript.segments.length,
+        fallbackOccurred: false,
+      });
       await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'transcribed', { transcript });
+      const sanitizedTranscript = sanitizeTranscriptForMemo(transcript, resolved.language);
+      logEvent('info', 'final_memo_input_transcript_sanitized', {
+        recordingId: job.recordingId,
+        inputTranscriptChars: transcript.fullText.length,
+        sanitizedTranscriptChars: sanitizedTranscript.transcript.fullText.length,
+        englishNoiseRemovedCount: sanitizedTranscript.noiseRemovedCount,
+      });
       let insights;
       let summaryError: string | undefined;
       let summaryErrorDetails: unknown;
       let summaryRaw: unknown;
       try {
-        insights = await summarizeInterview(env, transcript);
+        insights = await summarizeInterview(env, sanitizedTranscript.transcript);
       } catch (error) {
         summaryError = error instanceof Error ? error.message : 'summary generation failed';
         summaryErrorDetails = error instanceof HttpError ? error.details : error;
@@ -479,7 +560,7 @@ export async function processUploadedInterview(
       try {
         if (shouldRunInterviewReview(env)) {
           reviewResult = await reviewInterviewWithWebSearch(env, {
-            transcript,
+            transcript: sanitizedTranscript.transcript,
             insights,
             title: persisted.record.title,
             fileName: metadata.name,
@@ -725,7 +806,15 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
     if (!mutable.summaryWrittenAt || force) {
       try {
         logEvent('info', 'summary_generation_started', { recordingId });
-        insights = await summarizeInterview(env, mutable.transcript!);
+        const resolved = resolveTranscriptionLanguage(mutable.request.languageHint, env.TRANSCRIBE_LANGUAGE);
+        const sanitizedTranscript = sanitizeTranscriptForMemo(mutable.transcript!, resolved.language);
+        logEvent('info', 'final_memo_input_transcript_sanitized', {
+          recordingId,
+          inputTranscriptChars: mutable.transcript!.fullText.length,
+          sanitizedTranscriptChars: sanitizedTranscript.transcript.fullText.length,
+          englishNoiseRemovedCount: sanitizedTranscript.noiseRemovedCount,
+        });
+        insights = await summarizeInterview(env, sanitizedTranscript.transcript);
         if (pageId) {
           const record = ensureInterviewRecord(mutable, mutable.transcript!, insights);
           await updateInterviewRecordProperties(env, pageId, record);
@@ -748,7 +837,15 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
     if (shouldRunInterviewReview(env) && (!mutable.reviewCompletedAt || force)) {
       logEvent('info', 'review_started', { recordingId });
       try {
-        const review = await reviewInterviewWithWebSearch(env, { transcript: mutable.transcript!, insights, title: mutable.fileName, fileName: mutable.fileName, notionPageUrl: pageId ? buildNotionPageUrl(pageId) : undefined });
+        const resolved = resolveTranscriptionLanguage(mutable.request.languageHint, env.TRANSCRIBE_LANGUAGE);
+        const sanitizedTranscript = sanitizeTranscriptForMemo(mutable.transcript!, resolved.language);
+        logEvent('info', 'final_memo_input_transcript_sanitized', {
+          recordingId,
+          inputTranscriptChars: mutable.transcript!.fullText.length,
+          sanitizedTranscriptChars: sanitizedTranscript.transcript.fullText.length,
+          englishNoiseRemovedCount: sanitizedTranscript.noiseRemovedCount,
+        });
+        const review = await reviewInterviewWithWebSearch(env, { transcript: sanitizedTranscript.transcript, insights, title: mutable.fileName, fileName: mutable.fileName, notionPageUrl: pageId ? buildNotionPageUrl(pageId) : undefined });
         reviewResult = review;
         sourceUrls = review.sourceUrls;
         await updateRecordingJobStatus(env, { recordingId }, 'transcribed', { reviewCompletedAt: new Date().toISOString() });
@@ -765,11 +862,13 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
     }
 
     const finalMemoSelected = selectFinalMemo({ review: reviewResult, insights });
+    const finalMemoStats = buildFinalMemoStats(finalMemoSelected.finalMemo);
     logEvent('info', 'final_memo_selected', {
       recordingId,
       source: finalMemoSelected.source,
       finalMemoLength: finalMemoSelected.finalMemo.length,
       finalMemoStartsWith: finalMemoSelected.finalMemo.slice(0, 32),
+      ...finalMemoStats,
     });
 
     if (pageId) {

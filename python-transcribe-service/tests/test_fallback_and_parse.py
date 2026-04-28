@@ -55,7 +55,7 @@ def test_parse_text_fallback_from_segments_when_text_missing():
             ]
         }
     )
-    assert result.fullText == '[spk1] first\n[spk2] second'
+    assert result.fullText == 'first\n\nsecond'
 
 
 def test_parse_filters_empty_segments():

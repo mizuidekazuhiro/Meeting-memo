@@ -10,7 +10,7 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 - 主処理起点は Dropbox 保存成功時 metadata（scan 依存にしない）
 - 長時間 `.m4a` を Workers で unsafe chunking しない
 - mp4-rewrapped を使わない
-- 後段 Python サービスが `ffprobe` / `ffmpeg` / OpenAI diarized transcription を担当
+- 後段 Python サービスが `ffprobe` / `ffmpeg` / OpenAI transcription を担当（通常運用は diarization OFF）
 - Workers は callback を受けて Notion 保存
 
 ---
@@ -42,7 +42,7 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 4. `POST /api/interviews/upload` は受付専用で **202 Accepted (`action: queued`)** を即時返却（文字起こし完了は意味しない）
 5. iPhone アップロード経由の文字起こしは duration に関係なく Python API（Railway Python service）へ委譲
 6. Python API が Dropbox から直接取得、`ffprobe` / `ffmpeg` で安全分割
-7. Python API が `gpt-4o-transcribe-diarize` へ `chunking_strategy` を指定して chunkIndex 順に送信
+7. Python API が文字起こしを chunkIndex 順に送信（通常運用は `TRANSCRIBE_DIARIZATION_ENABLED=false` で話者分離なし）
 8. Python API が transcript を chunkIndex 順で結合して Workers callback
 9. Workers callback (`/api/interviews/transcription-callback`) は transcript と callback state を保存し、`FINALIZE_QUEUE` に `recordingId` を投入して `202 Accepted` を返す（軽量受信専用）
 10. Cloudflare Queue Consumer が重い finalize（summary / 二次レビュー / Notion追記 / My Tasks登録 / メール送信）を実行
@@ -129,6 +129,30 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 
 ## 環境変数
 
+## 文字起こし設定
+
+```text
+TRANSCRIBE_DIARIZATION_ENABLED=false
+TRANSCRIBE_LANGUAGE=ja
+```
+
+- 通常運用では `TRANSCRIBE_DIARIZATION_ENABLED=false` を推奨
+- iPhoneショートカットから `languageHint` を送る場合、優先順位は `request.languageHint` → `TRANSCRIBE_LANGUAGE` → `ja`
+- 話者分離は誤変換・英語混入・発話断片化を増やす場合がある
+- 面談メモ品質を優先する場合は話者分離OFF
+- 1対1面談など話者区別が重要な場合のみ `true` にする
+- 日本語会議は `languageHint: \"ja\"`、英語会議は `languageHint: \"en\"` を推奨
+
+### iPhoneショートカット送信例
+
+```json
+{ "languageHint": "ja" }
+```
+
+```json
+{ "languageHint": "en" }
+```
+
 ### Workers 側
 
 - `PYTHON_TRANSCRIBE_API_URL`（ベースURL）
@@ -145,6 +169,8 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 - `INTERVIEW_REVIEW_ENABLED`（未設定は有効。`false` の時のみ二次レビュー無効）
 - `INTERVIEW_REVIEW_WEB_SEARCH_ENABLED`（未設定は有効。`false` の時のみWeb検索無効）
 - `OPENAI_MODEL_REVIEW`（既定: `gpt-5.4-mini`）
+- `TRANSCRIBE_DIARIZATION_ENABLED`（既定: `false`。`true` の時のみ話者分離）
+- `TRANSCRIBE_LANGUAGE`（既定: `ja`）
 - `NOTION_TRANSCRIPT_EXCERPT_CHARS`（任意。既定: `4000`）
 - `TRANSCRIPT_STORAGE_MODE`（任意。`dropbox_txt` 推奨）
 - `MAIL_FROM`（送信元 Gmail アドレス）

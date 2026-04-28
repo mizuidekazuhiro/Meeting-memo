@@ -16,7 +16,21 @@ from models import TranscriptResult, TranscriptSegment, TranscriptionJobRequest,
 
 logger = get_logger()
 DIARIZATION_MODEL = 'gpt-4o-transcribe-diarize'
+STANDARD_MODEL = 'gpt-4o-transcribe'
 DIARIZED_RESPONSE_FORMAT = 'diarized_json'
+JAPANESE_TRANSCRIBE_PROMPT = '\n'.join([
+    'これは日本語の社内会議音声です。',
+    '明確な英単語・略語・会社名以外は日本語として文字起こししてください。',
+    '相槌、聞き取り不能な断片、意味のない英語風フレーズは無理に英語化しないでください。',
+    '業界用語、会社名、略称、数値が多く含まれます。',
+])
+ENGLISH_TRANSCRIBE_PROMPT = '\n'.join([
+    'This is an English business meeting audio.',
+    'Transcribe in English.',
+    'Preserve company names, abbreviations, numbers, technical terms, and business context.',
+    'Do not invent unclear content. Mark unclear parts as [inaudible] where necessary.',
+])
+SUPPORTED_LANGUAGES = {'ja', 'en'}
 
 
 class TranscriptionProcessingError(RuntimeError):
@@ -117,9 +131,13 @@ def parse_transcript_response(payload: dict[str, Any]) -> TranscriptResult:
             )
         )
 
+    diarization_enabled = SETTINGS.transcribe_diarization_enabled
     full_text = str(payload.get('text') or payload.get('transcript') or '').strip()
     if not full_text:
-        full_text = '\n'.join(f'[{seg.speaker}] {seg.text}' for seg in segments)
+        if diarization_enabled:
+            full_text = '\n'.join(f'[{seg.speaker}] {seg.text}' for seg in segments)
+        else:
+            full_text = '\n\n'.join(seg.text for seg in segments)
     return TranscriptResult(fullText=full_text, segments=segments, raw=payload)
 
 
@@ -213,16 +231,47 @@ class TranscriptionService:
             )
         return strategy
 
+    def _resolve_language(self, language_hint: str | None) -> tuple[str, str, str | None, str | None]:
+        normalized_hint = (language_hint or '').strip().lower()
+        normalized_env = (SETTINGS.transcribe_language or '').strip().lower()
+        invalid_hint = normalized_hint if normalized_hint and normalized_hint not in SUPPORTED_LANGUAGES else None
+        invalid_env = normalized_env if normalized_env and normalized_env not in SUPPORTED_LANGUAGES else None
+        if normalized_hint in SUPPORTED_LANGUAGES:
+            return normalized_hint, 'request', invalid_hint, invalid_env
+        if normalized_env in SUPPORTED_LANGUAGES:
+            return normalized_env, 'env', invalid_hint, invalid_env
+        return 'ja', 'default', invalid_hint, invalid_env
+
     def transcribe_file(self, file_path: Path, language_hint: str | None, chunk_index: int, audio_format: str) -> TranscriptResult:
-        chunking_strategy = self._get_diarization_chunking_strategy()
+        diarization_enabled = SETTINGS.transcribe_diarization_enabled
+        chunking_strategy = self._get_diarization_chunking_strategy() if diarization_enabled else None
+        model = DIARIZATION_MODEL if diarization_enabled else STANDARD_MODEL
+        language, fallback_reason, invalid_hint, invalid_env = self._resolve_language(language_hint)
+        if invalid_hint or invalid_env:
+            log_event(
+                logger,
+                'warning',
+                'invalid language hint/env for transcription; fallback applied',
+                requestLanguageHint=language_hint,
+                envLanguage=SETTINGS.transcribe_language,
+                invalidLanguageHint=invalid_hint,
+                invalidEnvLanguage=invalid_env,
+                resolvedLanguage=language,
+            )
         chunk_meta = ffprobe_metadata(file_path)
         log_event(
             logger,
             'info',
             'openai transcription request',
-            model=DIARIZATION_MODEL,
-            response_format=DIARIZED_RESPONSE_FORMAT,
+            model=model,
+            response_format=DIARIZED_RESPONSE_FORMAT if diarization_enabled else 'json',
             chunking_strategy=chunking_strategy,
+            diarizationEnabled=diarization_enabled,
+            requestLanguageHint=language_hint,
+            envLanguage=SETTINGS.transcribe_language,
+            languageFallbackReason=fallback_reason,
+            language=language,
+            promptEnabled=not diarization_enabled,
             languageHint=language_hint,
             chunkIndex=chunk_index,
             fileName=file_path.name,
@@ -236,11 +285,12 @@ class TranscriptionService:
                 # diarized_json is required to obtain speaker-separated segments from gpt-4o-transcribe-diarize.
                 # normalize_transcription_response keeps processing stable across SDK response-shape differences.
                 response = self.openai.audio.transcriptions.create(
-                    model=DIARIZATION_MODEL,
+                    model=model,
                     file=handle,
-                    response_format=DIARIZED_RESPONSE_FORMAT,
-                    language=language_hint,
-                    chunking_strategy=chunking_strategy,
+                    response_format=DIARIZED_RESPONSE_FORMAT if diarization_enabled else 'json',
+                    language=language,
+                    **({'chunking_strategy': chunking_strategy} if diarization_enabled and chunking_strategy else {}),
+                    **({'prompt': JAPANESE_TRANSCRIBE_PROMPT if language == 'ja' else ENGLISH_TRANSCRIBE_PROMPT} if not diarization_enabled else {}),
                 )
         except Exception as exc:  # noqa: BLE001
             status_code = getattr(exc, 'status_code', None)
@@ -251,8 +301,8 @@ class TranscriptionService:
                 'error',
                 'openai transcription failed',
                 exceptionClass=type(exc).__name__,
-                model=DIARIZATION_MODEL,
-                response_format=DIARIZED_RESPONSE_FORMAT,
+                model=model,
+                response_format=DIARIZED_RESPONSE_FORMAT if diarization_enabled else 'json',
                 chunking_strategy=chunking_strategy,
                 chunkIndex=chunk_index,
                 fileName=file_path.name,
@@ -267,8 +317,8 @@ class TranscriptionService:
                 chunk_index=chunk_index,
                 external_status_code=status_code,
                 context={
-                    'model': DIARIZATION_MODEL,
-                    'response_format': DIARIZED_RESPONSE_FORMAT,
+                    'model': model,
+                    'response_format': DIARIZED_RESPONSE_FORMAT if diarization_enabled else 'json',
                     'chunking_strategy': chunking_strategy,
                     'file_name': file_path.name,
                     'audio_format': audio_format,
@@ -299,12 +349,18 @@ class TranscriptionService:
             'info',
             'openai transcription response normalized',
             chunkIndex=chunk_index,
+            model=model,
+            diarizationEnabled=diarization_enabled,
+            language=language,
+            promptEnabled=not diarization_enabled,
             responseStatus=response_status,
             topLevelKeys=sorted(payload.keys()),
             segmentsCount=len(segments_raw) if isinstance(segments_raw, list) else 0,
             fullTextLength=len(full_text),
             hasUsage=payload.get('usage') is not None,
             payloadPreview=preview_text(payload),
+            transcriptLength=len(parse_transcript_response(payload).fullText),
+            fallbackOccurred=False,
         )
         return parse_transcript_response(payload)
 
@@ -351,8 +407,11 @@ class TranscriptionService:
                         startOffsetMs=chunk.start_offset_ms,
                         endOffsetMs=chunk.end_offset_ms,
                         model=DIARIZATION_MODEL,
-                        response_format=DIARIZED_RESPONSE_FORMAT,
+                        response_format=DIARIZED_RESPONSE_FORMAT if SETTINGS.transcribe_diarization_enabled else 'json',
                         chunking_strategy=SETTINGS.diarization_chunking_strategy,
+                        diarizationEnabled=SETTINGS.transcribe_diarization_enabled,
+                        language=job.request.languageHint if job.request and job.request.languageHint else SETTINGS.transcribe_language,
+                        promptEnabled=not SETTINGS.transcribe_diarization_enabled,
                         audioFormat=ext,
                         ffprobe={
                             'duration': details.get('duration'),
@@ -384,8 +443,8 @@ class TranscriptionService:
                             'chunk transcription failed',
                             recordingId=job.recordingId,
                             chunkIndex=chunk.chunk_index,
-                            model=DIARIZATION_MODEL,
-                            response_format=DIARIZED_RESPONSE_FORMAT,
+                            model=DIARIZATION_MODEL if SETTINGS.transcribe_diarization_enabled else STANDARD_MODEL,
+                            response_format=DIARIZED_RESPONSE_FORMAT if SETTINGS.transcribe_diarization_enabled else 'json',
                             chunking_strategy=SETTINGS.diarization_chunking_strategy,
                             error=str(exc),
                             errorSource=exc.source,

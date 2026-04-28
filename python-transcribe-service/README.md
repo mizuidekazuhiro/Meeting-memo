@@ -7,7 +7,7 @@
 - Shortcut -> Workers -> Dropbox の導線はそのまま
 - Workers が Dropbox 保存成功 metadata を起点に処理
 - 長時間音声（または Workers 側で安全判定できない音声）だけをこの API に委譲
-- 本サービスが Dropbox 直接取得 / ffprobe / ffmpeg chunking / OpenAI diarized transcription を担当
+- 本サービスが Dropbox 直接取得 / ffprobe / ffmpeg chunking / OpenAI transcription を担当（通常運用は話者分離OFF）
 - 文字起こし結果を Workers callback へ返却（このサービスは finalize 完了まで待たない）
 
 ## エンドポイント
@@ -42,6 +42,8 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 - `PRIMARY_AUDIO_FORMAT`
 - `FALLBACK_AUDIO_FORMAT`
 - `ENABLE_AUDIO_FALLBACK`
+- `TRANSCRIBE_DIARIZATION_ENABLED`（既定: `false`）
+- `TRANSCRIBE_LANGUAGE`（既定: `ja`）
 - `FFMPEG_PATH`
 - `FFPROBE_PATH`
 - `TMP_DIR`
@@ -52,9 +54,10 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 - `dropboxFileId` 優先、`dropboxPathLower` は fallback
 - mp4 rewrap / byte split / unsafe chunking は禁止
 - `decode -> trim -> re-encode`（m4a = AAC-LC、fallback 1回のみ wav）
-- OpenAI model は `gpt-4o-transcribe-diarize` 固定
-- `response_format=diarized_json` は話者分離用の正規フォーマットとして利用
-- diarization model 呼び出し時は `chunking_strategy` が必須（`DIARIZATION_CHUNKING_STRATEGY` で指定、未設定なら起動後実行時に明示エラー）
+- 通常運用は `TRANSCRIBE_DIARIZATION_ENABLED=false` で `gpt-4o-transcribe` + `language=ja` + 日本語会議向けpromptを使用
+- 話者分離が必要な場合のみ `TRANSCRIBE_DIARIZATION_ENABLED=true` で `gpt-4o-transcribe-diarize` + `response_format=diarized_json` を使用
+- 言語は `request.languageHint`（`ja` / `en`）を最優先し、未指定または不正値時は `TRANSCRIBE_LANGUAGE`、それも不正/未設定なら `ja` にフォールバック
+- diarization model 呼び出し時のみ `chunking_strategy` が必須（`DIARIZATION_CHUNKING_STRATEGY`）
 - OpenAI SDK 側で `Unexpected audio response format: diarized_json` warning が出ても、normalize 層で返却型差分を吸収して処理継続
 - chunkIndex 順に transcript を merge
 - callback 失敗はログ化するが、transcription 本体成功は失敗扱いにしない（`callbackSucceeded` で返す）
