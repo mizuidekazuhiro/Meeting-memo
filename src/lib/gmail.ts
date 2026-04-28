@@ -15,7 +15,7 @@ interface CompletionEmailInput {
   notionPageUrl: string;
   transcriptFileUrl?: string;
   finalMemo: string;
-  sourceUrls: string[];
+  sourceUrls: Array<string | Record<string, unknown>>;
   myTasks: Array<{ taskText: string; chooseUrl?: string }>;
 }
 
@@ -62,9 +62,30 @@ function normalizeTaskTextForEmail(value: string): string {
     .trim();
 }
 
-function linkifyText(value: string): string {
-  const escaped = escapeHtml(value);
+function linkifyEscapedText(escaped: string): string {
   return escaped.replace(/(https?:\/\/[^\s<]+)/g, (url) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`);
+}
+
+function renderInlineMarkdown(value: string): string {
+  if (!value) return '';
+  const segments: Array<{ text: string; bold: boolean }> = [];
+  const pattern = /\*\*(.+?)\*\*/g;
+  let cursor = 0;
+  for (let match = pattern.exec(value); match; match = pattern.exec(value)) {
+    if (match.index > cursor) {
+      segments.push({ text: value.slice(cursor, match.index), bold: false });
+    }
+    segments.push({ text: match[1], bold: true });
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < value.length) {
+    segments.push({ text: value.slice(cursor), bold: false });
+  }
+  const normalized = segments.length ? segments : [{ text: value, bold: false }];
+  return normalized.map((segment) => {
+    const linked = linkifyEscapedText(escapeHtml(segment.text));
+    return segment.bold ? `<strong>${linked}</strong>` : linked;
+  }).join('');
 }
 
 function stripLeadingMemoTitle(value: string): string {
@@ -87,6 +108,11 @@ function renderFinalMemoHtml(markdown: string): string {
   const isBulletLine = (value: string): boolean => /^(?:[-*]\s+|・\s*)/.test(value);
   const orderedMatch = (value: string): RegExpMatchArray | null => value.match(/^(\d+)[.)]\s+(.+)$/);
   const headingFromNumberLine = (value: string): RegExpMatchArray | null => value.match(/^(\d+)[.)]\s*(.+)$/);
+  const splitMarkdownTableRow = (value: string): string[] => value.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((cell) => cell.trim());
+  const isMarkdownTableSeparatorRow = (value: string): boolean => {
+    const cells = splitMarkdownTableRow(value);
+    return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+  };
 
   while (index < lines.length) {
     const line = lines[index].trim();
@@ -94,10 +120,29 @@ function renderFinalMemoHtml(markdown: string): string {
       index += 1;
       continue;
     }
+    if (/^---+$/.test(line)) {
+      index += 1;
+      continue;
+    }
+    if (line.startsWith('|') && isMarkdownTableSeparatorRow(lines[index + 1]?.trim() ?? '')) {
+      const headerCells = splitMarkdownTableRow(line);
+      const bodyRows: string[][] = [];
+      index += 2;
+      while (index < lines.length) {
+        const rowLine = lines[index].trim();
+        if (!rowLine.startsWith('|')) break;
+        bodyRows.push(splitMarkdownTableRow(rowLine));
+        index += 1;
+      }
+      const tableHeader = headerCells.map((cell) => `<th style="border:1px solid #ddd;padding:8px;text-align:left;white-space:nowrap;">${renderInlineMarkdown(cell)}</th>`).join('');
+      const tableBody = bodyRows.map((row) => `<tr>${headerCells.map((_, idx) => `<td style="border:1px solid #ddd;padding:8px;vertical-align:top;word-break:break-word;">${renderInlineMarkdown(row[idx] || (idx === 2 || idx === 3 ? '不明' : ''))}</td>`).join('')}</tr>`).join('');
+      html.push(`<table style="border-collapse:collapse;width:100%;font-family:'Yu Gothic UI','Yu Gothic',Meiryo,sans-serif;font-size:14px;line-height:1.6;margin:10px 0 14px 0;"><thead><tr>${tableHeader}</tr></thead><tbody>${tableBody}</tbody></table>`);
+      continue;
+    }
     const heading = line.match(/^#{1,3}\s+(.+)$/);
     if (heading) {
       const level = line.startsWith('###') ? 'h4' : line.startsWith('##') ? 'h3' : 'h2';
-      html.push(`<${level} style="margin:20px 0 8px 0;font-size:${level === 'h2' ? '19px' : level === 'h3' ? '17px' : '16px'};line-height:1.5;">${linkifyText(heading[1].trim())}</${level}>`);
+      html.push(`<${level} style="margin:20px 0 8px 0;font-size:${level === 'h2' ? '19px' : level === 'h3' ? '17px' : '16px'};line-height:1.5;font-weight:700;">${renderInlineMarkdown(heading[1].trim())}</${level}>`);
       index += 1;
       continue;
     }
@@ -107,7 +152,7 @@ function renderFinalMemoHtml(markdown: string): string {
         const listLine = lines[index].trim();
         const listMatch = listLine.match(/^(?:[-*]\s+|・\s*)(.+)$/);
         if (!listMatch) break;
-        items.push(`<li style="margin:6px 0;">${linkifyText(listMatch[1].trim())}</li>`);
+        items.push(`<li style="margin:6px 0;">${renderInlineMarkdown(listMatch[1].trim())}</li>`);
         index += 1;
       }
       html.push(`<ul style="margin:10px 0 14px 0;padding-left:20px;">${items.join('')}</ul>`);
@@ -127,7 +172,7 @@ function renderFinalMemoHtml(markdown: string): string {
           const orderedLine = lines[index].trim();
           const listMatch = orderedMatch(orderedLine);
           if (!listMatch) break;
-          items.push(`<li style="margin:6px 0;">${linkifyText(listMatch[2].trim())}</li>`);
+          items.push(`<li style="margin:6px 0;">${renderInlineMarkdown(listMatch[2].trim())}</li>`);
           index += 1;
         }
         html.push(`<ol style="margin:10px 0 14px 0;padding-left:22px;">${items.join('')}</ol>`);
@@ -136,7 +181,7 @@ function renderFinalMemoHtml(markdown: string): string {
     }
     const numberedHeading = headingFromNumberLine(line);
     if (numberedHeading) {
-      html.push(`<h3 style="font-size:16px;margin:18px 0 10px 0;line-height:1.6;font-weight:600;">${linkifyText(`${numberedHeading[1]}. ${numberedHeading[2].trim()}`)}</h3>`);
+      html.push(`<h3 style="font-size:16px;margin:18px 0 10px 0;line-height:1.6;font-weight:600;">${renderInlineMarkdown(`${numberedHeading[1]}. ${numberedHeading[2].trim()}`)}</h3>`);
       index += 1;
       continue;
     }
@@ -146,7 +191,7 @@ function renderFinalMemoHtml(markdown: string): string {
         const orderedLine = lines[index].trim();
         const listMatch = orderedMatch(orderedLine);
         if (!listMatch) break;
-        items.push(`<li style="margin:6px 0;">${linkifyText(listMatch[2].trim())}</li>`);
+        items.push(`<li style="margin:6px 0;">${renderInlineMarkdown(listMatch[2].trim())}</li>`);
         index += 1;
       }
       html.push(`<ol style="margin:10px 0 14px 0;padding-left:22px;">${items.join('')}</ol>`);
@@ -157,13 +202,69 @@ function renderFinalMemoHtml(markdown: string): string {
     while (index < lines.length) {
       const textLine = lines[index].trim();
       if (!textLine || /^#{1,3}\s+/.test(textLine) || isBulletLine(textLine) || orderedMatch(textLine) || headingFromNumberLine(textLine)) break;
-      paragraphLines.push(linkifyText(textLine));
+      paragraphLines.push(renderInlineMarkdown(textLine));
       index += 1;
     }
     html.push(`<p style="margin:0 0 12px 0;line-height:1.8;">${paragraphLines.join('<br />')}</p>`);
   }
 
   return html.join('');
+}
+
+function normalizeUrl(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (/^javascript:/i.test(trimmed)) return null;
+  try {
+    const parsed = new URL(trimmed);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return null;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function guessTitleFromUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const pathTail = parsed.pathname.split('/').filter(Boolean).pop();
+    if (pathTail) {
+      return decodeURIComponent(pathTail).replace(/[-_]+/g, ' ').slice(0, 80);
+    }
+    return parsed.hostname.replace(/^www\./, '');
+  } catch {
+    return '';
+  }
+}
+
+function getSourceTitle(source: Record<string, unknown> | undefined, fallbackUrl: string, index: number): string {
+  if (source) {
+    const keys = ['title', 'headline', 'name', 'source_title', 'file_name'];
+    for (const key of keys) {
+      const value = source[key];
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+  }
+  return guessTitleFromUrl(fallbackUrl) || `参考資料 ${index + 1}`;
+}
+
+function buildSourceLinks(sourceInput: Array<string | Record<string, unknown>>, notionPageUrl: string): string {
+  const normalizedNotionUrl = normalizeUrl(notionPageUrl);
+  const seen = new Set<string>();
+  const items: string[] = [];
+  for (const entry of sourceInput) {
+    const source = typeof entry === 'string' ? { url: entry } : entry;
+    const url = normalizeUrl(source?.url ?? source?.link ?? source?.source_url ?? source?.href);
+    if (!url) continue;
+    if (normalizedNotionUrl && url === normalizedNotionUrl) continue;
+    if (/notion\.so/i.test(url)) continue;
+    if (seen.has(url)) continue;
+    seen.add(url);
+    const title = getSourceTitle(source, url, items.length);
+    items.push(`<li style="margin:0 0 8px 0;"><a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(title)}</a></li>`);
+  }
+  return items.join('');
 }
 
 function toBase64(content: string): string {
@@ -234,11 +335,8 @@ function buildCompletionEmailHtml(input: CompletionEmailInput): string {
     }).join('')}</div>`
     : '';
   const notionPageUrl = escapeHtml(input.notionPageUrl);
-  const sourceUrls = [
-    `<li><a href="${notionPageUrl}" target="_blank" rel="noopener noreferrer">Notionページを開く</a></li>`,
-    ...sourceUrlsInput.map((url, idx) => `<li style="margin:0 0 8px 0;"><a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">参考資料 ${idx + 1} を開く</a></li>`),
-  ].join('');
-  const sourceSection = `<h2 style="font-size:18px;margin:24px 0 12px 0;padding-bottom:6px;border-bottom:1px solid #d0d7de;">参考リンク</h2><ul style="padding-left:20px;margin:0;">${sourceUrls}</ul>`;
+  const sourceUrls = buildSourceLinks(sourceUrlsInput, input.notionPageUrl);
+  const sourceSection = `<h2 style="font-size:18px;margin:24px 0 12px 0;padding-bottom:6px;border-bottom:1px solid #d0d7de;">参考リンク</h2>${sourceUrls ? `<ul style="padding-left:20px;margin:0;">${sourceUrls}</ul>` : '<p style="margin:0;">（参考リンクなし）</p>'}`;
   const myTasksSection = input.myTasks.length
     ? `<h2 style="font-size:18px;margin:24px 0 12px 0;padding-bottom:6px;border-bottom:1px solid #d0d7de;">次アクション</h2>${myTasksHtml}<h2 style="font-size:18px;margin:24px 0 12px 0;padding-bottom:6px;border-bottom:1px solid #d0d7de;">タスク処理を選ぶ</h2><p style="margin:0 0 10px 0;">各アクションの「処理を選ぶ」から処理先を選択できます。</p>`
     : '';
