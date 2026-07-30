@@ -2,7 +2,14 @@
 import { test } from 'node:test';
 import * as assert from 'node:assert/strict';
 
-import { buildCompletionEmailMessage, buildCompletionEmailSubject, shouldSendCompletionEmail } from '../src/lib/gmail';
+import {
+  buildCompletionEmailMessage,
+  buildCompletionEmailSubject,
+  buildFailureEmailMessage,
+  getFailureReasonJa,
+  shouldSendCompletionEmail,
+  shouldSendFailureEmail,
+} from '../src/lib/gmail';
 
 test('completion email body keeps readable final memo structure and per-task action controls', () => {
   const notionPageUrl = 'https://www.notion.so/example';
@@ -156,4 +163,49 @@ test('shouldSendCompletionEmail is true only when enabled and all required envs 
   assert.equal(shouldSendCompletionEmail({ ...baseEnv, MAIL_TO: '   ' }), false);
   assert.equal(shouldSendCompletionEmail({ ...baseEnv, MAIL_FROM: undefined }), false);
   assert.equal(shouldSendCompletionEmail({ ...baseEnv, MAIL_PASSWORD: '' }), false);
+});
+
+test('failure email includes human reason, technical error, metrics, and skipped downstream steps', () => {
+  const message = buildFailureEmailMessage({
+    to: ['to@example.com'],
+    cc: ['cc@example.com'],
+    from: 'from@example.com',
+    subject: 'Meeting Memo文字起こし失敗: audio.m4a',
+    fileName: 'audio.m4a',
+    recordingId: 'rec-123',
+    failureStage: 'transcript_quality',
+    humanReadableReasonJa: getFailureReasonJa('transcript_quality'),
+    technicalErrorMessage: 'Transcript quality rejected after WAV Auto retry',
+    failedChunkIndex: 3,
+    processingSeconds: 42.5,
+    qualityReasons: ['exact_sentence_repetition'],
+    qualityMetrics: {
+      uniqueSentenceRatio: 0.2,
+      maxExactSentenceRepetitions: 10,
+    },
+  });
+
+  assert.ok(message.includes('audio.m4a'));
+  assert.ok(message.includes('transcript_quality'));
+  assert.ok(message.includes('品質基準を満たしませんでした'));
+  assert.ok(message.includes('Transcript quality rejected after WAV Auto retry'));
+  assert.ok(message.includes('rec-123'));
+  assert.ok(message.includes('>3<'));
+  assert.ok(message.includes('42.5秒'));
+  assert.ok(message.includes('uniqueSentenceRatio'));
+  assert.ok(message.includes('maxExactSentenceRepetitions'));
+  assert.ok(message.includes('一次要約、二次レビュー、Notion最終化、My Tasks登録、完了通知メールは実行されていません'));
+});
+
+test('failure notification enablement defaults to GMAIL_NOTIFY_ENABLED and supports explicit override', () => {
+  const baseEnv = {
+    GMAIL_NOTIFY_ENABLED: 'true',
+    MAIL_TO: 'to@example.com',
+    MAIL_FROM: 'from@example.com',
+    MAIL_PASSWORD: 'app-password',
+  } as any;
+
+  assert.equal(shouldSendFailureEmail(baseEnv), true);
+  assert.equal(shouldSendFailureEmail({ ...baseEnv, FAILURE_NOTIFY_ENABLED: 'false' }), false);
+  assert.equal(shouldSendFailureEmail({ ...baseEnv, GMAIL_NOTIFY_ENABLED: 'false', FAILURE_NOTIFY_ENABLED: 'true' }), true);
 });

@@ -19,6 +19,33 @@ interface CompletionEmailInput {
   myTasks: Array<{ taskText: string; chooseUrl?: string }>;
 }
 
+export interface FailureEmailInput {
+  fileName: string;
+  recordingId: string;
+  failureStage: string;
+  humanReadableReasonJa: string;
+  technicalErrorMessage: string;
+  failedChunkIndex?: number | null;
+  processingSeconds: number;
+  qualityReasons?: string[] | null;
+  qualityMetrics?: Record<string, unknown> | null;
+}
+
+const FAILURE_REASON_JA_BY_STAGE: Readonly<Record<string, string>> = {
+  dropbox_download: 'Dropboxから録音ファイルを取得できませんでした。',
+  ffmpeg_chunk_validation: '録音ファイルの変換、分割、または分割後の音声検証に失敗しました。',
+  openai_transcription: 'OpenAIによる文字起こし処理に失敗しました。',
+  transcript_quality: 'WAV形式で再試行した後も、文字起こし結果が品質基準を満たしませんでした。',
+  wav_retry: 'WAV形式・言語自動判定での再試行に失敗しました。',
+  merged_transcript: '結合後の文字起こしが構造上の最低品質基準を満たしませんでした。',
+  transcription_unhandled: '文字起こし処理中に予期しないエラーが発生しました。',
+};
+
+export function getFailureReasonJa(failureStage: string): string {
+  return FAILURE_REASON_JA_BY_STAGE[failureStage]
+    ?? '文字起こし処理を完了できませんでした。';
+}
+
 function isEnabled(value: string | undefined): boolean {
   return value?.toLowerCase() === 'true';
 }
@@ -365,8 +392,73 @@ function buildCompletionEmailHtml(input: CompletionEmailInput): string {
 </html>`;
 }
 
+function formatFailureMetricValue(value: unknown): string {
+  if (value === null || value === undefined) return '不明';
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function buildFailureEmailHtml(input: FailureEmailInput): string {
+  const metrics = input.qualityMetrics && typeof input.qualityMetrics === 'object'
+    ? Object.entries(input.qualityMetrics)
+    : [];
+  const metricsHtml = metrics.length
+    ? `<table style="border-collapse:collapse;width:100%;margin:8px 0 16px 0;"><tbody>${metrics.map(([key, value]) => (
+      `<tr><th style="border:1px solid #d0d7de;padding:7px;text-align:left;background:#f6f8fa;">${escapeHtml(key)}</th><td style="border:1px solid #d0d7de;padding:7px;">${escapeHtml(formatFailureMetricValue(value))}</td></tr>`
+    )).join('')}</tbody></table>`
+    : '<p style="margin:0 0 16px 0;">（品質指標なし）</p>';
+  const qualityReasons = input.qualityReasons?.length
+    ? input.qualityReasons.join(', ')
+    : 'なし';
+  const failedChunk = input.failedChunkIndex === null || input.failedChunkIndex === undefined
+    ? '不明'
+    : String(input.failedChunkIndex);
+
+  return `<!DOCTYPE html>
+<html lang="ja">
+  <body style="margin:0;padding:0;background:#f8fafc;font-family:'Yu Gothic UI','Yu Gothic',Meiryo,Arial,sans-serif;font-size:15px;line-height:1.7;color:#1f2933;">
+    <div style="max-width:760px;margin:0 auto;padding:24px;">
+      <div style="background:#ffffff;border-radius:12px;padding:20px;border-top:5px solid #dc2626;">
+        <h2 style="font-size:19px;margin:0 0 14px 0;">Meeting Memoの文字起こしに失敗しました</h2>
+        <p style="margin:0 0 14px 0;">${escapeHtml(input.humanReadableReasonJa)}</p>
+        <table style="border-collapse:collapse;width:100%;margin:8px 0 18px 0;">
+          <tbody>
+            <tr><th style="border:1px solid #d0d7de;padding:7px;text-align:left;background:#f6f8fa;">録音ファイル</th><td style="border:1px solid #d0d7de;padding:7px;">${escapeHtml(input.fileName)}</td></tr>
+            <tr><th style="border:1px solid #d0d7de;padding:7px;text-align:left;background:#f6f8fa;">失敗ステージ</th><td style="border:1px solid #d0d7de;padding:7px;">${escapeHtml(input.failureStage)}</td></tr>
+            <tr><th style="border:1px solid #d0d7de;padding:7px;text-align:left;background:#f6f8fa;">recordingId</th><td style="border:1px solid #d0d7de;padding:7px;word-break:break-all;">${escapeHtml(input.recordingId)}</td></tr>
+            <tr><th style="border:1px solid #d0d7de;padding:7px;text-align:left;background:#f6f8fa;">失敗チャンク</th><td style="border:1px solid #d0d7de;padding:7px;">${escapeHtml(failedChunk)}</td></tr>
+            <tr><th style="border:1px solid #d0d7de;padding:7px;text-align:left;background:#f6f8fa;">処理時間</th><td style="border:1px solid #d0d7de;padding:7px;">${escapeHtml(`${input.processingSeconds}秒`)}</td></tr>
+          </tbody>
+        </table>
+        <h3 style="font-size:16px;margin:18px 0 8px 0;">技術エラー（原文）</h3>
+        <pre style="white-space:pre-wrap;word-break:break-word;background:#f6f8fa;border:1px solid #d0d7de;border-radius:8px;padding:12px;">${escapeHtml(input.technicalErrorMessage)}</pre>
+        <h3 style="font-size:16px;margin:18px 0 8px 0;">品質判定</h3>
+        <p style="margin:0 0 8px 0;">理由コード: ${escapeHtml(qualityReasons)}</p>
+        ${metricsHtml}
+        <h3 style="font-size:16px;margin:18px 0 8px 0;">実行されなかった後続処理</h3>
+        <p style="margin:0;">一次要約、二次レビュー、Notion最終化、My Tasks登録、完了通知メールは実行されていません。</p>
+      </div>
+    </div>
+  </body>
+</html>`;
+}
+
 export function shouldSendCompletionEmail(env: Env): boolean {
   return isEnabled(env.GMAIL_NOTIFY_ENABLED)
+    && hasValue(env.MAIL_TO)
+    && hasValue(env.MAIL_FROM)
+    && hasValue(env.MAIL_PASSWORD);
+}
+
+export function shouldSendFailureEmail(env: Env): boolean {
+  const configured = env.FAILURE_NOTIFY_ENABLED ?? env.GMAIL_NOTIFY_ENABLED;
+  return isEnabled(configured)
     && hasValue(env.MAIL_TO)
     && hasValue(env.MAIL_FROM)
     && hasValue(env.MAIL_PASSWORD);
@@ -376,6 +468,27 @@ export function buildCompletionEmailMessage(
   input: CompletionEmailInput & { to: string[]; cc?: string[]; from: string; subject: string },
 ): string {
   const html = buildCompletionEmailHtml(input);
+  const lines = [
+    `From: ${input.from}`,
+    `To: ${input.to.join(', ')}`,
+  ];
+  if (input.cc && input.cc.length > 0) {
+    lines.push(`Cc: ${input.cc.join(', ')}`);
+  }
+  lines.push(
+    `Subject: ${input.subject}`,
+    'MIME-Version: 1.0',
+    'Content-Type: text/html; charset=UTF-8',
+    '',
+    html,
+  );
+  return lines.join('\r\n');
+}
+
+export function buildFailureEmailMessage(
+  input: FailureEmailInput & { to: string[]; cc?: string[]; from: string; subject: string },
+): string {
+  const html = buildFailureEmailHtml(input);
   const lines = [
     `From: ${input.from}`,
     `To: ${input.to.join(', ')}`,
@@ -505,24 +618,8 @@ async function createSmtpClient(hostname: string, port: number): Promise<SmtpCli
   return { sendCommand, sendData, readGreeting, startTls, close };
 }
 
-export async function sendCompletionEmail(
-  env: Env,
-  input: CompletionEmailInput & { subject: string },
-): Promise<void> {
-  if (!shouldSendCompletionEmail(env)) {
-    return;
-  }
-
-  const config = getCompletionEmailConfig(env);
+async function sendSmtpMessage(config: MailConfig, message: string): Promise<void> {
   const recipients = uniqueRecipients([...config.to, ...config.cc, ...config.bcc]);
-  const message = buildCompletionEmailMessage({
-    ...input,
-    from: config.from,
-    to: config.to,
-    cc: config.cc,
-    subject: buildCompletionEmailSubject(input.subject),
-  });
-
   const smtp = await createSmtpClient(config.smtpHost, config.smtpPort);
   await smtp.readGreeting();
   await smtp.sendCommand('EHLO meeting-memo.worker', [250]);
@@ -538,4 +635,43 @@ export async function sendCompletionEmail(
   await smtp.sendCommand('DATA', [354]);
   await smtp.sendData(message);
   await smtp.close();
+}
+
+export async function sendCompletionEmail(
+  env: Env,
+  input: CompletionEmailInput & { subject: string },
+): Promise<void> {
+  if (!shouldSendCompletionEmail(env)) {
+    return;
+  }
+
+  const config = getCompletionEmailConfig(env);
+  const message = buildCompletionEmailMessage({
+    ...input,
+    from: config.from,
+    to: config.to,
+    cc: config.cc,
+    subject: buildCompletionEmailSubject(input.subject),
+  });
+
+  await sendSmtpMessage(config, message);
+}
+
+export async function sendFailureEmail(
+  env: Env,
+  input: FailureEmailInput & { subject: string },
+): Promise<void> {
+  if (!shouldSendFailureEmail(env)) {
+    return;
+  }
+
+  const config = getCompletionEmailConfig(env);
+  const message = buildFailureEmailMessage({
+    ...input,
+    from: config.from,
+    to: config.to,
+    cc: config.cc,
+  });
+
+  await sendSmtpMessage(config, message);
 }

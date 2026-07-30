@@ -368,6 +368,64 @@ test('summarizeInterview accepts payload.output_text', async () => {
   assert.deepEqual(result.myTasks, ['A']);
 });
 
+test('summarizeInterview uses gpt-5.6-terra and low reasoning by default', async () => {
+  const originalFetch = global.fetch;
+  let requestBody: any;
+  global.fetch = (async (_input: string, init?: RequestInit) => {
+    requestBody = typeof init?.body === 'string' ? JSON.parse(init.body) : {};
+    return new Response(JSON.stringify({
+      output_text: JSON.stringify({ summary: '要約', myTasks: [], otherTasks: [], ambiguities: [] }),
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+
+  await summarizeInterview({ OPENAI_API_KEY: 'test' } as any, { fullText: 'text', segments: [], raw: {} });
+  global.fetch = originalFetch;
+
+  assert.equal(requestBody.model, 'gpt-5.6-terra');
+  assert.deepEqual(requestBody.reasoning, { effort: 'low' });
+  assert.equal(requestBody.text.format.type, 'json_schema');
+});
+
+test('summarizeInterview honors model and reasoning environment overrides', async () => {
+  const originalFetch = global.fetch;
+  let requestBody: any;
+  global.fetch = (async (_input: string, init?: RequestInit) => {
+    requestBody = typeof init?.body === 'string' ? JSON.parse(init.body) : {};
+    return new Response(JSON.stringify({
+      output_text: JSON.stringify({ summary: '要約', myTasks: [], otherTasks: [], ambiguities: [] }),
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+
+  await summarizeInterview({
+    OPENAI_API_KEY: 'test',
+    OPENAI_MODEL_SUMMARIZE: 'summary-override',
+    OPENAI_REASONING_EFFORT_SUMMARIZE: 'high',
+  } as any, { fullText: 'text', segments: [], raw: {} });
+  global.fetch = originalFetch;
+
+  assert.equal(requestBody.model, 'summary-override');
+  assert.deepEqual(requestBody.reasoning, { effort: 'high' });
+});
+
+test('summarizeInterview safely falls back from invalid reasoning effort', async () => {
+  const originalFetch = global.fetch;
+  let requestBody: any;
+  global.fetch = (async (_input: string, init?: RequestInit) => {
+    requestBody = typeof init?.body === 'string' ? JSON.parse(init.body) : {};
+    return new Response(JSON.stringify({
+      output_text: JSON.stringify({ summary: '要約', myTasks: [], otherTasks: [], ambiguities: [] }),
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+
+  await summarizeInterview({
+    OPENAI_API_KEY: 'test',
+    OPENAI_REASONING_EFFORT_SUMMARIZE: 'turbo',
+  } as any, { fullText: 'text', segments: [], raw: {} });
+  global.fetch = originalFetch;
+
+  assert.deepEqual(requestBody.reasoning, { effort: 'low' });
+});
+
 test('summarizeInterview accepts payload.output[].content[].text', async () => {
   const originalFetch = global.fetch;
   global.fetch = (async () => new Response(JSON.stringify({
@@ -422,6 +480,26 @@ test('reviewInterviewWithWebSearch returns structured output JSON', async () => 
   assert.deepEqual(result.sourceUrls, ['https://example.com']);
 });
 
+test('reviewInterviewWithWebSearch uses gpt-5.6-sol and medium reasoning by default', async () => {
+  const originalFetch = global.fetch;
+  let requestBody: any;
+  global.fetch = (async (_input: string, init?: RequestInit) => {
+    requestBody = typeof init?.body === 'string' ? JSON.parse(init.body) : {};
+    return new Response(JSON.stringify({ output_text: JSON.stringify({
+      finalMemoMarkdown: '', correctedTermsMarkdown: '', summaryForEmail: '', uncertainItemsMarkdown: '', nextActionsMarkdown: '', humanCheckRequired: false, humanCheckReason: '', myTasks: [], otherTasks: [], sourceUrls: [],
+    }) }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+
+  await reviewInterviewWithWebSearch({ OPENAI_API_KEY: 'test' } as any, {
+    transcript: { fullText: 'text', segments: [], raw: {} },
+  });
+  global.fetch = originalFetch;
+
+  assert.equal(requestBody.model, 'gpt-5.6-sol');
+  assert.deepEqual(requestBody.reasoning, { effort: 'medium' });
+  assert.equal(requestBody.text.format.type, 'json_schema');
+});
+
 test('reviewInterviewWithWebSearch uses OPENAI_MODEL_REVIEW first', async () => {
   const originalFetch = global.fetch;
   let model = '';
@@ -438,6 +516,37 @@ test('reviewInterviewWithWebSearch uses OPENAI_MODEL_REVIEW first', async () => 
   });
   global.fetch = originalFetch;
   assert.equal(model, 'gpt-5.4-mini');
+});
+
+test('reviewInterviewWithWebSearch honors reasoning override and falls back safely when invalid', async () => {
+  const originalFetch = global.fetch;
+  const requestBodies: any[] = [];
+  global.fetch = (async (_input: string, init?: RequestInit) => {
+    requestBodies.push(typeof init?.body === 'string' ? JSON.parse(init.body) : {});
+    return new Response(JSON.stringify({ output_text: JSON.stringify({
+      finalMemoMarkdown: '', correctedTermsMarkdown: '', summaryForEmail: '', uncertainItemsMarkdown: '', nextActionsMarkdown: '', humanCheckRequired: false, humanCheckReason: '', myTasks: [], otherTasks: [], sourceUrls: [],
+    }) }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+
+  await reviewInterviewWithWebSearch({
+    OPENAI_API_KEY: 'test',
+    OPENAI_MODEL_REVIEW: 'review-override',
+    OPENAI_REASONING_EFFORT_REVIEW: 'xhigh',
+  } as any, {
+    transcript: { fullText: 'text', segments: [], raw: {} },
+  });
+  await reviewInterviewWithWebSearch({
+    OPENAI_API_KEY: 'test',
+    OPENAI_REASONING_EFFORT_REVIEW: 'invalid',
+  } as any, {
+    transcript: { fullText: 'text', segments: [], raw: {} },
+  });
+  global.fetch = originalFetch;
+
+  assert.equal(requestBodies[0].model, 'review-override');
+  assert.deepEqual(requestBodies[0].reasoning, { effort: 'xhigh' });
+  assert.equal(requestBodies[1].model, 'gpt-5.6-sol');
+  assert.deepEqual(requestBodies[1].reasoning, { effort: 'medium' });
 });
 
 test('reviewInterviewWithWebSearch disables web search tool when configured false', async () => {

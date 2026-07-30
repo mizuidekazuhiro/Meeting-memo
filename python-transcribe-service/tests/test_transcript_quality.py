@@ -1,4 +1,4 @@
-from transcript_quality import evaluate_transcript_quality
+from transcript_quality import evaluate_merged_transcript_quality, evaluate_transcript_quality
 
 
 def test_repeated_japanese_sentence_is_rejected():
@@ -52,3 +52,51 @@ def test_low_density_transcript_requests_retry():
     assert evaluation.has_only_low_text_density
     assert 'low_characters_per_minute' in evaluation.reasons
     assert 'too_few_characters' in evaluation.reasons
+
+
+def test_merged_max_repetition_is_warning_not_hard_failure():
+    evaluation = evaluate_merged_transcript_quality(
+        'We will follow up. ' * 10,
+        duration_sec=120,
+        accepted_chunk_count=2,
+    )
+
+    assert evaluation.status == 'pass'
+    assert evaluation.reasons == ()
+    assert 'global_exact_sentence_repetition' in evaluation.warnings
+    assert evaluation.metrics.max_exact_sentence_repetitions == 10
+
+
+def test_merged_severe_global_duplication_is_hard_failure():
+    evaluation = evaluate_merged_transcript_quality(
+        'We will follow up. ' * 20,
+        duration_sec=240,
+        accepted_chunk_count=4,
+    )
+
+    assert evaluation.status == 'reject'
+    assert 'severe_global_duplication' in evaluation.reasons
+    assert evaluation.metrics.unique_sentence_ratio < 0.40
+
+
+def test_merged_empty_and_zero_accepted_chunks_are_hard_failures():
+    evaluation = evaluate_merged_transcript_quality(
+        '',
+        duration_sec=120,
+        accepted_chunk_count=0,
+    )
+
+    assert evaluation.status == 'reject'
+    assert 'empty_merged_transcript' in evaluation.reasons
+    assert 'zero_accepted_chunks' in evaluation.reasons
+
+
+def test_merged_extremely_low_text_relative_to_duration_is_hard_failure():
+    evaluation = evaluate_merged_transcript_quality(
+        'A short note.',
+        duration_sec=600,
+        accepted_chunk_count=1,
+    )
+
+    assert evaluation.status == 'reject'
+    assert 'extremely_low_text_relative_to_duration' in evaluation.reasons

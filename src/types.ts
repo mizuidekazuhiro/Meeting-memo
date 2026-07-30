@@ -35,6 +35,8 @@ export interface Env {
   TRANSCRIBE_LANGUAGE?: string;
   OPENAI_MODEL_SUMMARIZE?: string;
   OPENAI_MODEL_REVIEW?: string;
+  OPENAI_REASONING_EFFORT_SUMMARIZE?: string;
+  OPENAI_REASONING_EFFORT_REVIEW?: string;
   INTERVIEW_REVIEW_ENABLED?: string;
   INTERVIEW_REVIEW_WEB_SEARCH_ENABLED?: string;
   PYTHON_TRANSCRIBE_API_URL?: string;
@@ -47,6 +49,7 @@ export interface Env {
   CALLBACK_JOB_LOOKUP_BASE_DELAY_MS?: string;
   CALLBACK_JOB_LOOKUP_MAX_DELAY_MS?: string;
   GMAIL_NOTIFY_ENABLED?: string;
+  FAILURE_NOTIFY_ENABLED?: string;
   MAIL_FROM?: string;
   MAIL_PASSWORD?: string;
   MAIL_TO?: string;
@@ -212,7 +215,7 @@ export interface RecordingJob {
   summaryWrittenAt?: string;
   reviewCompletedAt?: string;
   emailSentAt?: string;
-  finalizeStatus?: 'pending' | 'running' | 'completed' | 'failed';
+  finalizeStatus?: 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
   lastError?: string;
   finalizeQueuedAt?: string;
   finalizeStartedAt?: string;
@@ -225,9 +228,19 @@ export interface RecordingJob {
   transcriptFilePath?: string;
   transcriptFileUrl?: string;
   transcriptFileId?: string;
+  failureStage?: string;
+  errorSource?: string;
+  technicalErrorMessage?: string;
+  failureReasonJa?: string;
+  failedChunkIndex?: number;
+  processingSeconds?: number;
+  qualityReasons?: string[];
+  qualityMetrics?: Record<string, unknown>;
+  failureNotificationFingerprint?: string;
+  failureNotificationSentAt?: string;
 }
 
-export interface RecordingJobCallbackPayload {
+export interface RecordingJobSuccessCallbackPayload {
   recordingId?: string;
   dropboxFileId?: string;
   dropboxPathLower?: string;
@@ -236,3 +249,22 @@ export interface RecordingJobCallbackPayload {
   requestId?: string;
   transcript: TranscriptResult;
 }
+
+export interface RecordingJobFailureCallbackPayload {
+  recordingId: string;
+  dropboxFileId: string;
+  dropboxPathLower?: string | null;
+  fileName: string;
+  status: 'failed';
+  failureStage: string;
+  errorSource: string;
+  errorMessage: string;
+  failedChunkIndex?: number | null;
+  processingSeconds: number;
+  qualityReasons?: string[] | null;
+  qualityMetrics?: Record<string, unknown> | null;
+}
+
+export type RecordingJobCallbackPayload =
+  | RecordingJobSuccessCallbackPayload
+  | RecordingJobFailureCallbackPayload;

@@ -6,7 +6,7 @@ import httpx
 
 from config import SETTINGS
 from logging_utils import get_logger, log_event, preview_text
-from models import WorkersCallbackPayload
+from models import WorkersCallbackPayload, WorkersFailureCallbackPayload
 
 logger = get_logger()
 
@@ -30,7 +30,10 @@ def _extract_finalize_queued(resp: httpx.Response) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
-def send_callback(payload: WorkersCallbackPayload, callback_url: str | None = None) -> tuple[bool, bool | None]:
+def send_callback(
+    payload: WorkersCallbackPayload | WorkersFailureCallbackPayload,
+    callback_url: str | None = None,
+) -> tuple[bool, bool | None]:
     final_url = callback_url or SETTINGS.workers_callback_url
     if not final_url:
         log_event(logger, 'warning', 'callback skipped', reason='WORKERS_CALLBACK_URL is not configured')

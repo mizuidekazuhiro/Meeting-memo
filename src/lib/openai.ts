@@ -5,6 +5,11 @@ import { logEvent } from './logger';
 const OPENAI_API = 'https://api.openai.com/v1';
 const DEFAULT_DIARIZATION_MODEL = 'gpt-4o-transcribe-diarize';
 const DEFAULT_STANDARD_TRANSCRIBE_MODEL = 'gpt-4o-transcribe';
+const DEFAULT_SUMMARY_MODEL = 'gpt-5.6-terra';
+const DEFAULT_REVIEW_MODEL = 'gpt-5.6-sol';
+const DEFAULT_SUMMARY_REASONING_EFFORT = 'low';
+const DEFAULT_REVIEW_REASONING_EFFORT = 'medium';
+const ALLOWED_REASONING_EFFORTS = new Set(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
 const DEFAULT_JAPANESE_TRANSCRIBE_PROMPT = [
   'これは日本語の社内会議音声です。',
   '明確な英単語・略語・会社名以外は日本語として文字起こししてください。',
@@ -34,9 +39,27 @@ const MP4_BOX_HEADER_BYTES = 8;
 const WAV_HEADER_BYTES = 44;
 
 type AudioFormat = 'm4a' | 'wav';
+type ReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 type AudioContainer = 'm4a' | 'wav' | 'unknown';
 type AudioCodec = 'aac-lc' | 'pcm_s16le' | 'unknown';
 type ChunkStrategy = 'single-original' | 'reencoded-aac-m4a' | 'fallback-pcm-wav';
+
+function resolveReasoningEffort(
+  configuredValue: string | undefined,
+  fallback: ReasoningEffort,
+  operation: 'summary' | 'review',
+): ReasoningEffort {
+  const normalized = configuredValue?.trim().toLowerCase();
+  if (!normalized) return fallback;
+  if (ALLOWED_REASONING_EFFORTS.has(normalized)) return normalized as ReasoningEffort;
+  logEvent('warn', 'invalid reasoning effort; fallback applied', {
+    operation,
+    configuredReasoningEffort: configuredValue,
+    fallbackReasoningEffort: fallback,
+    allowedReasoningEfforts: [...ALLOWED_REASONING_EFFORTS],
+  });
+  return fallback;
+}
 
 type DiarizedSegmentLike = {
   speaker?: string | number;
@@ -719,12 +742,22 @@ export async function transcribeWithDiarization(env: Env, audio: Blob, fileName:
 }
 
 export async function summarizeInterview(env: Env, transcript: TranscriptResult): Promise<InterviewInsights> {
+  const model = env.OPENAI_MODEL_SUMMARIZE?.trim() || DEFAULT_SUMMARY_MODEL;
+  const reasoningEffort = resolveReasoningEffort(
+    env.OPENAI_REASONING_EFFORT_SUMMARIZE,
+    DEFAULT_SUMMARY_REASONING_EFFORT,
+    'summary',
+  );
+  logEvent('info', 'summary request configured', {
+    model,
+    reasoningEffort,
+  });
   let response: Response;
   try {
     response = await fetch(`${OPENAI_API}/responses`, {
       method: 'POST',
       headers: { authorization: `Bearer ${env.OPENAI_API_KEY}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ model: env.OPENAI_MODEL_SUMMARIZE ?? 'gpt-4.1-mini', input: [{ role: 'system', content: [{ type: 'input_text', text: [
+      body: JSON.stringify({ model, reasoning: { effort: reasoningEffort }, input: [{ role: 'system', content: [{ type: 'input_text', text: [
             'あなたは面談メモ作成アシスタントです。',
             '回答は文字起こし(transcript)に含まれる情報のみを根拠にし、事実と未確認事項を明確に分けてください。',
             'JSONは summary, myTasks, otherTasks, ambiguities の4キーだけを返してください。',
@@ -842,10 +875,20 @@ export async function reviewInterviewWithWebSearch(
     notionPageUrl?: string;
   },
 ): Promise<InterviewReviewResult> {
-  const model = env.OPENAI_MODEL_REVIEW ?? env.OPENAI_MODEL_SUMMARIZE ?? 'gpt-5.4-mini';
+  const model = env.OPENAI_MODEL_REVIEW?.trim() || DEFAULT_REVIEW_MODEL;
+  const reasoningEffort = resolveReasoningEffort(
+    env.OPENAI_REASONING_EFFORT_REVIEW,
+    DEFAULT_REVIEW_REASONING_EFFORT,
+    'review',
+  );
   const webSearchEnabled = env.INTERVIEW_REVIEW_WEB_SEARCH_ENABLED?.toLowerCase() !== 'false';
 
   const tools = webSearchEnabled ? [{ type: 'web_search_preview' as const }] : [];
+  logEvent('info', 'review request configured', {
+    model,
+    reasoningEffort,
+    webSearchEnabled,
+  });
   let response: Response;
   try {
     response = await fetch(`${OPENAI_API}/responses`, {
@@ -856,6 +899,7 @@ export async function reviewInterviewWithWebSearch(
       },
       body: JSON.stringify({
         model,
+        reasoning: { effort: reasoningEffort },
         tools,
         input: [
           {
