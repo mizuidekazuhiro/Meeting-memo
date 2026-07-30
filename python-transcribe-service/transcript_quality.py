@@ -12,6 +12,7 @@ QualityStatus = Literal['pass', 'retry', 'reject']
 REPETITION_LIMIT = 8
 MIN_SENTENCES_FOR_UNIQUE_RATIO = 20
 MIN_UNIQUE_SENTENCE_RATIO = 0.25
+MIN_MERGED_UNIQUE_SENTENCE_RATIO = 0.40
 MIN_DURATION_FOR_DENSITY_CHECK_SEC = 180
 MIN_CHARACTERS_PER_MINUTE = 20
 MIN_DURATION_FOR_TEXT_LENGTH_CHECK_SEC = 60
@@ -55,6 +56,7 @@ class TranscriptQualityEvaluation:
     status: QualityStatus
     reasons: tuple[str, ...]
     metrics: TranscriptQualityMetrics
+    warnings: tuple[str, ...] = ()
 
     @property
     def has_excessive_repetition(self) -> bool:
@@ -74,6 +76,7 @@ class TranscriptQualityEvaluation:
         return {
             'qualityStatus': self.status,
             'qualityReasons': list(self.reasons),
+            'qualityWarnings': list(self.warnings),
             **self.metrics.to_log_dict(),
         }
 
@@ -143,3 +146,48 @@ def evaluate_transcript_quality(text: str, duration_sec: float) -> TranscriptQua
         return TranscriptQualityEvaluation(status='retry', reasons=tuple(retry_reasons), metrics=metrics)
 
     return TranscriptQualityEvaluation(status='pass', reasons=(), metrics=metrics)
+
+
+def evaluate_merged_transcript_quality(
+    text: str,
+    duration_sec: float,
+    accepted_chunk_count: int,
+) -> TranscriptQualityEvaluation:
+    """Apply only structural hard failures to the merged transcript.
+
+    Chunk-level quality evaluation remains responsible for retrying or rejecting
+    repeated individual chunks. At the merged stage, high max-repetition counts
+    are observable warnings unless the transcript is globally and severely
+    duplicated.
+    """
+
+    metrics = evaluate_transcript_quality(text, duration_sec).metrics
+    hard_failure_reasons: list[str] = []
+    warnings: list[str] = []
+
+    if accepted_chunk_count <= 0:
+        hard_failure_reasons.append('zero_accepted_chunks')
+    if metrics.text_length == 0:
+        hard_failure_reasons.append('empty_merged_transcript')
+    if (
+        duration_sec >= MIN_DURATION_FOR_DENSITY_CHECK_SEC
+        and metrics.characters_per_minute < MIN_CHARACTERS_PER_MINUTE
+    ):
+        hard_failure_reasons.append('extremely_low_text_relative_to_duration')
+    if (
+        metrics.sentence_count >= MIN_SENTENCES_FOR_UNIQUE_RATIO
+        and metrics.unique_sentence_ratio < MIN_MERGED_UNIQUE_SENTENCE_RATIO
+    ):
+        hard_failure_reasons.append('severe_global_duplication')
+
+    if metrics.max_exact_sentence_repetitions >= REPETITION_LIMIT:
+        warnings.append('global_exact_sentence_repetition')
+    if metrics.max_normalized_sentence_repetitions >= REPETITION_LIMIT:
+        warnings.append('global_normalized_sentence_repetition')
+
+    return TranscriptQualityEvaluation(
+        status='reject' if hard_failure_reasons else 'pass',
+        reasons=tuple(hard_failure_reasons),
+        metrics=metrics,
+        warnings=tuple(warnings),
+    )

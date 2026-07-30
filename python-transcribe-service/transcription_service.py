@@ -13,7 +13,11 @@ from config import SETTINGS
 from ffmpeg_utils import ChunkPlanEntry, build_chunk_plan, ffprobe_metadata, run_ffmpeg_chunk, validate_chunk
 from logging_utils import get_logger, log_event, preview_text
 from models import TranscriptResult, TranscriptSegment, TranscriptionJobRequest, WorkersCallbackPayload
-from transcript_quality import TranscriptQualityEvaluation, evaluate_transcript_quality
+from transcript_quality import (
+    TranscriptQualityEvaluation,
+    evaluate_merged_transcript_quality,
+    evaluate_transcript_quality,
+)
 
 logger = get_logger()
 DIARIZATION_MODEL = 'gpt-4o-transcribe-diarize'
@@ -46,12 +50,14 @@ class TranscriptionProcessingError(RuntimeError):
         message: str,
         *,
         source: str,
+        failure_stage: str | None = None,
         chunk_index: int | None = None,
         external_status_code: int | None = None,
         context: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.source = source
+        self.failure_stage = failure_stage
         self.chunk_index = chunk_index
         self.external_status_code = external_status_code
         self.context = context or {}
@@ -175,11 +181,13 @@ def normalize_transcription_response(response: Any) -> dict[str, Any]:
             raise TranscriptionProcessingError(
                 f'Unable to parse transcription response as JSON string: {exc}',
                 source='openai_response',
+                failure_stage='openai_transcription',
             ) from exc
         if not isinstance(parsed, dict):
             raise TranscriptionProcessingError(
                 f'Transcription response JSON must be an object, got {type(parsed).__name__}',
                 source='openai_response',
+                failure_stage='openai_transcription',
             )
         return parsed
 
@@ -243,6 +251,7 @@ class TranscriptionService:
             raise TranscriptionProcessingError(
                 'DIARIZATION_CHUNKING_STRATEGY must be configured for diarization model transcription',
                 source='configuration',
+                failure_stage='openai_transcription',
             )
         return strategy
 
@@ -337,6 +346,7 @@ class TranscriptionService:
             raise TranscriptionProcessingError(
                 f'Transcription request failed for chunk {chunk_index}: {error_text}',
                 source='openai',
+                failure_stage='openai_transcription',
                 chunk_index=chunk_index,
                 external_status_code=status_code,
                 context={
@@ -351,7 +361,12 @@ class TranscriptionService:
         try:
             payload = normalize_transcription_response(response)
         except RuntimeError as exc:
-            raise TranscriptionProcessingError(str(exc), source='openai_response', chunk_index=chunk_index) from exc
+            raise TranscriptionProcessingError(
+                str(exc),
+                source='openai_response',
+                failure_stage='openai_transcription',
+                chunk_index=chunk_index,
+            ) from exc
 
         response_status = getattr(response, 'status_code', None)
         if response_status is None and hasattr(response, 'response'):
@@ -465,10 +480,28 @@ class TranscriptionService:
             source_path = Path(tmp_dir) / job.fileName
             source_path.write_bytes(source_bytes)
 
-            source_meta = ffprobe_metadata(source_path)
+            try:
+                source_meta = ffprobe_metadata(source_path)
+            except Exception as exc:  # noqa: BLE001
+                raise TranscriptionProcessingError(
+                    f'Unable to inspect source audio: {exc}',
+                    source='ffmpeg',
+                    failure_stage='ffmpeg_chunk_validation',
+                ) from exc
             if source_meta.duration_sec <= 0:
-                raise TranscriptionProcessingError('invalid source: duration must be > 0', source='validation')
-            plan = build_chunk_plan(source_meta.duration_sec, job.sourceBytes or len(source_bytes))
+                raise TranscriptionProcessingError(
+                    'invalid source: duration must be > 0',
+                    source='validation',
+                    failure_stage='ffmpeg_chunk_validation',
+                )
+            try:
+                plan = build_chunk_plan(source_meta.duration_sec, job.sourceBytes or len(source_bytes))
+            except Exception as exc:  # noqa: BLE001
+                raise TranscriptionProcessingError(
+                    f'Unable to build audio chunk plan: {exc}',
+                    source='ffmpeg',
+                    failure_stage='ffmpeg_chunk_validation',
+                ) from exc
             results: list[tuple[ChunkPlanEntry, TranscriptResult]] = []
             requested_language_hint = job.request.languageHint if job.request else None
 
@@ -492,14 +525,24 @@ class TranscriptionService:
                     ('wav', 'auto', 'quality_retry_wav_auto'),
                 )):
                     output = Path(tmp_dir) / f'part-{chunk.chunk_index + 1:03d}.{audio_format}'
-                    run_ffmpeg_chunk(
-                        source_path,
-                        output,
-                        chunk.start_offset_ms / 1000,
-                        chunk.estimated_duration_sec,
-                        audio_format,
-                    )
-                    ok, details = validate_chunk(output, audio_format)
+                    retry_failure_stage = 'wav_retry' if attempt_index > 0 else 'ffmpeg_chunk_validation'
+                    try:
+                        run_ffmpeg_chunk(
+                            source_path,
+                            output,
+                            chunk.start_offset_ms / 1000,
+                            chunk.estimated_duration_sec,
+                            audio_format,
+                        )
+                        ok, details = validate_chunk(output, audio_format)
+                    except Exception as exc:  # noqa: BLE001
+                        raise TranscriptionProcessingError(
+                            f'ffmpeg/chunk validation failed for chunk {chunk.chunk_index}: {exc}',
+                            source='ffmpeg',
+                            failure_stage=retry_failure_stage,
+                            chunk_index=chunk.chunk_index,
+                            context={'file_name': output.name, 'audio_format': audio_format},
+                        ) from exc
                     self._log_chunk_prepared(
                         job=job,
                         chunk=chunk,
@@ -513,6 +556,7 @@ class TranscriptionService:
                         raise TranscriptionProcessingError(
                             f'chunk validation failed: {details}',
                             source='validation',
+                            failure_stage=retry_failure_stage,
                             chunk_index=chunk.chunk_index,
                             context={'file_name': output.name, 'audio_format': audio_format},
                         )
@@ -563,6 +607,15 @@ class TranscriptionService:
                                 retryLanguage='auto',
                             )
                             continue
+                        if attempt_index > 0:
+                            raise TranscriptionProcessingError(
+                                f'WAV Auto retry failed for chunk {chunk.chunk_index}: {exc}',
+                                source=exc.source,
+                                failure_stage='wav_retry',
+                                chunk_index=chunk.chunk_index,
+                                external_status_code=exc.external_status_code,
+                                context=exc.context,
+                            ) from exc
                         raise
 
                     evaluation = evaluate_transcript_quality(
@@ -611,8 +664,12 @@ class TranscriptionService:
                         raise TranscriptionProcessingError(
                             f'Transcript quality rejected chunk {chunk.chunk_index} after WAV Auto retry',
                             source='quality',
+                            failure_stage='transcript_quality',
                             chunk_index=chunk.chunk_index,
-                            context=evaluation.to_log_dict(),
+                            context={
+                                **evaluation.to_log_dict(),
+                                'retryAttempt': 'wav_auto',
+                            },
                         )
 
                     if evaluation.has_only_low_text_density:
@@ -632,27 +689,47 @@ class TranscriptionService:
                     raise TranscriptionProcessingError(
                         f'Transcript quality remained invalid for chunk {chunk.chunk_index} after WAV Auto retry',
                         source='quality',
+                        failure_stage='transcript_quality',
                         chunk_index=chunk.chunk_index,
-                        context=evaluation.to_log_dict(),
+                        context={
+                            **evaluation.to_log_dict(),
+                            'retryAttempt': 'wav_auto',
+                        },
                     )
 
                 if not chunk_handled:
                     raise TranscriptionProcessingError(
                         f'Unable to transcribe chunk {chunk.chunk_index}',
                         source='openai',
+                        failure_stage='openai_transcription',
                         chunk_index=chunk.chunk_index,
                     )
 
-            merged = merge_results(results)
+            try:
+                merged = merge_results(results)
+            except Exception as exc:  # noqa: BLE001
+                raise TranscriptionProcessingError(
+                    f'Unable to merge transcript chunks: {exc}',
+                    source='merge',
+                    failure_stage='merged_transcript',
+                ) from exc
             accepted_duration_sec = sum(chunk.estimated_duration_sec for chunk, _ in results)
-            merged_evaluation = evaluate_transcript_quality(
+            merged_evaluation = evaluate_merged_transcript_quality(
                 merged.fullText,
-                accepted_duration_sec or source_meta.duration_sec,
+                source_meta.duration_sec,
+                len(results),
+            )
+            merged_log_level = (
+                'error'
+                if merged_evaluation.status != 'pass'
+                else 'warning'
+                if merged_evaluation.warnings
+                else 'info'
             )
             log_event(
                 logger,
-                'info' if merged_evaluation.status == 'pass' else 'error',
-                'merged transcript hard quality check',
+                merged_log_level,
+                'merged transcript structural quality check',
                 recordingId=job.recordingId,
                 chunkCount=len(plan),
                 acceptedChunkCount=len(results),
@@ -661,8 +738,9 @@ class TranscriptionService:
             )
             if merged_evaluation.status != 'pass':
                 raise TranscriptionProcessingError(
-                    'Merged transcript failed hard quality check',
+                    'Merged transcript failed structural quality check',
                     source='quality',
+                    failure_stage='merged_transcript',
                     context=merged_evaluation.to_log_dict(),
                 )
 

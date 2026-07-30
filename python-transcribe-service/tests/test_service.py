@@ -448,7 +448,7 @@ def test_repetition_after_wav_auto_retry_is_hard_failure(monkeypatch):
     assert calls == [('m4a', 'ja'), ('wav', 'auto')]
 
 
-def test_merged_transcript_runs_another_hard_repetition_check(monkeypatch):
+def test_merged_transcript_max_repetition_is_only_a_warning(monkeypatch):
     monkeypatch.setenv('OPENAI_API_KEY', 'test')
     monkeypatch.setenv('TRANSCRIBE_DIARIZATION_ENABLED', 'false')
 
@@ -501,10 +501,9 @@ def test_merged_transcript_runs_another_hard_repetition_check(monkeypatch):
         request=IntakeRequestPayload(languageHint='en'),
     )
 
-    with pytest.raises(transcription_service.TranscriptionProcessingError) as exc:
-        service.process(job, b'source-audio')
+    payload = service.process(job, b'source-audio')
 
-    assert exc.value.source == 'quality'
+    assert payload.transcript.fullText.count('We will follow up.') == 8
     assert calls == [(0, 'm4a', 'en'), (1, 'm4a', 'en')]
 
 

@@ -12,9 +12,25 @@ import { processInterviewFromMetadata } from './lib/interviews';
 import { createRecordingJob, findRecordingJobWithSource, getRecordingJob, getRecordingJobStorageMeta, normalizeDropboxPath, shouldSkipProcessingForExistingJob, upsertRecordingJob } from './lib/jobs';
 import { logEvent } from './lib/logger';
 import { updateRecordingJobStatus } from './lib/jobs';
-import { finalizeInterviewJob, getInterviewJobStatus, persistTranscriptionCallback, processUploadedInterview, resendInterviewEmail } from './lib/processing';
+import {
+  finalizeInterviewJob,
+  getInterviewJobStatus,
+  persistTranscriptionCallback,
+  persistTranscriptionFailureCallback,
+  processUploadedInterview,
+  resendInterviewEmail,
+} from './lib/processing';
 import { requireWebhookSecret } from './lib/security';
-import type { Env, FinalizeQueueMessage, IntakeRequest, RecordingJobCallbackPayload, ScanRequest, UploadRequestMetadata } from './types';
+import type {
+  Env,
+  FinalizeQueueMessage,
+  IntakeRequest,
+  RecordingJobCallbackPayload,
+  RecordingJobFailureCallbackPayload,
+  RecordingJobSuccessCallbackPayload,
+  ScanRequest,
+  UploadRequestMetadata,
+} from './types';
 
 type ExecutionContext = { waitUntil(promise: Promise<unknown>): void };
 type QueueMessageLike<T> = { body: T; ack?: () => void; retry?: () => void; attempts?: number };
@@ -273,6 +289,53 @@ async function handleUpload(request: Request, env: Env, ctx: ExecutionContext): 
   }
 }
 
+function isFailureCallbackPayload(
+  payload: RecordingJobCallbackPayload,
+): payload is RecordingJobFailureCallbackPayload {
+  return 'status' in payload && payload.status === 'failed';
+}
+
+function validateFailureCallbackPayload(payload: RecordingJobFailureCallbackPayload): void {
+  const missingFields: string[] = [];
+  for (const [key, value] of [
+    ['recordingId', payload.recordingId],
+    ['dropboxFileId', payload.dropboxFileId],
+    ['fileName', payload.fileName],
+    ['failureStage', payload.failureStage],
+    ['errorSource', payload.errorSource],
+    ['errorMessage', payload.errorMessage],
+  ] as const) {
+    if (typeof value !== 'string' || (key !== 'dropboxFileId' && !value.trim())) {
+      missingFields.push(key);
+    }
+  }
+  if (!Object.prototype.hasOwnProperty.call(payload, 'dropboxPathLower')) {
+    missingFields.push('dropboxPathLower');
+  }
+  if (!Object.prototype.hasOwnProperty.call(payload, 'failedChunkIndex')) {
+    missingFields.push('failedChunkIndex');
+  }
+  if (!Number.isFinite(payload.processingSeconds) || payload.processingSeconds < 0) {
+    missingFields.push('processingSeconds');
+  }
+  if (missingFields.length) {
+    throw new HttpError('Failure callback payload is invalid.', 400, {
+      phase: 'validate_failure_callback',
+      missingOrInvalidFields: missingFields,
+    });
+  }
+}
+
+function validateSuccessCallbackPayload(
+  payload: RecordingJobCallbackPayload,
+): asserts payload is RecordingJobSuccessCallbackPayload {
+  if (!('transcript' in payload) || !payload.transcript || typeof payload.transcript.fullText !== 'string') {
+    throw new HttpError('Successful transcription callback requires transcript.', 400, {
+      phase: 'validate_success_callback',
+    });
+  }
+}
+
 async function handleTranscriptionCallback(request: Request, env: Env): Promise<Response> {
   try {
     requireWebhookSecret(request, env.INTERVIEW_WEBHOOK_SECRET);
@@ -289,17 +352,40 @@ async function handleTranscriptionCallback(request: Request, env: Env): Promise<
       fileName: payload.fileName ?? null,
       dropboxFileId: payload.dropboxFileId ?? null,
       dropboxPathLower: payload.dropboxPathLower ?? null,
+      status: isFailureCallbackPayload(payload) ? payload.status : 'transcribed',
+      failureStage: isFailureCallbackPayload(payload) ? payload.failureStage : null,
     });
   } catch (error) {
     logEvent('error', 'callback_payload_invalid', { details: error instanceof HttpError ? error.details : error });
     throw error;
   }
   try {
+    if (isFailureCallbackPayload(payload)) {
+      validateFailureCallbackPayload(payload);
+      const result = await persistTranscriptionFailureCallback(env, payload);
+      logEvent('info', 'failure_callback_ack_returned', {
+        recordingId: payload.recordingId,
+        status: 202,
+        finalizeQueued: false,
+        notificationSent: result.notificationSent,
+        duplicateNotification: result.duplicateNotification,
+      });
+      return jsonResponse({
+        ok: true,
+        action: result.action,
+        reason: 'Failure callback accepted and persisted. Downstream finalization was not enqueued.',
+        finalizeQueued: false,
+        notificationSent: result.notificationSent,
+        duplicateNotification: result.duplicateNotification,
+      }, { status: 202 });
+    }
+
+    validateSuccessCallbackPayload(payload);
     const result = await persistTranscriptionCallback(env, payload);
     const lookup = await findRecordingJobWithSource(env, {
       recordingId: payload.recordingId?.trim(),
       dropboxFileId: payload.dropboxFileId?.trim(),
-      dropboxPathLower: normalizeDropboxPath(payload.dropboxPathLower),
+      dropboxPathLower: normalizeDropboxPath(payload.dropboxPathLower ?? undefined),
     });
     if (!lookup.job) throw new HttpError('Recording job not found after callback persistence.', 404, { phase: 'lookup_after_persist' });
     if (!env.FINALIZE_QUEUE) throw new HttpError('FINALIZE_QUEUE binding is required.', 500, { phase: 'enqueue_finalize' });

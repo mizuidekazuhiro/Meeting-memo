@@ -200,7 +200,7 @@ def test_callback_success_without_finalize_queued_not_completed(monkeypatch):
     assert body['status'] == 'callback_delivered'
 
 
-def test_hard_quality_failure_after_retry_prevents_callback_and_finalization(monkeypatch):
+def test_hard_quality_failure_sends_terminal_failure_callback(monkeypatch):
     import main
     from transcription_service import TranscriptionProcessingError
 
@@ -213,7 +213,13 @@ def test_hard_quality_failure_after_retry_prevents_callback_and_finalization(mon
             raise TranscriptionProcessingError(
                 'Transcript quality rejected after WAV Auto retry',
                 source='quality',
+                failure_stage='transcript_quality',
                 chunk_index=0,
+                context={
+                    'qualityReasons': ['exact_sentence_repetition'],
+                    'textLength': 120,
+                    'uniqueSentenceRatio': 0.1,
+                },
             )
 
     callback_calls = []
@@ -222,7 +228,10 @@ def test_hard_quality_failure_after_retry_prevents_callback_and_finalization(mon
     monkeypatch.setattr(
         main,
         'send_callback',
-        lambda payload, callback_url=None: callback_calls.append((payload, callback_url)),
+        lambda payload, callback_url=None: (
+            callback_calls.append((payload, callback_url)) or True,
+            False,
+        ),
     )
     main.job_states.clear()
 
@@ -234,8 +243,63 @@ def test_hard_quality_failure_after_retry_prevents_callback_and_finalization(mon
     main._process_job_async(job)
 
     state = main.job_states['rec-quality-failure']
-    assert callback_calls == []
+    assert len(callback_calls) == 1
+    failure_payload, callback_url = callback_calls[0]
+    assert callback_url is None
+    assert failure_payload.status == 'failed'
+    assert failure_payload.recordingId == 'rec-quality-failure'
+    assert failure_payload.dropboxFileId == 'id:quality-failure'
+    assert failure_payload.fileName == 'audio.m4a'
+    assert failure_payload.failureStage == 'transcript_quality'
+    assert failure_payload.errorSource == 'quality'
+    assert failure_payload.errorMessage == 'Transcript quality rejected after WAV Auto retry'
+    assert failure_payload.failedChunkIndex == 0
+    assert isinstance(failure_payload.processingSeconds, float)
+    assert failure_payload.qualityReasons == ['exact_sentence_repetition']
+    assert failure_payload.qualityMetrics == {
+        'textLength': 120,
+        'uniqueSentenceRatio': 0.1,
+    }
     assert state.status == 'failed'
     assert state.transcription_status == 'failed'
     assert state.finalize_status == 'skipped'
-    assert state.callback_status == 'failed'
+    assert state.callback_status == 'succeeded'
+    assert state.callback_succeeded is True
+    assert state.overall_status == 'failed_callback_delivered'
+
+
+def test_dropbox_download_failure_sends_terminal_failure_callback(monkeypatch):
+    import main
+
+    class FailingDropbox:
+        def download_file(self, dropbox_file_id, dropbox_path_lower):
+            raise RuntimeError('Dropbox download timed out')
+
+    callback_calls = []
+    monkeypatch.setattr(main, 'dropbox', FailingDropbox())
+    monkeypatch.setattr(
+        main,
+        'send_callback',
+        lambda payload, callback_url=None: (
+            callback_calls.append((payload, callback_url)) or True,
+            False,
+        ),
+    )
+    main.job_states.clear()
+
+    job = main.TranscriptionJobRequest(
+        recordingId='rec-dropbox-failure',
+        dropboxFileId='id:dropbox-failure',
+        dropboxPathLower='/apps/meetingmemo/inbox/audio.m4a',
+        fileName='audio.m4a',
+        callbackUrl='https://worker.example/callback',
+    )
+    main._process_job_async(job)
+
+    assert len(callback_calls) == 1
+    failure_payload, callback_url = callback_calls[0]
+    assert callback_url == 'https://worker.example/callback'
+    assert failure_payload.failureStage == 'dropbox_download'
+    assert failure_payload.errorSource == 'dropbox'
+    assert failure_payload.errorMessage == 'Dropbox download timed out'
+    assert failure_payload.dropboxPathLower == '/apps/meetingmemo/inbox/audio.m4a'

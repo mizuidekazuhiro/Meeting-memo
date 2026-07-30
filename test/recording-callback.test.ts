@@ -65,6 +65,27 @@ function transcriptPayload(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function failurePayload(overrides: Record<string, unknown> = {}) {
+  return {
+    recordingId: 'rec-failure',
+    dropboxFileId: 'id:failure',
+    dropboxPathLower: '/apps/meetingmemo/inbox/failure.m4a',
+    fileName: 'failure.m4a',
+    status: 'failed',
+    failureStage: 'transcript_quality',
+    errorSource: 'quality',
+    errorMessage: 'Merged transcript failed structural quality check',
+    failedChunkIndex: 2,
+    processingSeconds: 87.25,
+    qualityReasons: ['severe_global_duplication'],
+    qualityMetrics: {
+      uniqueSentenceRatio: 0.25,
+      maxExactSentenceRepetitions: 20,
+    },
+    ...overrides,
+  };
+}
+
 function installFinalizeFetchMock() {
   const originalFetch = global.fetch;
   const stats = {
@@ -235,6 +256,130 @@ test('callback persistence path stores transcript payload and remains lightweigh
   assert.equal(updated?.status, 'callback_received');
   assert.equal(updated?.transcript?.fullText, 'hello world');
   assert.equal(updated?.finalizeStatus, 'pending');
+});
+
+test('failure callback persists failed state, sends one email, and never enqueues finalization', async () => {
+  const { workerMod, jobsMod, processingMod, gmailMod } = await loadDeps();
+  const worker = workerMod.default;
+  const { createRecordingJob, upsertRecordingJob, getRecordingJob } = jobsMod;
+
+  const kv = new MockKv();
+  const queueMessages: any[] = [];
+  const env = makeEnv(kv, {
+    GMAIL_NOTIFY_ENABLED: 'true',
+    MAIL_TO: 'to@example.com',
+    MAIL_FROM: 'from@example.com',
+    MAIL_PASSWORD: 'password',
+    FINALIZE_QUEUE: { send: async (message: unknown) => { queueMessages.push(message); } },
+  });
+  const job = createRecordingJob({
+    request: { fileName: 'failure.m4a' },
+    dropboxFileId: 'id:failure',
+    dropboxPathLower: '/apps/meetingmemo/inbox/failure.m4a',
+    fileName: 'failure.m4a',
+  });
+  await upsertRecordingJob(env, job);
+
+  const failureEmails: any[] = [];
+  let downstreamFetchCalls = 0;
+  const originalSendFailureEmail = gmailMod.sendFailureEmail;
+  const originalFetch = global.fetch;
+  gmailMod.sendFailureEmail = (async (_env: any, input: any) => {
+    failureEmails.push(input);
+  }) as any;
+  global.fetch = (async () => {
+    downstreamFetchCalls += 1;
+    throw new Error('downstream fetch must not run for failure callbacks');
+  }) as any;
+
+  const makeRequest = () => new Request('https://example.com/api/interviews/transcription-callback', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-webhook-secret': env.INTERVIEW_WEBHOOK_SECRET },
+    body: JSON.stringify(failurePayload({ recordingId: job.recordingId })),
+  });
+  const firstResponse = await worker.fetch(makeRequest(), env, { waitUntil: () => undefined });
+  const secondResponse = await worker.fetch(makeRequest(), env, { waitUntil: () => undefined });
+  const finalizeResult = await processingMod.finalizeInterviewJob(env, job.recordingId);
+
+  gmailMod.sendFailureEmail = originalSendFailureEmail;
+  global.fetch = originalFetch;
+
+  const updated = await getRecordingJob(env, { recordingId: job.recordingId });
+  assert.equal(firstResponse.status, 202);
+  assert.equal(secondResponse.status, 202);
+  assert.equal(updated?.status, 'failed');
+  assert.equal(updated?.callbackStatus, 'received');
+  assert.equal(updated?.finalizeStatus, 'skipped');
+  assert.equal(updated?.failureStage, 'transcript_quality');
+  assert.equal(updated?.errorSource, 'quality');
+  assert.equal(updated?.technicalErrorMessage, 'Merged transcript failed structural quality check');
+  assert.equal(updated?.failureReasonJa, 'WAV形式で再試行した後も、文字起こし結果が品質基準を満たしませんでした。');
+  assert.equal(updated?.failedChunkIndex, 2);
+  assert.equal(updated?.processingSeconds, 87.25);
+  assert.deepEqual(updated?.qualityReasons, ['severe_global_duplication']);
+  assert.equal(updated?.qualityMetrics?.uniqueSentenceRatio, 0.25);
+  assert.ok(updated?.failureNotificationFingerprint);
+  assert.ok(updated?.failureNotificationSentAt);
+  assert.equal(failureEmails.length, 1);
+  assert.equal(failureEmails[0].technicalErrorMessage, 'Merged transcript failed structural quality check');
+  assert.equal(queueMessages.length, 0);
+  assert.deepEqual(finalizeResult, { ok: false, status: 'skipped_transcription_failed' });
+  assert.equal(downstreamFetchCalls, 0);
+  assert.equal(updated?.transcript, undefined);
+  assert.equal(updated?.summaryWrittenAt, undefined);
+  assert.equal(updated?.reviewCompletedAt, undefined);
+  assert.equal(updated?.emailSentAt, undefined);
+  const firstBody = await firstResponse.json();
+  const secondBody = await secondResponse.json();
+  assert.equal(firstBody.finalizeQueued, false);
+  assert.equal(firstBody.notificationSent, true);
+  assert.equal(secondBody.finalizeQueued, false);
+  assert.equal(secondBody.duplicateNotification, true);
+});
+
+test('failure email delivery error is logged without failing the callback', async () => {
+  const { workerMod, jobsMod, gmailMod } = await loadDeps();
+  const worker = workerMod.default;
+  const { createRecordingJob, upsertRecordingJob, getRecordingJob } = jobsMod;
+
+  const kv = new MockKv();
+  const env = makeEnv(kv, {
+    GMAIL_NOTIFY_ENABLED: 'true',
+    MAIL_TO: 'to@example.com',
+    MAIL_FROM: 'from@example.com',
+    MAIL_PASSWORD: 'password',
+  });
+  const job = createRecordingJob({
+    request: { fileName: 'smtp-failure.m4a' },
+    dropboxFileId: 'id:smtp-failure',
+    dropboxPathLower: '/apps/meetingmemo/inbox/smtp-failure.m4a',
+    fileName: 'smtp-failure.m4a',
+  });
+  await upsertRecordingJob(env, job);
+
+  const originalSendFailureEmail = gmailMod.sendFailureEmail;
+  gmailMod.sendFailureEmail = (async () => {
+    throw new Error('SMTP unavailable');
+  }) as any;
+  const response = await worker.fetch(new Request('https://example.com/api/interviews/transcription-callback', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-webhook-secret': env.INTERVIEW_WEBHOOK_SECRET },
+    body: JSON.stringify(failurePayload({
+      recordingId: job.recordingId,
+      dropboxFileId: job.dropboxFileId,
+      dropboxPathLower: job.dropboxPathLower,
+      fileName: job.fileName,
+    })),
+  }), env, { waitUntil: () => undefined });
+  gmailMod.sendFailureEmail = originalSendFailureEmail;
+
+  const updated = await getRecordingJob(env, { recordingId: job.recordingId });
+  const body = await response.json();
+  assert.equal(response.status, 202);
+  assert.equal(body.notificationSent, false);
+  assert.equal(updated?.status, 'failed');
+  assert.equal(updated?.finalizeStatus, 'skipped');
+  assert.equal(updated?.failureNotificationSentAt, undefined);
 });
 
 test('callback returns error when queue enqueue fails', async () => {

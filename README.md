@@ -43,14 +43,15 @@ Meeting-memo は **同一レポ（monorepo）運用のまま**、
 5. iPhone アップロード経由の文字起こしは duration に関係なく Python API（Railway Python service）へ委譲
 6. Python API が Dropbox から直接取得、`ffprobe` / `ffmpeg` で安全分割
 7. Python API が文字起こしを chunkIndex 順に送信（通常運用は `TRANSCRIBE_DIARIZATION_ENABLED=false` で話者分離なし）
-8. Python API が transcript を chunkIndex 順で結合して Workers callback
-9. Workers callback (`/api/interviews/transcription-callback`) は transcript と callback state を保存し、`FINALIZE_QUEUE` に `recordingId` を投入して `202 Accepted` を返す（軽量受信専用）
+8. Python API が transcript を chunkIndex 順で結合して Workers callback。終端失敗時も同じ再試行ポリシーで `status=failed` callback を送る
+9. Workers callback (`/api/interviews/transcription-callback`) は成功時に transcript と callback state を保存して `FINALIZE_QUEUE` に投入する。失敗時は failed state と通知fingerprintをKVへ保存し、失敗メールだけを送り、Queueには投入しない
 10. Cloudflare Queue Consumer が重い finalize（summary / 二次レビュー / Notion追記 / My Tasks登録 / メール送信）を実行
 11. `/api/interviews/job-status` の `finalizeStatus=completed` を最終完了判定とする（callback成功だけでは完了ではない）
 
 ### 二次レビュー機能（重要）
 
-- 使用モデル: `gpt-5.4-mini`（`OPENAI_MODEL_REVIEW`。未設定時は `OPENAI_MODEL_SUMMARIZE`、さらに未設定時は `gpt-5.4-mini`）
+- 一次要約モデル: `gpt-5.6-terra`（`OPENAI_MODEL_SUMMARIZE`、既定reasoning effort: `low`）
+- 二次レビューモデル: `gpt-5.6-sol`（`OPENAI_MODEL_REVIEW`、既定reasoning effort: `medium`）
 - Notion DB プロパティの追加は不要です。既存プロパティ（`Summary` / `My Tasks` / `Other Tasks` / `Raw JSON` / `Error Message`）のみ更新します。
 - メール本文 / Notion本文 / Summaryプロパティで使う最終メモは `finalMemo`（`review.finalMemoMarkdown` 優先）に統一します。
 - レビュー結果の分割セクションは原則作らず、Notion本文とメール本文は「完成版 面談メモ」を中心に表示します。
@@ -171,9 +172,13 @@ TRANSCRIBE_LANGUAGE=ja
 - `CALLBACK_JOB_LOOKUP_BASE_DELAY_MS`（指数 backoff の基準遅延。既定: `200`）
 - `CALLBACK_JOB_LOOKUP_MAX_DELAY_MS`（指数 backoff の最大遅延。既定: `1600`）
 - `GMAIL_NOTIFY_ENABLED`（`true` の時だけ通知）
+- `FAILURE_NOTIFY_ENABLED`（失敗通知。未設定時は `GMAIL_NOTIFY_ENABLED` の値を使用）
 - `INTERVIEW_REVIEW_ENABLED`（未設定は有効。`false` の時のみ二次レビュー無効）
 - `INTERVIEW_REVIEW_WEB_SEARCH_ENABLED`（未設定は有効。`false` の時のみWeb検索無効）
-- `OPENAI_MODEL_REVIEW`（既定: `gpt-5.4-mini`）
+- `OPENAI_MODEL_SUMMARIZE`（既定: `gpt-5.6-terra`）
+- `OPENAI_MODEL_REVIEW`（既定: `gpt-5.6-sol`）
+- `OPENAI_REASONING_EFFORT_SUMMARIZE`（既定: `low`。許容値: `none`, `low`, `medium`, `high`, `xhigh`, `max`）
+- `OPENAI_REASONING_EFFORT_REVIEW`（既定: `medium`。許容値は同上）
 - `TRANSCRIBE_DIARIZATION_ENABLED`（既定: `false`。`true` の時のみ話者分離）
 - `TRANSCRIBE_LANGUAGE`（既定: `ja`）
 - `NOTION_TRANSCRIPT_EXCERPT_CHARS`（任意。既定: `4000`）
@@ -267,7 +272,9 @@ Workers に下記 env を設定します。
 - `TMP_DIR`
 - `DIARIZATION_CHUNKING_STRATEGY`（diarization transcription 呼び出し時に必須）
 
-文字起こしは既定300秒単位で分割し、各chunkをM4A＋指定言語で処理します。反復過多または文字密度不足を検知した場合は、WAV＋Autoで1回だけ再試行します。再試行後も反復過多ならcallbackせず失敗とし、低密度だけなら無音候補chunkとして除外します。
+文字起こしは既定300秒単位で分割し、各chunkをM4A＋指定言語で処理します。反復過多または文字密度不足を検知した場合は、WAV＋Autoで1回だけ再試行します。再試行後もchunk単位で反復過多なら失敗とし、低密度だけなら無音候補chunkとして除外します。
+
+結合後の品質判定は、空文字起こし、採用chunk数0、録音時間に比して極端に少ない文字数、unique sentence ratioが0.40未満の深刻な全体重複だけをhard failureとします。結合後に同一文が8回または10回現れただけでは失敗にせず、max repetitionはwarningとして記録します。
 
 ---
 
@@ -308,6 +315,8 @@ Python API 実行環境には `ffmpeg` と `ffprobe` が必要です。
 - callback受信では `ctx.waitUntil(finalizeInterviewJob(...))` を起動しない
 - callback受信では `/api/interviews/finalize` をHTTPで呼ばない
 - Summary / 二次レビュー / Notion反映 / My Tasks登録 / メール送信は Queue Consumer が実行
+- `status=failed` callback はKVへfailed stateを保存し、一次要約・二次レビュー・Notion最終化・My Tasks登録・完了メールを実行しない
+- 失敗通知メールは同じfailure fingerprintの送信済み時刻をKVへ保存し、重複callbackでは再送しない
 - callback成功は最終完了ではない
 - 最終完了判定は Workers 側 `finalizeStatus=completed`
 - 手動復旧API:

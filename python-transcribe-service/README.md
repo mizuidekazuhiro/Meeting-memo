@@ -8,7 +8,7 @@
 - Workers が Dropbox 保存成功 metadata を起点に処理
 - 長時間音声（または Workers 側で安全判定できない音声）だけをこの API に委譲
 - 本サービスが Dropbox 直接取得 / ffprobe / ffmpeg chunking / OpenAI transcription を担当（通常運用は話者分離OFF）
-- 文字起こし結果を Workers callback へ返却（このサービスは finalize 完了まで待たない）
+- 文字起こし成功または終端失敗を Workers callback へ返却（このサービスは finalize 完了まで待たない）
 
 ## エンドポイント
 
@@ -61,10 +61,13 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 - AutoではEnglish、Indian English、Hindi、日本語名を含み得る混在言語promptを使い、実際に話された言語を維持する
 - 既定のchunk長は300秒。24 MB上限も単一chunkを返す前に判定する
 - M4A＋指定言語の品質が不十分ならWAV＋Autoで1回だけ再試行する
-- WAV再試行後も反復過多ならcallbackせず失敗し、低密度だけなら無音候補chunkとして除外する
+- WAV再試行後もchunk単位で反復過多なら終端失敗callbackを送り、低密度だけなら無音候補chunkとして除外する
+- 結合後は空文字、採用chunk数0、録音時間比で極端な低文字数、unique sentence ratio 0.40未満だけをhard failureにする
+- 結合後のmax sentence repetitionはwarningとし、同一文が8回または10回あることだけでは失敗にしない
 - diarization model 呼び出し時のみ `chunking_strategy` が必須（`DIARIZATION_CHUNKING_STRATEGY`）
 - OpenAI SDK 側で `Unexpected audio response format: diarized_json` warning が出ても、normalize 層で返却型差分を吸収して処理継続
 - chunkIndex 順に transcript を merge
+- 成功callbackと失敗callbackは同じtimeout・再試行ポリシーを使う
 - callback 失敗はログ化するが、transcription 本体成功は失敗扱いにしない（`callbackSucceeded` で返す）
 - callback 成功後の最終化は Cloudflare Queues 上で Workers が処理するため、Python 側 `overallStatus` は `callback_delivered_finalize_*` で管理する
 - `/jobs/transcribe` はバックグラウンド実行だが、ジョブ内部は同期パイプラインのため長時間音声では完了まで時間がかかる

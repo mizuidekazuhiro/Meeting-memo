@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, model_validator
 
@@ -48,3 +48,18 @@ class WorkersCallbackPayload(BaseModel):
     fileName: str
     sourceDurationSec: float | None = None
     transcript: TranscriptResult
+
+
+class WorkersFailureCallbackPayload(BaseModel):
+    recordingId: str
+    dropboxFileId: str
+    dropboxPathLower: str | None = None
+    fileName: str
+    status: Literal['failed'] = 'failed'
+    failureStage: str
+    errorSource: str
+    errorMessage: str
+    failedChunkIndex: int | None = None
+    processingSeconds: float
+    qualityReasons: list[str] | None = None
+    qualityMetrics: dict[str, Any] | None = None

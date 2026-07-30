@@ -13,7 +13,7 @@ from auth import require_bearer_token
 from callback_client import send_callback
 from dropbox_client import DropboxClient
 from logging_utils import configure_logging, get_logger, log_event, preview_text
-from models import TranscriptionJobRequest, WorkersCallbackPayload
+from models import TranscriptionJobRequest, WorkersCallbackPayload, WorkersFailureCallbackPayload
 from transcription_service import TranscriptionProcessingError, TranscriptionService
 
 configure_logging()
@@ -37,7 +37,7 @@ class JobState:
     transcription_status: str = 'pending'
     overall_status: str = 'queued'
     updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    payload: WorkersCallbackPayload | None = None
+    payload: WorkersCallbackPayload | WorkersFailureCallbackPayload | None = None
 
 
 class CallbackRetryRequest(BaseModel):
@@ -60,12 +60,82 @@ def update_job_state(recording_id: str, status: str, **kwargs) -> JobState:
         return state
 
 
+_QUALITY_METRIC_KEYS = {
+    'textLength',
+    'sentenceCount',
+    'uniqueSentenceCount',
+    'uniqueSentenceRatio',
+    'maxExactSentenceRepetitions',
+    'maxNormalizedSentenceRepetitions',
+    'charactersPerMinute',
+    'japanesePunctuationCount',
+    'englishPunctuationCount',
+    'hindiPunctuationCount',
+}
+
+
+def _failure_stage_for_exception(exc: Exception, current_stage: str) -> str:
+    if isinstance(exc, TranscriptionProcessingError):
+        if exc.failure_stage:
+            return exc.failure_stage
+        return {
+            'validation': 'ffmpeg_chunk_validation',
+            'ffmpeg': 'ffmpeg_chunk_validation',
+            'openai': 'openai_transcription',
+            'openai_response': 'openai_transcription',
+            'quality': 'transcript_quality',
+            'merge': 'merged_transcript',
+        }.get(exc.source, 'transcription_unhandled')
+    return current_stage
+
+
+def _build_failure_callback_payload(
+    job: TranscriptionJobRequest,
+    exc: Exception,
+    processing_seconds: float,
+    current_stage: str,
+) -> WorkersFailureCallbackPayload:
+    context = exc.context if isinstance(exc, TranscriptionProcessingError) else {}
+    quality_reasons_value = context.get('qualityReasons')
+    quality_reasons = (
+        [str(reason) for reason in quality_reasons_value]
+        if isinstance(quality_reasons_value, list)
+        else None
+    )
+    quality_metrics = {
+        key: context[key]
+        for key in _QUALITY_METRIC_KEYS
+        if key in context
+    } or None
+    return WorkersFailureCallbackPayload(
+        recordingId=job.recordingId,
+        dropboxFileId=job.dropboxFileId or '',
+        dropboxPathLower=job.dropboxPathLower,
+        fileName=job.fileName,
+        failureStage=_failure_stage_for_exception(exc, current_stage),
+        errorSource=(
+            exc.source
+            if isinstance(exc, TranscriptionProcessingError)
+            else 'dropbox'
+            if current_stage == 'dropbox_download'
+            else type(exc).__name__
+        ),
+        errorMessage=str(exc) or type(exc).__name__,
+        failedChunkIndex=exc.chunk_index if isinstance(exc, TranscriptionProcessingError) else None,
+        processingSeconds=processing_seconds,
+        qualityReasons=quality_reasons,
+        qualityMetrics=quality_metrics,
+    )
+
+
 def _process_job_async(job: TranscriptionJobRequest) -> None:
     update_job_state(job.recordingId, 'running', transcription_status='running', overall_status='running', callback_status='pending', finalize_status='pending')
     started_at = time.perf_counter()
+    current_stage = 'dropbox_download'
     log_event(logger, 'info', 'transcription_started', recordingId=job.recordingId, dropboxFileId=job.dropboxFileId, dropboxPathLower=job.dropboxPathLower, fileName=job.fileName)
     try:
         source = dropbox.download_file(job.dropboxFileId, job.dropboxPathLower)
+        current_stage = 'transcription_unhandled'
         payload = service.process(job, source)
         log_event(logger, 'info', 'transcript_merge_completed', recordingId=job.recordingId, transcriptLength=len(payload.transcript.fullText), segmentCount=len(payload.transcript.segments))
 
@@ -121,19 +191,56 @@ def _process_job_async(job: TranscriptionJobRequest) -> None:
             phase = exc.source
             failed_chunk_index = exc.chunk_index
             status_code = exc.external_status_code
-        update_job_state(job.recordingId, 'failed', error=str(exc), callback_succeeded=False, callback_status='failed', transcription_status='failed', finalize_status='skipped', overall_status='failed', processing_seconds=elapsed)
+        failure_payload = _build_failure_callback_payload(job, exc, elapsed, current_stage)
+        failure_callback_succeeded = False
+        try:
+            failure_callback_succeeded, _ = send_callback(
+                failure_payload,
+                callback_url=job.callbackUrl,
+            )
+        except Exception as callback_exc:  # noqa: BLE001
+            log_event(
+                logger,
+                'error',
+                'terminal failure callback raised unexpectedly',
+                recordingId=job.recordingId,
+                failureStage=failure_payload.failureStage,
+                exceptionClass=type(callback_exc).__name__,
+                error=preview_text(str(callback_exc)),
+            )
+        update_job_state(
+            job.recordingId,
+            'failed',
+            payload=failure_payload,
+            error=str(exc),
+            callback_succeeded=failure_callback_succeeded,
+            callback_status='succeeded' if failure_callback_succeeded else 'failed',
+            transcription_status='failed',
+            finalize_status='skipped',
+            overall_status=(
+                'failed_callback_delivered'
+                if failure_callback_succeeded
+                else 'failed_callback_delivery_failed'
+            ),
+            processing_seconds=elapsed,
+        )
         log_event(
             logger,
             'error',
             'python transcription pipeline failed',
             recordingId=job.recordingId,
             phase=phase,
+            failureStage=failure_payload.failureStage,
+            errorSource=failure_payload.errorSource,
             failedChunkIndex=failed_chunk_index,
             responseStatus=status_code,
             exceptionClass=type(exc).__name__,
             error=preview_text(str(exc)),
             processingSeconds=elapsed,
             callbackUrlOverride=bool(job.callbackUrl),
+            failureCallbackSucceeded=failure_callback_succeeded,
+            qualityReasons=failure_payload.qualityReasons,
+            qualityMetrics=failure_payload.qualityMetrics,
         )
 
 
@@ -169,7 +276,27 @@ def retry_callback(recording_id: str, body: CallbackRetryRequest) -> dict[str, o
 
     log_event(logger, 'info', 'callback_retry_started', recordingId=recording_id, manual=True)
     callback_succeeded, finalize_queued = send_callback(state.payload, callback_url=body.callbackUrl)
+    is_failure_payload = isinstance(state.payload, WorkersFailureCallbackPayload)
     if callback_succeeded:
+        if is_failure_payload:
+            updated = update_job_state(
+                recording_id,
+                'failed',
+                callback_succeeded=True,
+                callback_status='succeeded',
+                transcription_status='failed',
+                finalize_status='skipped',
+                overall_status='failed_callback_delivered',
+                error=state.error,
+            )
+            log_event(logger, 'info', 'failure_callback_retry_succeeded', recordingId=recording_id, manual=True)
+            return {
+                'ok': True,
+                'recordingId': recording_id,
+                'status': updated.status,
+                'callbackStatus': updated.callback_status,
+                'overallStatus': updated.overall_status,
+            }
         updated = update_job_state(
             recording_id,
             'callback_delivered',
@@ -182,7 +309,16 @@ def retry_callback(recording_id: str, body: CallbackRetryRequest) -> dict[str, o
         log_event(logger, 'info', 'callback_retry_succeeded', recordingId=recording_id, manual=True)
         return {'ok': True, 'recordingId': recording_id, 'status': updated.status, 'callbackStatus': updated.callback_status, 'overallStatus': updated.overall_status}
 
-    updated = update_job_state(recording_id, 'callback_failed', callback_succeeded=False, callback_status='failed', finalize_status='skipped', overall_status='transcribed_callback_failed', error='manual callback retry failed')
+    updated = update_job_state(
+        recording_id,
+        'failed' if is_failure_payload else 'callback_failed',
+        callback_succeeded=False,
+        callback_status='failed',
+        transcription_status='failed' if is_failure_payload else state.transcription_status,
+        finalize_status='skipped',
+        overall_status='failed_callback_delivery_failed' if is_failure_payload else 'transcribed_callback_failed',
+        error=state.error if is_failure_payload else 'manual callback retry failed',
+    )
     log_event(logger, 'warning', 'callback_retry_failed', recordingId=recording_id, manual=True)
     return {'ok': False, 'recordingId': recording_id, 'status': updated.status, 'callbackStatus': updated.callback_status, 'overallStatus': updated.overall_status}
 

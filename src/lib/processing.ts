@@ -1,7 +1,24 @@
-import type { DropboxFileMetadata, Env, IntakeRequest, InterviewInsights, ProcessInterviewResult, RecordingJob, RecordingJobCallbackPayload, TranscriptResult } from '../types';
+import type {
+  DropboxFileMetadata,
+  Env,
+  IntakeRequest,
+  InterviewInsights,
+  ProcessInterviewResult,
+  RecordingJob,
+  RecordingJobFailureCallbackPayload,
+  RecordingJobSuccessCallbackPayload,
+  TranscriptResult,
+} from '../types';
 import { buildDedupCandidates } from './dedup';
 import { downloadDropboxFile, getOrCreateDropboxSharedLink, sanitizeDropboxFileName, sha256Hex, uploadTextFileToDropbox } from './dropbox';
-import { getCompletionEmailConfig, sendCompletionEmail, shouldSendCompletionEmail } from './gmail';
+import {
+  getCompletionEmailConfig,
+  getFailureReasonJa,
+  sendCompletionEmail,
+  sendFailureEmail,
+  shouldSendCompletionEmail,
+  shouldSendFailureEmail,
+} from './gmail';
 import { HttpError } from './http';
 import { findRecordingJobWithSource, getRecordingJob, getRecordingJobStorageMeta, markJobFailed, normalizeDropboxPath, shouldSkipProcessingForExistingJob, updateRecordingJobStatus } from './jobs';
 import { logEvent } from './logger';
@@ -652,7 +669,7 @@ export async function processUploadedInterview(
   }
 }
 
-export async function persistTranscriptionCallback(env: Env, payload: RecordingJobCallbackPayload): Promise<ProcessInterviewResult> {
+export async function persistTranscriptionCallback(env: Env, payload: RecordingJobSuccessCallbackPayload): Promise<ProcessInterviewResult> {
   const lookup = await findRecordingJobWithSource(env, {
     recordingId: payload.recordingId?.trim(),
     dropboxFileId: payload.dropboxFileId?.trim(),
@@ -699,6 +716,151 @@ export async function persistTranscriptionCallback(env: Env, payload: RecordingJ
   };
 }
 
+function stableFailureMetrics(metrics: Record<string, unknown> | null | undefined): Record<string, unknown> | null {
+  if (!metrics) return null;
+  return Object.fromEntries(
+    Object.entries(metrics).sort(([left], [right]) => left.localeCompare(right)),
+  );
+}
+
+async function buildFailureNotificationFingerprint(
+  payload: RecordingJobFailureCallbackPayload,
+): Promise<string> {
+  return sha256Hex(JSON.stringify({
+    recordingId: payload.recordingId,
+    failureStage: payload.failureStage,
+    errorSource: payload.errorSource,
+    errorMessage: payload.errorMessage,
+    failedChunkIndex: payload.failedChunkIndex ?? null,
+    qualityReasons: payload.qualityReasons ?? [],
+    qualityMetrics: stableFailureMetrics(payload.qualityMetrics),
+  }));
+}
+
+export async function persistTranscriptionFailureCallback(
+  env: Env,
+  payload: RecordingJobFailureCallbackPayload,
+): Promise<{ action: 'failed'; notificationSent: boolean; duplicateNotification: boolean }> {
+  const lookup = await findRecordingJobWithSource(env, {
+    recordingId: payload.recordingId.trim(),
+    dropboxFileId: payload.dropboxFileId.trim(),
+    dropboxPathLower: normalizeDropboxPath(payload.dropboxPathLower ?? undefined),
+  });
+  const job = lookup.job;
+  if (!job) {
+    logEvent('error', 'failure_callback_job_not_found', {
+      recordingId: payload.recordingId,
+      dropboxFileId: payload.dropboxFileId,
+      dropboxPathLower: payload.dropboxPathLower ?? null,
+      failureStage: payload.failureStage,
+    });
+    throw new HttpError('Recording job not found for failure callback.', 404, { phase: 'lookup_failure_job' });
+  }
+
+  const callbackReceivedAt = new Date().toISOString();
+  const failureReasonJa = getFailureReasonJa(payload.failureStage);
+  const fingerprint = await buildFailureNotificationFingerprint(payload);
+  const duplicateNotification = (
+    job.failureNotificationFingerprint === fingerprint
+    && Boolean(job.failureNotificationSentAt)
+  );
+
+  await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'failed', {
+    callbackStatus: 'received',
+    callbackReceivedAt,
+    finalizeStatus: 'skipped',
+    finalizeQueuedAt: undefined,
+    finalizeStartedAt: undefined,
+    finalizeCompletedAt: undefined,
+    failureStage: payload.failureStage,
+    errorSource: payload.errorSource,
+    technicalErrorMessage: payload.errorMessage,
+    errorMessage: payload.errorMessage,
+    lastError: payload.errorMessage,
+    failureReasonJa,
+    failedChunkIndex: payload.failedChunkIndex ?? undefined,
+    processingSeconds: payload.processingSeconds,
+    qualityReasons: payload.qualityReasons ?? undefined,
+    qualityMetrics: payload.qualityMetrics ?? undefined,
+  });
+
+  logEvent('error', 'transcription_failure_state_saved', {
+    recordingId: job.recordingId,
+    fileName: job.fileName,
+    dropboxFileId: job.dropboxFileId,
+    dropboxPathLower: job.dropboxPathLower,
+    failureStage: payload.failureStage,
+    errorSource: payload.errorSource,
+    failedChunkIndex: payload.failedChunkIndex ?? null,
+    processingSeconds: payload.processingSeconds,
+    qualityReasons: payload.qualityReasons ?? [],
+    qualityMetrics: payload.qualityMetrics ?? null,
+    finalizeStatus: 'skipped',
+  });
+
+  if (duplicateNotification) {
+    logEvent('info', 'failure_email_skipped_duplicate', {
+      recordingId: job.recordingId,
+      failureNotificationFingerprint: fingerprint,
+      failureNotificationSentAt: job.failureNotificationSentAt,
+    });
+    return { action: 'failed', notificationSent: false, duplicateNotification: true };
+  }
+
+  if (!shouldSendFailureEmail(env)) {
+    logEvent('info', 'failure_email_skipped_not_configured', {
+      recordingId: job.recordingId,
+      failureNotifyEnabled: env.FAILURE_NOTIFY_ENABLED ?? env.GMAIL_NOTIFY_ENABLED ?? null,
+    });
+    return { action: 'failed', notificationSent: false, duplicateNotification: false };
+  }
+
+  try {
+    const mailConfig = getCompletionEmailConfig(env);
+    logEvent('info', 'failure_email_send_started', {
+      recordingId: job.recordingId,
+      fileName: job.fileName,
+      failureStage: payload.failureStage,
+      smtpHost: mailConfig.smtpHost,
+      smtpPort: mailConfig.smtpPort,
+      toCount: mailConfig.to.length,
+      ccCount: mailConfig.cc.length,
+      bccCount: mailConfig.bcc.length,
+    });
+    await sendFailureEmail(env, {
+      subject: `Meeting Memo文字起こし失敗: ${job.fileName}`,
+      fileName: job.fileName,
+      recordingId: job.recordingId,
+      failureStage: payload.failureStage,
+      humanReadableReasonJa: failureReasonJa,
+      technicalErrorMessage: payload.errorMessage,
+      failedChunkIndex: payload.failedChunkIndex,
+      processingSeconds: payload.processingSeconds,
+      qualityReasons: payload.qualityReasons,
+      qualityMetrics: payload.qualityMetrics,
+    });
+    const failureNotificationSentAt = new Date().toISOString();
+    await updateRecordingJobStatus(env, { recordingId: job.recordingId }, 'failed', {
+      failureNotificationFingerprint: fingerprint,
+      failureNotificationSentAt,
+    });
+    logEvent('info', 'failure_email_sent', {
+      recordingId: job.recordingId,
+      failureNotificationFingerprint: fingerprint,
+      failureNotificationSentAt,
+    });
+    return { action: 'failed', notificationSent: true, duplicateNotification: false };
+  } catch (error) {
+    logEvent('warn', 'failure_email_send_failed', {
+      recordingId: job.recordingId,
+      fileName: job.fileName,
+      failureStage: payload.failureStage,
+      details: error instanceof HttpError ? error.details : error instanceof Error ? error.message : String(error),
+    });
+    return { action: 'failed', notificationSent: false, duplicateNotification: false };
+  }
+}
+
 function ensureInterviewRecord(job: RecordingJob, transcript: TranscriptResult, insights?: InterviewInsights) {
   return {
     title: job.fileName ? `Interview Memo ${new Date().toISOString().slice(0, 10)} - ${job.fileName}` : 'Interview Memo',
@@ -724,6 +886,19 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
   const forceEmail = options.forceEmail === true;
   const job = await getRecordingJob(env, { recordingId });
   if (!job) throw new HttpError('Recording job not found.', 404, { recordingId });
+
+  if (job.failureStage && !job.transcript) {
+    await updateRecordingJobStatus(env, { recordingId }, 'failed', {
+      finalizeStatus: 'skipped',
+      lastError: job.technicalErrorMessage ?? job.errorMessage ?? job.lastError,
+    });
+    logEvent('info', 'finalize_skipped_transcription_failed', {
+      recordingId,
+      failureStage: job.failureStage,
+      errorSource: job.errorSource ?? null,
+    });
+    return { ok: false, status: 'skipped_transcription_failed' };
+  }
 
   if (job.finalizeStatus === 'completed' && !force && !forceEmail) {
     logEvent('info', 'finalize_skipped_already_completed', { recordingId });
