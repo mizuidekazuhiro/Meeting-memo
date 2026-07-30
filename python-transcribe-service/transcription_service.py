@@ -13,6 +13,7 @@ from config import SETTINGS
 from ffmpeg_utils import ChunkPlanEntry, build_chunk_plan, ffprobe_metadata, run_ffmpeg_chunk, validate_chunk
 from logging_utils import get_logger, log_event, preview_text
 from models import TranscriptResult, TranscriptSegment, TranscriptionJobRequest, WorkersCallbackPayload
+from transcript_quality import TranscriptQualityEvaluation, evaluate_transcript_quality
 
 logger = get_logger()
 DIARIZATION_MODEL = 'gpt-4o-transcribe-diarize'
@@ -30,7 +31,13 @@ ENGLISH_TRANSCRIBE_PROMPT = '\n'.join([
     'Preserve company names, abbreviations, numbers, technical terms, and business context.',
     'Do not invent unclear content. Mark unclear parts as [inaudible] where necessary.',
 ])
-SUPPORTED_LANGUAGES = {'ja', 'en'}
+AUTO_TRANSCRIBE_PROMPT = '\n'.join([
+    'This recording may contain English, Indian English, Hindi, and Japanese names.',
+    'Preserve the language actually spoken in each passage.',
+    'Do not force all speech into English.',
+    'Do not invent, guess, or repeat unclear content.',
+])
+SUPPORTED_LANGUAGES = {'ja', 'en', 'auto'}
 
 
 class TranscriptionProcessingError(RuntimeError):
@@ -53,6 +60,14 @@ class TranscriptionProcessingError(RuntimeError):
 def should_fallback(status_code: int, error_text: str) -> bool:
     text = error_text.lower()
     return SETTINGS.enable_audio_fallback and 400 <= status_code < 500 and any(token in text for token in ('corrupted', 'unsupported', 'file'))
+
+
+def _prompt_for_language_mode(language_mode: str) -> str:
+    if language_mode == 'ja':
+        return JAPANESE_TRANSCRIBE_PROMPT
+    if language_mode == 'en':
+        return ENGLISH_TRANSCRIBE_PROMPT
+    return AUTO_TRANSCRIBE_PROMPT
 
 
 def _coerce_ms(value: Any, *, is_ms: bool) -> int | None:
@@ -246,7 +261,8 @@ class TranscriptionService:
         diarization_enabled = SETTINGS.transcribe_diarization_enabled
         chunking_strategy = self._get_diarization_chunking_strategy() if diarization_enabled else None
         model = DIARIZATION_MODEL if diarization_enabled else STANDARD_MODEL
-        language, fallback_reason, invalid_hint, invalid_env = self._resolve_language(language_hint)
+        language_mode, fallback_reason, invalid_hint, invalid_env = self._resolve_language(language_hint)
+        language_parameter = language_mode if language_mode in {'ja', 'en'} else None
         if invalid_hint or invalid_env:
             log_event(
                 logger,
@@ -256,7 +272,7 @@ class TranscriptionService:
                 envLanguage=SETTINGS.transcribe_language,
                 invalidLanguageHint=invalid_hint,
                 invalidEnvLanguage=invalid_env,
-                resolvedLanguage=language,
+                resolvedLanguage=language_mode,
             )
         chunk_meta = ffprobe_metadata(file_path)
         log_event(
@@ -270,7 +286,8 @@ class TranscriptionService:
             requestLanguageHint=language_hint,
             envLanguage=SETTINGS.transcribe_language,
             languageFallbackReason=fallback_reason,
-            language=language,
+            language=language_mode,
+            languageParameter=language_parameter,
             promptEnabled=not diarization_enabled,
             languageHint=language_hint,
             chunkIndex=chunk_index,
@@ -284,13 +301,19 @@ class TranscriptionService:
             with file_path.open('rb') as handle:
                 # diarized_json is required to obtain speaker-separated segments from gpt-4o-transcribe-diarize.
                 # normalize_transcription_response keeps processing stable across SDK response-shape differences.
+                request_options: dict[str, Any] = {
+                    'model': model,
+                    'file': handle,
+                    'response_format': DIARIZED_RESPONSE_FORMAT if diarization_enabled else 'json',
+                }
+                if language_parameter:
+                    request_options['language'] = language_parameter
+                if diarization_enabled and chunking_strategy:
+                    request_options['chunking_strategy'] = chunking_strategy
+                if not diarization_enabled:
+                    request_options['prompt'] = _prompt_for_language_mode(language_mode)
                 response = self.openai.audio.transcriptions.create(
-                    model=model,
-                    file=handle,
-                    response_format=DIARIZED_RESPONSE_FORMAT if diarization_enabled else 'json',
-                    language=language,
-                    **({'chunking_strategy': chunking_strategy} if diarization_enabled and chunking_strategy else {}),
-                    **({'prompt': JAPANESE_TRANSCRIBE_PROMPT if language == 'ja' else ENGLISH_TRANSCRIBE_PROMPT} if not diarization_enabled else {}),
+                    **request_options,
                 )
         except Exception as exc:  # noqa: BLE001
             status_code = getattr(exc, 'status_code', None)
@@ -351,18 +374,91 @@ class TranscriptionService:
             chunkIndex=chunk_index,
             model=model,
             diarizationEnabled=diarization_enabled,
-            language=language,
+            language=language_mode,
+            languageParameter=language_parameter,
             promptEnabled=not diarization_enabled,
             responseStatus=response_status,
             topLevelKeys=sorted(payload.keys()),
             segmentsCount=len(segments_raw) if isinstance(segments_raw, list) else 0,
             fullTextLength=len(full_text),
             hasUsage=payload.get('usage') is not None,
-            payloadPreview=preview_text(payload),
             transcriptLength=len(parse_transcript_response(payload).fullText),
             fallbackOccurred=False,
         )
         return parse_transcript_response(payload)
+
+    def _log_chunk_prepared(
+        self,
+        *,
+        job: TranscriptionJobRequest,
+        chunk: ChunkPlanEntry,
+        audio_format: str,
+        language_hint: str | None,
+        attempt: str,
+        validation_passed: bool,
+        details: dict[str, object],
+    ) -> None:
+        diarization_enabled = SETTINGS.transcribe_diarization_enabled
+        language_mode, fallback_reason, _, _ = self._resolve_language(language_hint)
+        language_parameter = language_mode if language_mode in {'ja', 'en'} else None
+        log_event(
+            logger,
+            'info',
+            'chunk prepared',
+            recordingId=job.recordingId,
+            chunkIndex=chunk.chunk_index,
+            chunkCount=chunk.chunk_count,
+            startOffsetMs=chunk.start_offset_ms,
+            endOffsetMs=chunk.end_offset_ms,
+            attempt=attempt,
+            model=DIARIZATION_MODEL if diarization_enabled else STANDARD_MODEL,
+            response_format=DIARIZED_RESPONSE_FORMAT if diarization_enabled else 'json',
+            chunking_strategy=self._get_diarization_chunking_strategy() if diarization_enabled else None,
+            diarizationEnabled=diarization_enabled,
+            requestLanguageHint=language_hint,
+            language=language_mode,
+            languageParameter=language_parameter,
+            languageFallbackReason=fallback_reason,
+            promptEnabled=not diarization_enabled,
+            audioFormat=audio_format,
+            ffprobe={
+                'duration': details.get('duration'),
+                'codec': details.get('codec'),
+                'sample_rate': details.get('sample_rate'),
+                'channels': details.get('channels'),
+                'mime_type': details.get('mime_type'),
+            },
+            validationPassed=validation_passed,
+        )
+
+    @staticmethod
+    def _quality_duration(details: dict[str, object], chunk: ChunkPlanEntry) -> float:
+        try:
+            duration = float(details.get('duration') or chunk.estimated_duration_sec)
+        except (TypeError, ValueError):
+            duration = chunk.estimated_duration_sec
+        return max(0.001, duration)
+
+    @staticmethod
+    def _log_quality(
+        *,
+        job: TranscriptionJobRequest,
+        chunk: ChunkPlanEntry,
+        attempt: str,
+        audio_format: str,
+        evaluation: TranscriptQualityEvaluation,
+    ) -> None:
+        log_event(
+            logger,
+            'info' if evaluation.status == 'pass' else 'warning',
+            'transcript quality evaluated',
+            recordingId=job.recordingId,
+            chunkIndex=chunk.chunk_index,
+            chunkCount=chunk.chunk_count,
+            attempt=attempt,
+            audioFormat=audio_format,
+            **evaluation.to_log_dict(),
+        )
 
     def process(self, job: TranscriptionJobRequest, source_bytes: bytes) -> WorkersCallbackPayload:
         with tempfile.TemporaryDirectory(dir=SETTINGS.tmp_dir) as tmp_dir:
@@ -374,6 +470,7 @@ class TranscriptionService:
                 raise TranscriptionProcessingError('invalid source: duration must be > 0', source='validation')
             plan = build_chunk_plan(source_meta.duration_sec, job.sourceBytes or len(source_bytes))
             results: list[tuple[ChunkPlanEntry, TranscriptResult]] = []
+            requested_language_hint = job.request.languageHint if job.request else None
 
             for chunk in plan:
                 log_event(
@@ -385,58 +482,54 @@ class TranscriptionService:
                     chunkCount=chunk.chunk_count,
                     startOffsetMs=chunk.start_offset_ms,
                     endOffsetMs=chunk.end_offset_ms,
-                    audioFormat=SETTINGS.primary_audio_format,
+                    audioFormat='m4a',
+                    language=requested_language_hint,
                 )
-                formats = [SETTINGS.primary_audio_format]
-                if SETTINGS.enable_audio_fallback and SETTINGS.fallback_audio_format != SETTINGS.primary_audio_format:
-                    formats.append(SETTINGS.fallback_audio_format)
 
-                transcribed = False
-                for index, fmt in enumerate(formats):
-                    ext = 'm4a' if fmt == 'm4a' else 'wav'
-                    output = Path(tmp_dir) / f'part-{chunk.chunk_index + 1:03d}.{ext}'
-                    run_ffmpeg_chunk(source_path, output, chunk.start_offset_ms / 1000, chunk.estimated_duration_sec, fmt)
-                    ok, details = validate_chunk(output, ext)
-                    log_event(
-                        logger,
-                        'info',
-                        'chunk prepared',
-                        recordingId=job.recordingId,
-                        chunkIndex=chunk.chunk_index,
-                        chunkCount=chunk.chunk_count,
-                        startOffsetMs=chunk.start_offset_ms,
-                        endOffsetMs=chunk.end_offset_ms,
-                        model=DIARIZATION_MODEL,
-                        response_format=DIARIZED_RESPONSE_FORMAT if SETTINGS.transcribe_diarization_enabled else 'json',
-                        chunking_strategy=SETTINGS.diarization_chunking_strategy,
-                        diarizationEnabled=SETTINGS.transcribe_diarization_enabled,
-                        language=job.request.languageHint if job.request and job.request.languageHint else SETTINGS.transcribe_language,
-                        promptEnabled=not SETTINGS.transcribe_diarization_enabled,
-                        audioFormat=ext,
-                        ffprobe={
-                            'duration': details.get('duration'),
-                            'codec': details.get('codec'),
-                            'sample_rate': details.get('sample_rate'),
-                            'channels': details.get('channels'),
-                            'mime_type': details.get('mime_type'),
-                        },
-                        validationPassed=ok,
+                chunk_handled = False
+                for attempt_index, (audio_format, language_hint, attempt) in enumerate((
+                    ('m4a', requested_language_hint, 'initial_m4a_requested_language'),
+                    ('wav', 'auto', 'quality_retry_wav_auto'),
+                )):
+                    output = Path(tmp_dir) / f'part-{chunk.chunk_index + 1:03d}.{audio_format}'
+                    run_ffmpeg_chunk(
+                        source_path,
+                        output,
+                        chunk.start_offset_ms / 1000,
+                        chunk.estimated_duration_sec,
+                        audio_format,
+                    )
+                    ok, details = validate_chunk(output, audio_format)
+                    self._log_chunk_prepared(
+                        job=job,
+                        chunk=chunk,
+                        audio_format=audio_format,
+                        language_hint=language_hint,
+                        attempt=attempt,
+                        validation_passed=ok,
+                        details=details,
                     )
                     if not ok:
                         raise TranscriptionProcessingError(
                             f'chunk validation failed: {details}',
                             source='validation',
                             chunk_index=chunk.chunk_index,
-                            context={'file_name': output.name, 'audio_format': ext},
+                            context={'file_name': output.name, 'audio_format': audio_format},
                         )
 
                     try:
-                        result = self.transcribe_file(output, job.request.languageHint if job.request else None, chunk.chunk_index, ext)
-                        results.append((chunk, result))
-                        transcribed = True
-                        break
+                        result = self.transcribe_file(
+                            output,
+                            language_hint,
+                            chunk.chunk_index,
+                            audio_format,
+                        )
                     except TranscriptionProcessingError as exc:
-                        fallback_candidate = should_fallback(exc.external_status_code or 500, str(exc))
+                        fallback_candidate = (
+                            attempt_index == 0
+                            and audio_format == 'm4a'
+                            and should_fallback(exc.external_status_code or 500, str(exc))
+                        )
                         log_event(
                             logger,
                             'error',
@@ -445,17 +538,105 @@ class TranscriptionService:
                             chunkIndex=chunk.chunk_index,
                             model=DIARIZATION_MODEL if SETTINGS.transcribe_diarization_enabled else STANDARD_MODEL,
                             response_format=DIARIZED_RESPONSE_FORMAT if SETTINGS.transcribe_diarization_enabled else 'json',
-                            chunking_strategy=SETTINGS.diarization_chunking_strategy,
+                            chunking_strategy=(
+                                self._get_diarization_chunking_strategy()
+                                if SETTINGS.transcribe_diarization_enabled
+                                else None
+                            ),
+                            audioFormat=audio_format,
+                            language=self._resolve_language(language_hint)[0],
                             error=str(exc),
                             errorSource=exc.source,
                             responseStatus=exc.external_status_code,
                             fallbackCandidate=fallback_candidate,
                         )
-                        if index == 0 and fmt == 'm4a' and fallback_candidate:
+                        if fallback_candidate:
+                            log_event(
+                                logger,
+                                'warning',
+                                'transcription retry selected',
+                                recordingId=job.recordingId,
+                                chunkIndex=chunk.chunk_index,
+                                retryReason='openai_file_error',
+                                fromAudioFormat='m4a',
+                                toAudioFormat='wav',
+                                retryLanguage='auto',
+                            )
                             continue
                         raise
 
-                if not transcribed:
+                    evaluation = evaluate_transcript_quality(
+                        result.fullText,
+                        self._quality_duration(details, chunk),
+                    )
+                    self._log_quality(
+                        job=job,
+                        chunk=chunk,
+                        attempt=attempt,
+                        audio_format=audio_format,
+                        evaluation=evaluation,
+                    )
+                    if evaluation.status == 'pass':
+                        results.append((chunk, result))
+                        chunk_handled = True
+                        break
+
+                    if attempt_index == 0:
+                        log_event(
+                            logger,
+                            'warning',
+                            'transcription retry selected',
+                            recordingId=job.recordingId,
+                            chunkIndex=chunk.chunk_index,
+                            retryReason='quality_gate',
+                            qualityStatus=evaluation.status,
+                            qualityReasons=list(evaluation.reasons),
+                            fromAudioFormat='m4a',
+                            toAudioFormat='wav',
+                            retryLanguage='auto',
+                        )
+                        continue
+
+                    if evaluation.has_excessive_repetition:
+                        log_event(
+                            logger,
+                            'error',
+                            'transcription quality hard failure after retry',
+                            recordingId=job.recordingId,
+                            chunkIndex=chunk.chunk_index,
+                            audioFormat='wav',
+                            language='auto',
+                            **evaluation.to_log_dict(),
+                        )
+                        raise TranscriptionProcessingError(
+                            f'Transcript quality rejected chunk {chunk.chunk_index} after WAV Auto retry',
+                            source='quality',
+                            chunk_index=chunk.chunk_index,
+                            context=evaluation.to_log_dict(),
+                        )
+
+                    if evaluation.has_only_low_text_density:
+                        log_event(
+                            logger,
+                            'warning',
+                            'transcription chunk skipped as probable silence',
+                            recordingId=job.recordingId,
+                            chunkIndex=chunk.chunk_index,
+                            audioFormat='wav',
+                            language='auto',
+                            **evaluation.to_log_dict(),
+                        )
+                        chunk_handled = True
+                        break
+
+                    raise TranscriptionProcessingError(
+                        f'Transcript quality remained invalid for chunk {chunk.chunk_index} after WAV Auto retry',
+                        source='quality',
+                        chunk_index=chunk.chunk_index,
+                        context=evaluation.to_log_dict(),
+                    )
+
+                if not chunk_handled:
                     raise TranscriptionProcessingError(
                         f'Unable to transcribe chunk {chunk.chunk_index}',
                         source='openai',
@@ -463,6 +644,28 @@ class TranscriptionService:
                     )
 
             merged = merge_results(results)
+            accepted_duration_sec = sum(chunk.estimated_duration_sec for chunk, _ in results)
+            merged_evaluation = evaluate_transcript_quality(
+                merged.fullText,
+                accepted_duration_sec or source_meta.duration_sec,
+            )
+            log_event(
+                logger,
+                'info' if merged_evaluation.status == 'pass' else 'error',
+                'merged transcript hard quality check',
+                recordingId=job.recordingId,
+                chunkCount=len(plan),
+                acceptedChunkCount=len(results),
+                acceptedDurationSec=accepted_duration_sec,
+                **merged_evaluation.to_log_dict(),
+            )
+            if merged_evaluation.status != 'pass':
+                raise TranscriptionProcessingError(
+                    'Merged transcript failed hard quality check',
+                    source='quality',
+                    context=merged_evaluation.to_log_dict(),
+                )
+
             return WorkersCallbackPayload(
                 recordingId=job.recordingId,
                 dropboxFileId=job.dropboxFileId or '',

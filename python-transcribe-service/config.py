@@ -15,7 +15,7 @@ class Settings:
     workers_callback_url: str = os.getenv('WORKERS_CALLBACK_URL', '')
     workers_finalize_url: str = os.getenv('WORKERS_FINALIZE_URL', '')
     workers_callback_token: str = os.getenv('WORKERS_CALLBACK_TOKEN', '')
-    target_chunk_duration_sec: int = int(os.getenv('TARGET_CHUNK_DURATION_SEC', '720'))
+    target_chunk_duration_sec: int = int(os.getenv('TARGET_CHUNK_DURATION_SEC', '300'))
     max_transcribe_duration_sec: int = int(os.getenv('MAX_TRANSCRIBE_DURATION_SEC', '1400'))
     primary_audio_format: str = os.getenv('PRIMARY_AUDIO_FORMAT', 'm4a').lower()
     fallback_audio_format: str = os.getenv('FALLBACK_AUDIO_FORMAT', 'wav').lower()

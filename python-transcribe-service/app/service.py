@@ -75,9 +75,14 @@ class ChunkArtifact:
 
 
 def build_chunk_plan(duration_sec: float, source_bytes: int) -> list[ChunkPlanEntry]:
-    if duration_sec <= MAX_TRANSCRIBE_DURATION_SEC and duration_sec <= TARGET_CHUNK_DURATION_SEC:
+    effective_target_duration = min(TARGET_CHUNK_DURATION_SEC, MAX_TRANSCRIBE_DURATION_SEC)
+    chunk_count = max(
+        1,
+        math.ceil(duration_sec / effective_target_duration),
+        math.ceil(source_bytes / (24 * 1024 * 1024)),
+    )
+    if chunk_count == 1:
         return [ChunkPlanEntry(0, 1, 0, math.ceil(duration_sec * 1000), duration_sec)]
-    chunk_count = max(1, math.ceil(duration_sec / TARGET_CHUNK_DURATION_SEC), math.ceil(source_bytes / (24 * 1024 * 1024)))
     duration_ms = math.ceil(duration_sec * 1000)
     out: list[ChunkPlanEntry] = []
     for idx in range(chunk_count):

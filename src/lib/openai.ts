@@ -17,12 +17,16 @@ const DEFAULT_ENGLISH_TRANSCRIBE_PROMPT = [
   'Preserve company names, abbreviations, numbers, technical terms, and business context.',
   'Do not invent unclear content. Mark unclear parts as [inaudible] where necessary.',
 ].join('\n');
-const SUPPORTED_TRANSCRIBE_LANGUAGES = new Set(['ja', 'en']);
+const DEFAULT_AUTO_TRANSCRIBE_PROMPT = [
+  'This recording may contain English, Indian English, Hindi, and Japanese names.',
+  'Preserve the language actually spoken in each passage.',
+  'Do not force all speech into English.',
+  'Do not invent, guess, or repeat unclear content.',
+].join('\n');
+const SUPPORTED_TRANSCRIBE_LANGUAGES = new Set(['ja', 'en', 'auto']);
 export const MAX_TRANSCRIPTION_BYTES = 24 * 1024 * 1024;
 export const MAX_TRANSCRIBE_DURATION_SEC = 1400;
-// Keep chunks around 10-12 minutes so we stay well under the 1400s model limit
-// and leave headroom for metadata drift / duration estimation error.
-export const TARGET_CHUNK_DURATION_SEC = 720;
+export const TARGET_CHUNK_DURATION_SEC = 300;
 export const PRIMARY_AUDIO_FORMAT = 'm4a';
 export const FALLBACK_AUDIO_FORMAT = 'wav';
 export const ENABLE_AUDIO_FALLBACK = true;
@@ -116,7 +120,8 @@ type AudioChunkGenerator = (source: Blob, sourceMeta: SourceAudioMetadata, plan:
 
 type TranscribeOptions = {
   diarizationEnabled: boolean;
-  language: string;
+  language: 'ja' | 'en' | 'auto';
+  languageParameter?: 'ja' | 'en';
   prompt?: string;
   requestedLanguageHint?: string;
   envLanguage?: string;
@@ -135,25 +140,44 @@ function normalizeLanguageCandidate(value?: string): string | undefined {
 }
 
 export function resolveTranscriptionLanguage(languageHint?: string, envLanguage?: string): {
-  language: 'ja' | 'en';
+  language: 'ja' | 'en' | 'auto';
+  languageParameter?: 'ja' | 'en';
   fallbackReason: 'request' | 'env' | 'default';
   invalidLanguageHint?: string;
   invalidEnvLanguage?: string;
 } {
   const normalizedHint = normalizeLanguageCandidate(languageHint);
   if (normalizedHint && SUPPORTED_TRANSCRIBE_LANGUAGES.has(normalizedHint)) {
-    return { language: normalizedHint as 'ja' | 'en', fallbackReason: 'request' };
+    const language = normalizedHint as 'ja' | 'en' | 'auto';
+    return {
+      language,
+      languageParameter: language === 'auto' ? undefined : language,
+      fallbackReason: 'request',
+    };
   }
   const normalizedEnv = normalizeLanguageCandidate(envLanguage);
   if (normalizedEnv && SUPPORTED_TRANSCRIBE_LANGUAGES.has(normalizedEnv)) {
-    return { language: normalizedEnv as 'ja' | 'en', fallbackReason: 'env', invalidLanguageHint: normalizedHint && !SUPPORTED_TRANSCRIBE_LANGUAGES.has(normalizedHint) ? normalizedHint : undefined };
+    const language = normalizedEnv as 'ja' | 'en' | 'auto';
+    return {
+      language,
+      languageParameter: language === 'auto' ? undefined : language,
+      fallbackReason: 'env',
+      invalidLanguageHint: normalizedHint && !SUPPORTED_TRANSCRIBE_LANGUAGES.has(normalizedHint) ? normalizedHint : undefined,
+    };
   }
   return {
     language: 'ja',
+    languageParameter: 'ja',
     fallbackReason: 'default',
     invalidLanguageHint: normalizedHint && !SUPPORTED_TRANSCRIBE_LANGUAGES.has(normalizedHint) ? normalizedHint : undefined,
     invalidEnvLanguage: normalizedEnv && !SUPPORTED_TRANSCRIBE_LANGUAGES.has(normalizedEnv) ? normalizedEnv : undefined,
   };
+}
+
+function promptForLanguage(language: 'ja' | 'en' | 'auto'): string {
+  if (language === 'ja') return DEFAULT_JAPANESE_TRANSCRIBE_PROMPT;
+  if (language === 'en') return DEFAULT_ENGLISH_TRANSCRIBE_PROMPT;
+  return DEFAULT_AUTO_TRANSCRIBE_PROMPT;
 }
 
 function asSpeakerLabel(segment: DiarizedSegmentLike): string {
@@ -528,8 +552,9 @@ async function uploadPreparedChunk(env: Env, chunk: PreparedTranscriptionChunk, 
     form.append('response_format', 'diarized_json');
     form.append('chunking_strategy', 'auto');
   }
-  const language = options?.language || languageHint;
-  if (language) form.append('language', language);
+  const fallbackLanguage = languageHint === 'ja' || languageHint === 'en' ? languageHint : undefined;
+  const languageParameter = options ? options.languageParameter : fallbackLanguage;
+  if (languageParameter) form.append('language', languageParameter);
   if (!diarizationEnabled && options?.prompt) form.append('prompt', options.prompt);
   const response = await fetch(`${OPENAI_API}/audio/transcriptions`, { method: 'POST', headers: { authorization: `Bearer ${env.OPENAI_API_KEY}` }, body: form });
   if (!response.ok) {
@@ -541,13 +566,26 @@ async function uploadPreparedChunk(env: Env, chunk: PreparedTranscriptionChunk, 
   return mapTranscriptPayload((await response.json()) as OpenAiDiarizedTranscript);
 }
 
+function buildTranscriptionRequestLogMeta(env: Env, options: TranscribeOptions): Record<string, unknown> {
+  return {
+    model: env.OPENAI_MODEL_TRANSCRIBE
+      ?? (options.diarizationEnabled ? DEFAULT_DIARIZATION_MODEL : DEFAULT_STANDARD_TRANSCRIBE_MODEL),
+    responseFormat: options.diarizationEnabled ? 'diarized_json' : 'json',
+    chunkingStrategy: options.diarizationEnabled ? 'auto' : undefined,
+    diarizationEnabled: options.diarizationEnabled,
+    language: options.language,
+    languageParameter: options.languageParameter,
+    promptEnabled: Boolean(options.prompt),
+  };
+}
+
 async function transcribeChunkWithFallback(env: Env, source: Blob, sourceMeta: SourceAudioMetadata, plan: ChunkPlanEntry, languageHint: string | undefined, chunkGenerator: AudioChunkGenerator, uploadChunk: UploadChunkFn, context: Record<string, unknown>, options: TranscribeOptions): Promise<TranscriptResult> {
   let chunk = await validateChunk(await chunkGenerator(source, sourceMeta, plan, { preferredFormat: PRIMARY_AUDIO_FORMAT }));
   if (!chunk.validationPassed) {
     logEvent('error', 'chunk validation failed', { ...context, fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, strategy: chunk.strategy, extension: chunk.extension, originalMimeType: chunk.originalMimeType, normalizedMimeType: chunk.mimeType, validationErrors: chunk.validationErrors });
     throw new HttpError('chunk validation failed', 500, { fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, strategy: chunk.strategy, extension: chunk.extension, format: chunk.extension, originalMimeType: chunk.originalMimeType, normalizedMimeType: chunk.mimeType, validationErrors: chunk.validationErrors });
   }
-  logEvent('info', 'openai.transcription.chunk', { ...context, ...buildChunkLogMeta(sourceMeta, chunk) });
+  logEvent('info', 'openai.transcription.chunk', { ...context, ...buildChunkLogMeta(sourceMeta, chunk), ...buildTranscriptionRequestLogMeta(env, options) });
   try {
     return await uploadChunk(env, chunk, languageHint, options);
   } catch (error) {
@@ -558,9 +596,17 @@ async function transcribeChunkWithFallback(env: Env, source: Blob, sourceMeta: S
       logEvent('error', 'chunk validation failed', { ...context, fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, strategy: fallbackChunk.strategy, extension: fallbackChunk.extension, originalMimeType: fallbackChunk.originalMimeType, normalizedMimeType: fallbackChunk.mimeType, validationErrors: fallbackChunk.validationErrors });
       throw new HttpError('chunk validation failed', 500, { fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount, strategy: fallbackChunk.strategy, extension: fallbackChunk.extension, format: fallbackChunk.extension, originalMimeType: fallbackChunk.originalMimeType, normalizedMimeType: fallbackChunk.mimeType, validationErrors: fallbackChunk.validationErrors });
     }
-    logEvent('info', 'fallback wav upload started', { ...context, ...buildChunkLogMeta(sourceMeta, fallbackChunk) });
+    const fallbackOptions: TranscribeOptions = {
+      ...options,
+      language: 'auto',
+      languageParameter: undefined,
+      prompt: options.diarizationEnabled ? undefined : DEFAULT_AUTO_TRANSCRIBE_PROMPT,
+      requestedLanguageHint: 'auto',
+      languageFallbackReason: 'request',
+    };
+    logEvent('info', 'fallback wav upload started', { ...context, ...buildChunkLogMeta(sourceMeta, fallbackChunk), ...buildTranscriptionRequestLogMeta(env, fallbackOptions) });
     try {
-      const result = await uploadChunk(env, fallbackChunk, languageHint, options);
+      const result = await uploadChunk(env, fallbackChunk, 'auto', fallbackOptions);
       logEvent('info', 'fallback wav upload succeeded', { ...context, fileName: sourceMeta.fileName, chunkIndex: plan.chunkIndex + 1, chunkCount: plan.chunkCount });
       return result;
     } catch (fallbackError) {
@@ -601,7 +647,8 @@ export async function transcribeWithDiarization(env: Env, audio: Blob, fileName:
   const transcribeOptions: TranscribeOptions = {
     diarizationEnabled,
     language,
-    prompt: diarizationEnabled ? undefined : (language === 'ja' ? DEFAULT_JAPANESE_TRANSCRIBE_PROMPT : DEFAULT_ENGLISH_TRANSCRIBE_PROMPT),
+    languageParameter: resolvedLanguage.languageParameter,
+    prompt: diarizationEnabled ? undefined : promptForLanguage(language),
     requestedLanguageHint: languageHint,
     envLanguage: env.TRANSCRIBE_LANGUAGE,
     languageFallbackReason: resolvedLanguage.fallbackReason,
@@ -636,7 +683,7 @@ export async function transcribeWithDiarization(env: Env, audio: Blob, fileName:
       resolvedLanguage: language,
     });
   }
-  logEvent('info', 'openai.transcription.plan', { ...context, sourceDurationSec: sourceMeta.durationSec, sourceBytes: sourceMeta.bytes, chunkCount: plan.entries.length, targetChunkDurationSec: TARGET_CHUNK_DURATION_SEC, maxModelDurationSec: MAX_TRANSCRIBE_DURATION_SEC, primaryAudioFormat: PRIMARY_AUDIO_FORMAT, fallbackAudioFormat: FALLBACK_AUDIO_FORMAT, diarizationEnabled, requestLanguageHint: languageHint, envLanguage: env.TRANSCRIBE_LANGUAGE, resolvedLanguage: language, languageFallbackReason: resolvedLanguage.fallbackReason, promptEnabled: Boolean(transcribeOptions.prompt), model: env.OPENAI_MODEL_TRANSCRIBE ?? (diarizationEnabled ? DEFAULT_DIARIZATION_MODEL : DEFAULT_STANDARD_TRANSCRIBE_MODEL) });
+  logEvent('info', 'openai.transcription.plan', { ...context, sourceDurationSec: sourceMeta.durationSec, sourceBytes: sourceMeta.bytes, chunkCount: plan.entries.length, targetChunkDurationSec: TARGET_CHUNK_DURATION_SEC, maxModelDurationSec: MAX_TRANSCRIBE_DURATION_SEC, primaryAudioFormat: PRIMARY_AUDIO_FORMAT, fallbackAudioFormat: FALLBACK_AUDIO_FORMAT, requestLanguageHint: languageHint, envLanguage: env.TRANSCRIBE_LANGUAGE, resolvedLanguage: language, languageFallbackReason: resolvedLanguage.fallbackReason, ...buildTranscriptionRequestLogMeta(env, transcribeOptions) });
 
   if (!plan.requiresSplit) {
     const chunk = await validateChunk({ blob: audio, fileName, extension: sourceMeta.extension || extensionForFileName(fileName), mimeType: sourceMeta.mimeType, originalMimeType: sourceMeta.originalMimeType ?? sourceMeta.mimeType, bytes: sourceMeta.bytes, codec: sourceMeta.codec, container: sourceMeta.container, sampleRate: sourceMeta.sampleRate, channels: sourceMeta.channels, estimatedDurationSec: sourceMeta.durationSec ?? 0, actualDurationSec: sourceMeta.durationSec, strategy: 'single-original', validationPassed: false, validationErrors: [], chunkIndex: 0, chunkCount: 1, startOffsetMs: 0, endOffsetMs: Math.round((sourceMeta.durationSec ?? 0) * 1000) });
@@ -644,7 +691,7 @@ export async function transcribeWithDiarization(env: Env, audio: Blob, fileName:
       logEvent('error', 'chunk validation failed', { ...context, chunkIndex: 1, chunkCount: 1, strategy: chunk.strategy, extension: chunk.extension, originalMimeType: chunk.originalMimeType, normalizedMimeType: chunk.mimeType, validationErrors: chunk.validationErrors });
       throw new HttpError('chunk validation failed', 500, { fileName, chunkIndex: 1, chunkCount: 1, strategy: chunk.strategy, extension: chunk.extension, format: chunk.extension, originalMimeType: chunk.originalMimeType, normalizedMimeType: chunk.mimeType, validationErrors: chunk.validationErrors });
     }
-    logEvent('info', 'openai.transcription.chunk', { ...context, ...buildChunkLogMeta(sourceMeta, chunk) });
+    logEvent('info', 'openai.transcription.chunk', { ...context, ...buildChunkLogMeta(sourceMeta, chunk), ...buildTranscriptionRequestLogMeta(env, transcribeOptions) });
     return uploadChunk(env, chunk, languageHint, transcribeOptions);
   }
 

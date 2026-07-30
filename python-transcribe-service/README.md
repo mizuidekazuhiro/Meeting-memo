@@ -56,7 +56,12 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 - `decode -> trim -> re-encode`（m4a = AAC-LC、fallback 1回のみ wav）
 - 通常運用は `TRANSCRIBE_DIARIZATION_ENABLED=false` で `gpt-4o-transcribe` + `language=ja` + 日本語会議向けpromptを使用
 - 話者分離が必要な場合のみ `TRANSCRIBE_DIARIZATION_ENABLED=true` で `gpt-4o-transcribe-diarize` + `response_format=diarized_json` を使用
-- 言語は `request.languageHint`（`ja` / `en`）を最優先し、未指定または不正値時は `TRANSCRIBE_LANGUAGE`、それも不正/未設定なら `ja` にフォールバック
+- 言語は `request.languageHint`（`ja` / `en` / `auto`）を最優先し、未指定または不正値時は `TRANSCRIBE_LANGUAGE`、それも不正/未設定なら `ja` にフォールバック
+- 明示的な `request.languageHint=auto` は `TRANSCRIBE_LANGUAGE=ja` より優先し、OpenAIの `language` パラメータを省略する
+- AutoではEnglish、Indian English、Hindi、日本語名を含み得る混在言語promptを使い、実際に話された言語を維持する
+- 既定のchunk長は300秒。24 MB上限も単一chunkを返す前に判定する
+- M4A＋指定言語の品質が不十分ならWAV＋Autoで1回だけ再試行する
+- WAV再試行後も反復過多ならcallbackせず失敗し、低密度だけなら無音候補chunkとして除外する
 - diarization model 呼び出し時のみ `chunking_strategy` が必須（`DIARIZATION_CHUNKING_STRATEGY`）
 - OpenAI SDK 側で `Unexpected audio response format: diarized_json` warning が出ても、normalize 層で返却型差分を吸収して処理継続
 - chunkIndex 順に transcript を merge
