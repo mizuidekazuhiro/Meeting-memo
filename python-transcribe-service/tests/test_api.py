@@ -198,3 +198,44 @@ def test_callback_success_without_finalize_queued_not_completed(monkeypatch):
     assert body['overallStatus'] != 'completed'
     assert body['finalizeStatus'] == 'unknown_in_workers'
     assert body['status'] == 'callback_delivered'
+
+
+def test_hard_quality_failure_after_retry_prevents_callback_and_finalization(monkeypatch):
+    import main
+    from transcription_service import TranscriptionProcessingError
+
+    class FakeDropbox:
+        def download_file(self, dropbox_file_id, dropbox_path_lower):
+            return b'audio-bytes'
+
+    class QualityFailureService:
+        def process(self, job, source_bytes):
+            raise TranscriptionProcessingError(
+                'Transcript quality rejected after WAV Auto retry',
+                source='quality',
+                chunk_index=0,
+            )
+
+    callback_calls = []
+    monkeypatch.setattr(main, 'dropbox', FakeDropbox())
+    monkeypatch.setattr(main, 'service', QualityFailureService())
+    monkeypatch.setattr(
+        main,
+        'send_callback',
+        lambda payload, callback_url=None: callback_calls.append((payload, callback_url)),
+    )
+    main.job_states.clear()
+
+    job = main.TranscriptionJobRequest(
+        recordingId='rec-quality-failure',
+        dropboxFileId='id:quality-failure',
+        fileName='audio.m4a',
+    )
+    main._process_job_async(job)
+
+    state = main.job_states['rec-quality-failure']
+    assert callback_calls == []
+    assert state.status == 'failed'
+    assert state.transcription_status == 'failed'
+    assert state.finalize_status == 'skipped'
+    assert state.callback_status == 'failed'

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 
 MAX_TRANSCRIBE_DURATION_SEC = int(os.getenv('MAX_TRANSCRIBE_DURATION_SEC', '1400'))
-TARGET_CHUNK_DURATION_SEC = int(os.getenv('TARGET_CHUNK_DURATION_SEC', '720'))
+TARGET_CHUNK_DURATION_SEC = int(os.getenv('TARGET_CHUNK_DURATION_SEC', '300'))
 PRIMARY_AUDIO_FORMAT = os.getenv('PRIMARY_AUDIO_FORMAT', 'm4a')
 FALLBACK_AUDIO_FORMAT = os.getenv('FALLBACK_AUDIO_FORMAT', 'wav')
 ENABLE_AUDIO_FALLBACK = os.getenv('ENABLE_AUDIO_FALLBACK', 'true').lower() == 'true'

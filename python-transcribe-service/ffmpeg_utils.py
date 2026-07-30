@@ -8,6 +8,8 @@ from pathlib import Path
 
 from config import SETTINGS
 
+MAX_TRANSCRIPTION_BYTES = 24 * 1024 * 1024
+
 
 @dataclass
 class SourceMetadata:
@@ -44,12 +46,13 @@ def ffprobe_metadata(path: Path) -> SourceMetadata:
 
 
 def build_chunk_plan(duration_sec: float, source_bytes: int | None) -> list[ChunkPlanEntry]:
-    if duration_sec <= SETTINGS.max_transcribe_duration_sec:
+    effective_target_duration = min(SETTINGS.target_chunk_duration_sec, SETTINGS.max_transcribe_duration_sec)
+    by_duration = math.ceil(duration_sec / effective_target_duration)
+    by_size = math.ceil((source_bytes or 1) / MAX_TRANSCRIPTION_BYTES)
+    chunk_count = max(1, by_duration, by_size)
+    if chunk_count == 1:
         return [ChunkPlanEntry(0, 1, 0, math.ceil(duration_sec * 1000), duration_sec)]
 
-    by_duration = math.ceil(duration_sec / SETTINGS.target_chunk_duration_sec)
-    by_size = math.ceil((source_bytes or 1) / (24 * 1024 * 1024))
-    chunk_count = max(1, by_duration, by_size)
     duration_ms = math.ceil(duration_sec * 1000)
     plan: list[ChunkPlanEntry] = []
     for idx in range(chunk_count):
@@ -63,7 +66,7 @@ def run_ffmpeg_chunk(source: Path, output: Path, start_offset_sec: float, durati
     if fmt == 'm4a':
         args = ['-vn', '-c:a', 'aac', '-profile:a', 'aac_low', '-b:a', '128k', '-movflags', '+faststart']
     elif fmt == 'wav':
-        args = ['-vn', '-c:a', 'pcm_s16le']
+        args = ['-vn', '-c:a', 'pcm_s16le', '-ar', '16000', '-ac', '1']
     else:
         raise RuntimeError(f'Unsupported audio format: {fmt}')
     cmd = [SETTINGS.ffmpeg_path, '-y', '-ss', str(start_offset_sec), '-i', str(source), '-t', str(duration_sec), *args, str(output)]
@@ -73,6 +76,8 @@ def run_ffmpeg_chunk(source: Path, output: Path, start_offset_sec: float, durati
 def validate_chunk(path: Path, expected_ext: str) -> tuple[bool, dict[str, object]]:
     if not path.exists() or path.stat().st_size <= 0:
         return False, {'error': 'bytes must be > 0'}
+    if path.stat().st_size > MAX_TRANSCRIPTION_BYTES:
+        return False, {'error': 'bytes must be <= 24 MB', 'bytes': path.stat().st_size}
     meta = ffprobe_metadata(path)
     if meta.duration_sec <= 0:
         return False, {'error': 'duration must be > 0'}

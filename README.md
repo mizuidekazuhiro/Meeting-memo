@@ -138,10 +138,11 @@ TRANSCRIBE_LANGUAGE=ja
 
 - 通常運用では `TRANSCRIBE_DIARIZATION_ENABLED=false` を推奨
 - iPhoneショートカットから `languageHint` を送る場合、優先順位は `request.languageHint` → `TRANSCRIBE_LANGUAGE` → `ja`
+- `languageHint: "auto"` は明示指定として最優先され、OpenAIの `language` パラメータを送信しない（`TRANSCRIBE_LANGUAGE=ja` へ戻さない）
 - 話者分離は誤変換・英語混入・発話断片化を増やす場合がある
 - 面談メモ品質を優先する場合は話者分離OFF
 - 1対1面談など話者区別が重要な場合のみ `true` にする
-- 日本語会議は `languageHint: \"ja\"`、英語会議は `languageHint: \"en\"` を推奨
+- 日本語会議は `languageHint: "ja"`、英語会議は `languageHint: "en"`、英語・Indian English・Hindiの混在は `languageHint: "auto"` を推奨
 
 ### iPhoneショートカット送信例
 
@@ -151,6 +152,10 @@ TRANSCRIBE_LANGUAGE=ja
 
 ```json
 { "languageHint": "en" }
+```
+
+```json
+{ "languageHint": "auto" }
 ```
 
 ### Workers 側
@@ -261,6 +266,8 @@ Workers に下記 env を設定します。
 - `FFPROBE_PATH`
 - `TMP_DIR`
 - `DIARIZATION_CHUNKING_STRATEGY`（diarization transcription 呼び出し時に必須）
+
+文字起こしは既定300秒単位で分割し、各chunkをM4A＋指定言語で処理します。反復過多または文字密度不足を検知した場合は、WAV＋Autoで1回だけ再試行します。再試行後も反復過多ならcallbackせず失敗とし、低密度だけなら無音候補chunkとして除外します。
 
 ---
 

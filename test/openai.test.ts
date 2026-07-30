@@ -34,7 +34,7 @@ function makeFtypM4aBlob(mimeType: string): Blob {
 }
 
 test('sourceDurationSec below threshold does not split', () => {
-  const plan = createChunkPlan(600, 1024);
+  const plan = createChunkPlan(300, 1024);
   assert.equal(plan.requiresSplit, false);
   assert.equal(plan.entries.length, 1);
 });
@@ -42,16 +42,33 @@ test('sourceDurationSec below threshold does not split', () => {
 test('sourceDurationSec above threshold creates multiple chunks', () => {
   const plan = createChunkPlan(1800, 1024);
   assert.equal(plan.requiresSplit, true);
-  assert.equal(plan.entries.length, 3);
+  assert.equal(plan.entries.length, 6);
 });
 
 test('chunk plan start/end offsets are ordered correctly', () => {
   const plan = createChunkPlan(1800, 1024);
   assert.deepEqual(plan.entries.map(({ startOffsetMs, endOffsetMs }) => [startOffsetMs, endOffsetMs]), [
-    [0, 600000],
-    [600000, 1200000],
-    [1200000, 1800000],
+    [0, 300000],
+    [300000, 600000],
+    [600000, 900000],
+    [900000, 1200000],
+    [1200000, 1500000],
+    [1500000, 1800000],
   ]);
+});
+
+test('1000 seconds is split into four chunks at the 300 second target', () => {
+  const plan = createChunkPlan(1000, 1024);
+
+  assert.equal(plan.requiresSplit, true);
+  assert.equal(plan.entries.length, 4);
+});
+
+test('chunk plan respects the 24 MB size limit', () => {
+  const plan = createChunkPlan(120, 24 * 1024 * 1024 + 1);
+
+  assert.equal(plan.requiresSplit, true);
+  assert.equal(plan.entries.length, 2);
 });
 
 test('invalid empty chunk is rejected by validation', async () => {
@@ -274,7 +291,7 @@ test('mime fallback logging includes fallback metadata', async () => {
 
 test('m4a failure triggers one wav fallback and succeeds', async () => {
   const calls: string[] = [];
-  const source = makeTestWav(1440);
+  const source = makeTestWav(600);
   const result = await transcribeWithDiarization(env, source, 'meeting.wav', undefined, {
     chunkGenerator: async (_source, _meta, plan, options) => ({
       blob: new Blob([new Uint8Array([1,2,3])], { type: options.preferredFormat === 'm4a' ? 'audio/mp4' : 'audio/wav' }),
@@ -286,8 +303,8 @@ test('m4a failure triggers one wav fallback and succeeds', async () => {
       container: options.preferredFormat === 'm4a' ? 'm4a' : 'wav',
       sampleRate: 16000,
       channels: 1,
-      estimatedDurationSec: 720,
-      actualDurationSec: 720,
+      estimatedDurationSec: 300,
+      actualDurationSec: 300,
       strategy: options.preferredFormat === 'm4a' ? 'reencoded-aac-m4a' : 'fallback-pcm-wav',
       validationPassed: false,
       validationErrors: [],
@@ -296,9 +313,14 @@ test('m4a failure triggers one wav fallback and succeeds', async () => {
       startOffsetMs: plan.startOffsetMs,
       endOffsetMs: plan.endOffsetMs,
     }),
-    uploadChunk: async (_env, chunk) => {
+    uploadChunk: async (_env, chunk, hint, options) => {
       calls.push(chunk.extension);
       if (calls.length === 1) throw new HttpError('OpenAI transcription request failed.', 502, { responseStatus: 400, responseText: 'Audio file might be corrupted or unsupported', param: 'file' });
+      if (chunk.extension === '.wav') {
+        assert.equal(hint, 'auto');
+        assert.equal(options?.language, 'auto');
+        assert.equal(options?.languageParameter, undefined);
+      }
       return { fullText: 'ok', segments: [{ speaker: 'spk1', startMs: 0, endMs: 1000, text: 'ok' }], raw: { ok: true } };
     },
   });
@@ -314,7 +336,7 @@ test('fallback runs only once and surfaces final error', async () => {
         blob: new Blob([new Uint8Array([1,2,3])]), fileName: `meeting.part-${plan.chunkIndex + 1}${options.preferredFormat === 'm4a' ? '.m4a' : '.wav'}`,
         extension: options.preferredFormat === 'm4a' ? '.m4a' : '.wav', mimeType: options.preferredFormat === 'm4a' ? 'audio/mp4' : 'audio/wav', bytes: 3,
         codec: options.preferredFormat === 'm4a' ? 'aac-lc' : 'pcm_s16le', container: options.preferredFormat === 'm4a' ? 'm4a' : 'wav', sampleRate: 16000, channels: 1,
-        estimatedDurationSec: 720, actualDurationSec: 720, strategy: options.preferredFormat === 'm4a' ? 'reencoded-aac-m4a' : 'fallback-pcm-wav',
+        estimatedDurationSec: 300, actualDurationSec: 300, strategy: options.preferredFormat === 'm4a' ? 'reencoded-aac-m4a' : 'fallback-pcm-wav',
         validationPassed: false, validationErrors: [], chunkIndex: plan.chunkIndex, chunkCount: plan.chunkCount, startOffsetMs: plan.startOffsetMs, endOffsetMs: plan.endOffsetMs,
       }),
       uploadChunk: async () => { throw new HttpError('OpenAI transcription request failed.', 502, { responseStatus: 400, responseText: 'Audio file might be corrupted or unsupported', param: 'file' }); },
@@ -482,9 +504,66 @@ test('language resolution falls back to env then default ja on invalid inputs', 
   const envFallback = resolveTranscriptionLanguage('english', 'en');
   assert.equal(envFallback.language, 'en');
   assert.equal(envFallback.fallbackReason, 'env');
-  const defaultFallback = resolveTranscriptionLanguage('jp', 'auto');
+  const autoFallback = resolveTranscriptionLanguage('jp', 'auto');
+  assert.equal(autoFallback.language, 'auto');
+  assert.equal(autoFallback.languageParameter, undefined);
+  assert.equal(autoFallback.fallbackReason, 'env');
+  assert.equal(autoFallback.invalidLanguageHint, 'jp');
+  const defaultFallback = resolveTranscriptionLanguage('jp', 'unsupported');
   assert.equal(defaultFallback.language, 'ja');
   assert.equal(defaultFallback.fallbackReason, 'default');
   assert.equal(defaultFallback.invalidLanguageHint, 'jp');
-  assert.equal(defaultFallback.invalidEnvLanguage, 'auto');
+  assert.equal(defaultFallback.invalidEnvLanguage, 'unsupported');
+});
+
+test('explicit Auto overrides TRANSCRIBE_LANGUAGE=ja and omits OpenAI language parameter', async () => {
+  const originalFetch = global.fetch;
+  let form: FormData | undefined;
+  global.fetch = (async (_input: string, init?: RequestInit) => {
+    form = init?.body as FormData;
+    return new Response(JSON.stringify({ text: 'The multilingual meeting transcript is available.' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }) as any;
+
+  try {
+    await transcribeWithDiarization(
+      { OPENAI_API_KEY: 'test', TRANSCRIBE_LANGUAGE: 'ja', TRANSCRIBE_DIARIZATION_ENABLED: 'false' } as any,
+      makeTestWav(60),
+      'meeting.wav',
+      'auto',
+    );
+  } finally {
+    global.fetch = originalFetch;
+  }
+
+  assert.ok(form);
+  assert.equal(form?.has('language'), false);
+  assert.match(String(form?.get('prompt')), /English, Indian English, Hindi, and Japanese names/);
+  assert.match(String(form?.get('prompt')), /Preserve the language actually spoken/);
+  assert.match(String(form?.get('prompt')), /Do not force all speech into English/);
+  assert.match(String(form?.get('prompt')), /Do not invent, guess, or repeat unclear content/);
+});
+
+test('EN and JA still send the correct OpenAI language parameter', async () => {
+  const originalFetch = global.fetch;
+  const sentLanguages: Array<string | null> = [];
+  global.fetch = (async (_input: string, init?: RequestInit) => {
+    const form = init?.body as FormData;
+    sentLanguages.push(form.get('language') as string | null);
+    return new Response(JSON.stringify({ text: 'A sufficiently clear transcription result.' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }) as any;
+
+  try {
+    await transcribeWithDiarization({ OPENAI_API_KEY: 'test', TRANSCRIBE_LANGUAGE: 'auto' } as any, makeTestWav(60), 'en.wav', 'en');
+    await transcribeWithDiarization({ OPENAI_API_KEY: 'test', TRANSCRIBE_LANGUAGE: 'auto' } as any, makeTestWav(60), 'ja.wav', 'ja');
+  } finally {
+    global.fetch = originalFetch;
+  }
+
+  assert.deepEqual(sentLanguages, ['en', 'ja']);
 });

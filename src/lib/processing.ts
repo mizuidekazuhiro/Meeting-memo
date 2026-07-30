@@ -73,7 +73,7 @@ function removeEnglishNoise(text: string): { cleanedText: string; removedCount: 
   return { cleanedText: next.replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim(), removedCount };
 }
 
-export function sanitizeTranscriptForMemo(transcript: TranscriptResult, language: 'ja' | 'en' = 'ja'): { transcript: TranscriptResult; noiseRemovedCount: number } {
+export function sanitizeTranscriptForMemo(transcript: TranscriptResult, language: 'ja' | 'en' | 'auto' = 'ja'): { transcript: TranscriptResult; noiseRemovedCount: number } {
   const shouldRemoveEnglishNoise = language === 'ja';
   if (transcript.segments.length === 0) {
     const base = removeSpeakerLabel(transcript.fullText);
