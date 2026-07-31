@@ -1,298 +1,25 @@
 import type { Env } from '../types';
 import { HttpError } from './http';
+import { logEvent } from './logger';
+import * as base from './gmail-base';
 
-interface MailConfig {
-  from: string;
-  password: string;
-  to: string[];
-  cc: string[];
-  bcc: string[];
-  smtpHost: string;
-  smtpPort: number;
+export * from './gmail-base';
+
+export interface TextAttachment {
+  fileName: string;
+  content: string;
 }
 
 interface CompletionEmailInput {
   notionPageUrl: string;
   transcriptFileUrl?: string;
+  transcriptAttachment?: TextAttachment;
   finalMemo: string;
   sourceUrls: Array<string | Record<string, unknown>>;
   myTasks: Array<{ taskText: string; chooseUrl?: string }>;
 }
 
-export interface FailureEmailInput {
-  fileName: string;
-  recordingId: string;
-  failureStage: string;
-  humanReadableReasonJa: string;
-  technicalErrorMessage: string;
-  failedChunkIndex?: number | null;
-  processingSeconds: number;
-  qualityReasons?: string[] | null;
-  qualityMetrics?: Record<string, unknown> | null;
-}
-
-const FAILURE_REASON_JA_BY_STAGE: Readonly<Record<string, string>> = {
-  dropbox_download: 'Dropboxから録音ファイルを取得できませんでした。',
-  ffmpeg_chunk_validation: '録音ファイルの変換、分割、または分割後の音声検証に失敗しました。',
-  openai_transcription: 'OpenAIによる文字起こし処理に失敗しました。',
-  transcript_quality: 'WAV形式で再試行した後も、文字起こし結果が品質基準を満たしませんでした。',
-  wav_retry: 'WAV形式・言語自動判定での再試行に失敗しました。',
-  merged_transcript: '結合後の文字起こしが構造上の最低品質基準を満たしませんでした。',
-  transcription_unhandled: '文字起こし処理中に予期しないエラーが発生しました。',
-};
-
-export function getFailureReasonJa(failureStage: string): string {
-  return FAILURE_REASON_JA_BY_STAGE[failureStage]
-    ?? '文字起こし処理を完了できませんでした。';
-}
-
-function isEnabled(value: string | undefined): boolean {
-  return value?.toLowerCase() === 'true';
-}
-
-function hasValue(value: string | undefined): boolean {
-  return Boolean(value?.trim());
-}
-
-function escapeHtml(value: string): string {
-  return value.replace(/[&<>"']/g, (matched) => {
-    switch (matched) {
-      case '&':
-        return '&amp;';
-      case '<':
-        return '&lt;';
-      case '>':
-        return '&gt;';
-      case '"':
-        return '&quot;';
-      case '\'':
-        return '&#39;';
-      default:
-        return matched;
-    }
-  });
-}
-
-const MEMO_TITLE_PATTERNS: RegExp[] = [
-  /^完成版\s*面談メモ$/i,
-  /^面談メモ（完成版）$/i,
-  /^#\s*完成版\s*面談メモ$/i,
-  /^##\s*完成版\s*面談メモ$/i,
-  /^#\s*面談メモ（完成版）$/i,
-  /^##\s*面談メモ（完成版）$/i,
-];
-
-function normalizeTaskTextForEmail(value: string): string {
-  return value
-    .replace(/\r\n/g, '\n')
-    .replace(/^\s*(?:[-*・]|\d+[.)]?)\s+/, '')
-    .trim();
-}
-
-function linkifyEscapedText(escaped: string): string {
-  return escaped.replace(/(https?:\/\/[^\s<]+)/g, (url) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`);
-}
-
-function renderInlineMarkdown(value: string): string {
-  if (!value) return '';
-  const segments: Array<{ text: string; bold: boolean }> = [];
-  const pattern = /\*\*(.+?)\*\*/g;
-  let cursor = 0;
-  for (let match = pattern.exec(value); match; match = pattern.exec(value)) {
-    if (match.index > cursor) {
-      segments.push({ text: value.slice(cursor, match.index), bold: false });
-    }
-    segments.push({ text: match[1], bold: true });
-    cursor = match.index + match[0].length;
-  }
-  if (cursor < value.length) {
-    segments.push({ text: value.slice(cursor), bold: false });
-  }
-  const normalized = segments.length ? segments : [{ text: value, bold: false }];
-  return normalized.map((segment) => {
-    const linked = linkifyEscapedText(escapeHtml(segment.text));
-    return segment.bold ? `<strong>${linked}</strong>` : linked;
-  }).join('');
-}
-
-function stripLeadingMemoTitle(value: string): string {
-  const lines = value.replace(/\r\n/g, '\n').split('\n');
-  let cursor = 0;
-  while (cursor < lines.length && lines[cursor].trim().length === 0) cursor += 1;
-  if (cursor < lines.length && MEMO_TITLE_PATTERNS.some((pattern) => pattern.test(lines[cursor].trim()))) {
-    lines.splice(cursor, 1);
-  }
-  return lines.join('\n').trim();
-}
-
-function renderFinalMemoHtml(markdown: string): string {
-  const source = stripLeadingMemoTitle(markdown ?? '');
-  if (!source) return '<p style="margin:0;">（内容なし）</p>';
-  const lines = source.replace(/\r\n/g, '\n').split('\n');
-  const html: string[] = [];
-  let index = 0;
-
-  const isBulletLine = (value: string): boolean => /^(?:[-*]\s+|・\s*)/.test(value);
-  const orderedMatch = (value: string): RegExpMatchArray | null => value.match(/^(\d+)[.)]\s+(.+)$/);
-  const headingFromNumberLine = (value: string): RegExpMatchArray | null => value.match(/^(\d+)[.)]\s*(.+)$/);
-  const splitMarkdownTableRow = (value: string): string[] => value.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((cell) => cell.trim());
-  const isMarkdownTableSeparatorRow = (value: string): boolean => {
-    const cells = splitMarkdownTableRow(value);
-    return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
-  };
-
-  while (index < lines.length) {
-    const line = lines[index].trim();
-    if (!line) {
-      index += 1;
-      continue;
-    }
-    if (/^---+$/.test(line)) {
-      index += 1;
-      continue;
-    }
-    if (line.startsWith('|') && isMarkdownTableSeparatorRow(lines[index + 1]?.trim() ?? '')) {
-      const headerCells = splitMarkdownTableRow(line);
-      const bodyRows: string[][] = [];
-      index += 2;
-      while (index < lines.length) {
-        const rowLine = lines[index].trim();
-        if (!rowLine.startsWith('|')) break;
-        bodyRows.push(splitMarkdownTableRow(rowLine));
-        index += 1;
-      }
-      const tableHeader = headerCells.map((cell) => `<th style="border:1px solid #ddd;padding:8px;text-align:left;white-space:nowrap;">${renderInlineMarkdown(cell)}</th>`).join('');
-      const tableBody = bodyRows.map((row) => `<tr>${headerCells.map((_, idx) => `<td style="border:1px solid #ddd;padding:8px;vertical-align:top;word-break:break-word;">${renderInlineMarkdown(row[idx] || (idx === 2 || idx === 3 ? '不明' : ''))}</td>`).join('')}</tr>`).join('');
-      html.push(`<table style="border-collapse:collapse;width:100%;font-family:'Yu Gothic UI','Yu Gothic',Meiryo,sans-serif;font-size:14px;line-height:1.6;margin:10px 0 14px 0;"><thead><tr>${tableHeader}</tr></thead><tbody>${tableBody}</tbody></table>`);
-      continue;
-    }
-    const heading = line.match(/^#{1,3}\s+(.+)$/);
-    if (heading) {
-      const level = line.startsWith('###') ? 'h4' : line.startsWith('##') ? 'h3' : 'h2';
-      html.push(`<${level} style="margin:20px 0 8px 0;font-size:${level === 'h2' ? '19px' : level === 'h3' ? '17px' : '16px'};line-height:1.5;font-weight:700;">${renderInlineMarkdown(heading[1].trim())}</${level}>`);
-      index += 1;
-      continue;
-    }
-    if (isBulletLine(line)) {
-      const items: string[] = [];
-      while (index < lines.length) {
-        const listLine = lines[index].trim();
-        const listMatch = listLine.match(/^(?:[-*]\s+|・\s*)(.+)$/);
-        if (!listMatch) break;
-        items.push(`<li style="margin:6px 0;">${renderInlineMarkdown(listMatch[1].trim())}</li>`);
-        index += 1;
-      }
-      html.push(`<ul style="margin:10px 0 14px 0;padding-left:20px;">${items.join('')}</ul>`);
-      continue;
-    }
-    const orderedStart = orderedMatch(line);
-    if (orderedStart) {
-      let probe = index;
-      let consecutiveOrderedCount = 0;
-      while (probe < lines.length && orderedMatch(lines[probe].trim())) {
-        consecutiveOrderedCount += 1;
-        probe += 1;
-      }
-      if (consecutiveOrderedCount >= 2) {
-        const items: string[] = [];
-        while (index < lines.length) {
-          const orderedLine = lines[index].trim();
-          const listMatch = orderedMatch(orderedLine);
-          if (!listMatch) break;
-          items.push(`<li style="margin:6px 0;">${renderInlineMarkdown(listMatch[2].trim())}</li>`);
-          index += 1;
-        }
-        html.push(`<ol style="margin:10px 0 14px 0;padding-left:22px;">${items.join('')}</ol>`);
-        continue;
-      }
-    }
-    const numberedHeading = headingFromNumberLine(line);
-    if (numberedHeading) {
-      html.push(`<h3 style="font-size:16px;margin:18px 0 10px 0;line-height:1.6;font-weight:600;">${renderInlineMarkdown(`${numberedHeading[1]}. ${numberedHeading[2].trim()}`)}</h3>`);
-      index += 1;
-      continue;
-    }
-    if (orderedStart) {
-      const items: string[] = [];
-      while (index < lines.length) {
-        const orderedLine = lines[index].trim();
-        const listMatch = orderedMatch(orderedLine);
-        if (!listMatch) break;
-        items.push(`<li style="margin:6px 0;">${renderInlineMarkdown(listMatch[2].trim())}</li>`);
-        index += 1;
-      }
-      html.push(`<ol style="margin:10px 0 14px 0;padding-left:22px;">${items.join('')}</ol>`);
-      continue;
-    }
-
-    const paragraphLines: string[] = [];
-    while (index < lines.length) {
-      const textLine = lines[index].trim();
-      if (!textLine || /^#{1,3}\s+/.test(textLine) || isBulletLine(textLine) || orderedMatch(textLine) || headingFromNumberLine(textLine)) break;
-      paragraphLines.push(renderInlineMarkdown(textLine));
-      index += 1;
-    }
-    html.push(`<p style="margin:0 0 12px 0;line-height:1.8;">${paragraphLines.join('<br />')}</p>`);
-  }
-
-  return html.join('');
-}
-
-function normalizeUrl(value: unknown): string | null {
-  if (typeof value !== 'string') return null;
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  if (/^javascript:/i.test(trimmed)) return null;
-  try {
-    const parsed = new URL(trimmed);
-    if (!['http:', 'https:'].includes(parsed.protocol)) return null;
-    return parsed.toString();
-  } catch {
-    return null;
-  }
-}
-
-function guessTitleFromUrl(url: string): string {
-  try {
-    const parsed = new URL(url);
-    const pathTail = parsed.pathname.split('/').filter(Boolean).pop();
-    if (pathTail) {
-      return decodeURIComponent(pathTail).replace(/[-_]+/g, ' ').slice(0, 80);
-    }
-    return parsed.hostname.replace(/^www\./, '');
-  } catch {
-    return '';
-  }
-}
-
-function getSourceTitle(source: Record<string, unknown> | undefined, fallbackUrl: string, index: number): string {
-  if (source) {
-    const keys = ['title', 'headline', 'name', 'source_title', 'file_name'];
-    for (const key of keys) {
-      const value = source[key];
-      if (typeof value === 'string' && value.trim()) return value.trim();
-    }
-  }
-  return guessTitleFromUrl(fallbackUrl) || `参考資料 ${index + 1}`;
-}
-
-function buildSourceLinks(sourceInput: Array<string | Record<string, unknown>>, notionPageUrl: string): string {
-  const normalizedNotionUrl = normalizeUrl(notionPageUrl);
-  const seen = new Set<string>();
-  const items: string[] = [];
-  for (const entry of sourceInput) {
-    const source = typeof entry === 'string' ? { url: entry } : entry;
-    const url = normalizeUrl(source?.url ?? source?.link ?? source?.source_url ?? source?.href);
-    if (!url) continue;
-    if (normalizedNotionUrl && url === normalizedNotionUrl) continue;
-    if (/notion\.so/i.test(url)) continue;
-    if (seen.has(url)) continue;
-    seen.add(url);
-    const title = getSourceTitle(source, url, items.length);
-    items.push(`<li style="margin:0 0 8px 0;"><a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(title)}</a></li>`);
-  }
-  return items.join('');
-}
+type MailConfig = ReturnType<typeof base.getCompletionEmailConfig>;
 
 function toBase64(content: string): string {
   const utf8 = new TextEncoder().encode(content);
@@ -303,211 +30,126 @@ function toBase64(content: string): string {
   return btoa(binary);
 }
 
-function parseRecipientList(value: string | undefined): string[] {
-  if (!value) return [];
-  return value
-    .split(/[\n,;]+/)
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
+function wrapBase64(value: string): string {
+  return value.match(/.{1,76}/g)?.join('\r\n') ?? '';
 }
 
-function parsePort(value: string | undefined, fallback: number): number {
-  if (!value) return fallback;
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 65535) return fallback;
-  return parsed;
+function sanitizeAttachmentFileName(value: string): string {
+  const normalized = value
+    .normalize('NFKC')
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .trim();
+  const baseName = normalized || 'meeting-transcript.txt';
+  return /\.txt$/i.test(baseName) ? baseName : `${baseName}.txt`;
 }
 
-function uniqueRecipients(recipients: string[]): string[] {
-  const seen = new Set<string>();
-  const unique: string[] = [];
-  for (const recipient of recipients) {
-    const key = recipient.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    unique.push(recipient);
+function asciiAttachmentFileName(value: string): string {
+  const ascii = value.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
+  return ascii || 'meeting-transcript.txt';
+}
+
+function buildCommonHeaders(input: { to: string[]; cc?: string[]; from: string; subject: string }): string[] {
+  const lines = [
+    `From: ${input.from}`,
+    `To: ${input.to.join(', ')}`,
+  ];
+  if (input.cc && input.cc.length > 0) {
+    lines.push(`Cc: ${input.cc.join(', ')}`);
   }
-  return unique;
+  lines.push(`Subject: ${input.subject}`, 'MIME-Version: 1.0');
+  return lines;
 }
 
-export function getCompletionEmailConfig(env: Env): MailConfig {
-  const from = env.MAIL_FROM?.trim() ?? '';
-  const password = env.MAIL_PASSWORD?.trim() ?? '';
-  const to = parseRecipientList(env.MAIL_TO);
-
-  if (!from || !password || to.length === 0) {
-    throw new HttpError('SMTP mail envs are missing. Required: MAIL_FROM, MAIL_PASSWORD, MAIL_TO.', 500);
+function extractHtmlBody(message: string): string {
+  const separator = '\r\n\r\n';
+  const index = message.indexOf(separator);
+  if (index < 0) {
+    throw new HttpError('Completion email message is missing the MIME body separator.', 500);
   }
-
-  return {
-    from,
-    password,
-    to,
-    cc: parseRecipientList(env.MAIL_CC),
-    bcc: parseRecipientList(env.MAIL_BCC),
-    smtpHost: env.SMTP_HOST?.trim() || 'smtp.gmail.com',
-    smtpPort: parsePort(env.SMTP_PORT, 587),
-  };
+  return message.slice(index + separator.length);
 }
 
-function buildCompletionEmailHtml(input: CompletionEmailInput): string {
-  const finalMemoHtml = renderFinalMemoHtml(input.finalMemo ?? '');
-  const sourceUrlsInput = Array.isArray(input.sourceUrls) ? input.sourceUrls : [];
-  const myTasksHtml = input.myTasks.length
-    ? `<div style="display:flex;flex-direction:column;gap:10px;">${input.myTasks.map((task) => {
-      const buttonHtml = task.chooseUrl
-        ? `<div style="margin-top:8px;"><a href="${escapeHtml(task.chooseUrl)}" target="_blank" rel="noopener noreferrer" style="display:inline-block;padding:6px 10px;border-radius:6px;background:#2563eb;color:#ffffff;text-decoration:none;font-size:13px;">処理を選ぶ</a></div>`
-        : '';
-      return `<div style="border:1px solid #d0d7de;border-radius:8px;padding:12px 14px;background:#ffffff;"><p style="margin:0 0 8px 0;font-weight:600;line-height:1.7;">${escapeHtml(normalizeTaskTextForEmail(task.taskText))}</p>${buttonHtml}</div>`;
-    }).join('')}</div>`
-    : '';
-  const notionPageUrl = escapeHtml(input.notionPageUrl);
-  const sourceUrls = buildSourceLinks(sourceUrlsInput, input.notionPageUrl);
-  const sourceSection = `<h2 style="font-size:18px;margin:24px 0 12px 0;padding-bottom:6px;border-bottom:1px solid #d0d7de;">参考リンク</h2>${sourceUrls ? `<ul style="padding-left:20px;margin:0;">${sourceUrls}</ul>` : '<p style="margin:0;">（参考リンクなし）</p>'}`;
-  const myTasksSection = input.myTasks.length
-    ? `<h2 style="font-size:18px;margin:24px 0 12px 0;padding-bottom:6px;border-bottom:1px solid #d0d7de;">次アクション</h2>${myTasksHtml}<h2 style="font-size:18px;margin:24px 0 12px 0;padding-bottom:6px;border-bottom:1px solid #d0d7de;">タスク処理を選ぶ</h2><p style="margin:0 0 10px 0;">各アクションの「処理を選ぶ」から処理先を選択できます。</p>`
-    : '';
-  const notionSection = `<h2 style="font-size:18px;margin:24px 0 12px 0;padding-bottom:6px;border-bottom:1px solid #d0d7de;">Notionで補足確認</h2><p style="margin:0 0 12px 0;"><a href="${notionPageUrl}" target="_blank" rel="noopener noreferrer">Notion ページを開く</a></p>`;
+function buildMultipartCompletionMessage(
+  input: CompletionEmailInput & { to: string[]; cc?: string[]; from: string; subject: string },
+  html: string,
+  attachment: TextAttachment,
+): string {
+  const randomPart = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const boundary = `----=_MeetingMemo_${randomPart}`;
+  const fileName = sanitizeAttachmentFileName(attachment.fileName);
+  const asciiFileName = asciiAttachmentFileName(fileName);
+  const headers = buildCommonHeaders(input);
+  headers.push(`Content-Type: multipart/mixed; boundary="${boundary}"`, '');
 
-  return `<!DOCTYPE html>
-<html lang="ja">
-  <body style="margin:0;padding:0;background:#f8fafc;font-family:'Yu Gothic UI','Yu Gothic',Meiryo,Arial,sans-serif;font-size:15px;line-height:1.7;color:#1f2933;">
-    <div style="max-width:880px;margin:0 auto;padding:24px;">
-      <div style="background:#ffffff;border-radius:12px;padding:20px;">
-        <h2 style="font-size:18px;margin:0 0 12px 0;padding-bottom:6px;border-bottom:1px solid #d0d7de;">Meeting Memo作成完了</h2>
-        <p style="margin:0 0 12px 0;">Interview Memo の文字起こしと要約が完了しました。</p>
-        <p style="margin:0 0 12px 0;">
-          Notion ページ：
-          <a href="${notionPageUrl}" target="_blank" rel="noopener noreferrer">Notion ページを開く</a>
-        </p>
-        ${input.transcriptFileUrl ? `<p style="margin:0 0 12px 0;">Transcript全文リンク：<a href="${escapeHtml(input.transcriptFileUrl)}" target="_blank" rel="noopener noreferrer">Transcript全文リンク</a></p>` : ''}
-        <h2 style="font-size:18px;margin:24px 0 12px 0;padding-bottom:6px;border-bottom:1px solid #d0d7de;">完成版 面談メモ</h2>
-        <div style="background:#ffffff;border:1px solid #d0d7de;border-radius:10px;padding:14px 14px 10px 14px;">${finalMemoHtml}</div>
-        ${myTasksSection}
-        ${sourceSection}
-        ${notionSection}
-      </div>
-    </div>
-  </body>
-</html>`;
-}
+  const parts = [
+    `--${boundary}`,
+    'Content-Type: text/html; charset=UTF-8',
+    'Content-Transfer-Encoding: 8bit',
+    '',
+    html,
+    `--${boundary}`,
+    `Content-Type: text/plain; charset=UTF-8; name="${asciiFileName}"`,
+    'Content-Transfer-Encoding: base64',
+    `Content-Disposition: attachment; filename="${asciiFileName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+    '',
+    wrapBase64(toBase64(attachment.content)),
+    `--${boundary}--`,
+    '',
+  ];
 
-function formatFailureMetricValue(value: unknown): string {
-  if (value === null || value === undefined) return '不明';
-  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
-    return String(value);
-  }
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
-}
-
-function buildFailureEmailHtml(input: FailureEmailInput): string {
-  const metrics = input.qualityMetrics && typeof input.qualityMetrics === 'object'
-    ? Object.entries(input.qualityMetrics)
-    : [];
-  const metricsHtml = metrics.length
-    ? `<table style="border-collapse:collapse;width:100%;margin:8px 0 16px 0;"><tbody>${metrics.map(([key, value]) => (
-      `<tr><th style="border:1px solid #d0d7de;padding:7px;text-align:left;background:#f6f8fa;">${escapeHtml(key)}</th><td style="border:1px solid #d0d7de;padding:7px;">${escapeHtml(formatFailureMetricValue(value))}</td></tr>`
-    )).join('')}</tbody></table>`
-    : '<p style="margin:0 0 16px 0;">（品質指標なし）</p>';
-  const qualityReasons = input.qualityReasons?.length
-    ? input.qualityReasons.join(', ')
-    : 'なし';
-  const failedChunk = input.failedChunkIndex === null || input.failedChunkIndex === undefined
-    ? '不明'
-    : String(input.failedChunkIndex);
-
-  return `<!DOCTYPE html>
-<html lang="ja">
-  <body style="margin:0;padding:0;background:#f8fafc;font-family:'Yu Gothic UI','Yu Gothic',Meiryo,Arial,sans-serif;font-size:15px;line-height:1.7;color:#1f2933;">
-    <div style="max-width:760px;margin:0 auto;padding:24px;">
-      <div style="background:#ffffff;border-radius:12px;padding:20px;border-top:5px solid #dc2626;">
-        <h2 style="font-size:19px;margin:0 0 14px 0;">Meeting Memoの文字起こしに失敗しました</h2>
-        <p style="margin:0 0 14px 0;">${escapeHtml(input.humanReadableReasonJa)}</p>
-        <table style="border-collapse:collapse;width:100%;margin:8px 0 18px 0;">
-          <tbody>
-            <tr><th style="border:1px solid #d0d7de;padding:7px;text-align:left;background:#f6f8fa;">録音ファイル</th><td style="border:1px solid #d0d7de;padding:7px;">${escapeHtml(input.fileName)}</td></tr>
-            <tr><th style="border:1px solid #d0d7de;padding:7px;text-align:left;background:#f6f8fa;">失敗ステージ</th><td style="border:1px solid #d0d7de;padding:7px;">${escapeHtml(input.failureStage)}</td></tr>
-            <tr><th style="border:1px solid #d0d7de;padding:7px;text-align:left;background:#f6f8fa;">recordingId</th><td style="border:1px solid #d0d7de;padding:7px;word-break:break-all;">${escapeHtml(input.recordingId)}</td></tr>
-            <tr><th style="border:1px solid #d0d7de;padding:7px;text-align:left;background:#f6f8fa;">失敗チャンク</th><td style="border:1px solid #d0d7de;padding:7px;">${escapeHtml(failedChunk)}</td></tr>
-            <tr><th style="border:1px solid #d0d7de;padding:7px;text-align:left;background:#f6f8fa;">処理時間</th><td style="border:1px solid #d0d7de;padding:7px;">${escapeHtml(`${input.processingSeconds}秒`)}</td></tr>
-          </tbody>
-        </table>
-        <h3 style="font-size:16px;margin:18px 0 8px 0;">技術エラー（原文）</h3>
-        <pre style="white-space:pre-wrap;word-break:break-word;background:#f6f8fa;border:1px solid #d0d7de;border-radius:8px;padding:12px;">${escapeHtml(input.technicalErrorMessage)}</pre>
-        <h3 style="font-size:16px;margin:18px 0 8px 0;">品質判定</h3>
-        <p style="margin:0 0 8px 0;">理由コード: ${escapeHtml(qualityReasons)}</p>
-        ${metricsHtml}
-        <h3 style="font-size:16px;margin:18px 0 8px 0;">実行されなかった後続処理</h3>
-        <p style="margin:0;">一次要約、二次レビュー、Notion最終化、My Tasks登録、完了通知メールは実行されていません。</p>
-      </div>
-    </div>
-  </body>
-</html>`;
-}
-
-export function shouldSendCompletionEmail(env: Env): boolean {
-  return isEnabled(env.GMAIL_NOTIFY_ENABLED)
-    && hasValue(env.MAIL_TO)
-    && hasValue(env.MAIL_FROM)
-    && hasValue(env.MAIL_PASSWORD);
-}
-
-export function shouldSendFailureEmail(env: Env): boolean {
-  const configured = env.FAILURE_NOTIFY_ENABLED ?? env.GMAIL_NOTIFY_ENABLED;
-  return isEnabled(configured)
-    && hasValue(env.MAIL_TO)
-    && hasValue(env.MAIL_FROM)
-    && hasValue(env.MAIL_PASSWORD);
+  return [...headers, ...parts].join('\r\n');
 }
 
 export function buildCompletionEmailMessage(
   input: CompletionEmailInput & { to: string[]; cc?: string[]; from: string; subject: string },
 ): string {
-  const html = buildCompletionEmailHtml(input);
-  const lines = [
-    `From: ${input.from}`,
-    `To: ${input.to.join(', ')}`,
-  ];
-  if (input.cc && input.cc.length > 0) {
-    lines.push(`Cc: ${input.cc.join(', ')}`);
+  if (!input.transcriptAttachment) {
+    return base.buildCompletionEmailMessage(input);
   }
-  lines.push(
-    `Subject: ${input.subject}`,
-    'MIME-Version: 1.0',
-    'Content-Type: text/html; charset=UTF-8',
-    '',
-    html,
-  );
-  return lines.join('\r\n');
+
+  const { transcriptAttachment, ...baseInput } = input;
+  const html = extractHtmlBody(base.buildCompletionEmailMessage(baseInput));
+  return buildMultipartCompletionMessage(input, html, transcriptAttachment);
 }
 
-export function buildFailureEmailMessage(
-  input: FailureEmailInput & { to: string[]; cc?: string[]; from: string; subject: string },
-): string {
-  const html = buildFailureEmailHtml(input);
-  const lines = [
-    `From: ${input.from}`,
-    `To: ${input.to.join(', ')}`,
-  ];
-  if (input.cc && input.cc.length > 0) {
-    lines.push(`Cc: ${input.cc.join(', ')}`);
+function toDirectDropboxDownloadUrl(value: string): string {
+  const parsed = new URL(value);
+  if (/(^|\.)dropbox\.com$/i.test(parsed.hostname)) {
+    parsed.searchParams.set('dl', '1');
   }
-  lines.push(
-    `Subject: ${input.subject}`,
-    'MIME-Version: 1.0',
-    'Content-Type: text/html; charset=UTF-8',
-    '',
-    html,
-  );
-  return lines.join('\r\n');
+  return parsed.toString();
 }
 
-export function buildCompletionEmailSubject(subject: string): string {
-  return subject;
+function attachmentFileNameFromUrl(value: string): string {
+  try {
+    const parsed = new URL(value);
+    const pathTail = parsed.pathname.split('/').filter(Boolean).pop();
+    return sanitizeAttachmentFileName(pathTail ? decodeURIComponent(pathTail) : 'meeting-transcript.txt');
+  } catch {
+    return 'meeting-transcript.txt';
+  }
+}
+
+export async function downloadTranscriptAttachment(transcriptFileUrl: string): Promise<TextAttachment> {
+  const downloadUrl = toDirectDropboxDownloadUrl(transcriptFileUrl);
+  const response = await fetch(downloadUrl, { method: 'GET', redirect: 'follow' });
+  if (!response.ok) {
+    throw new HttpError('Unable to download transcript attachment from Dropbox.', 502, {
+      status: response.status,
+      transcriptFileUrl,
+    });
+  }
+
+  const content = await response.text();
+  if (!content.trim()) {
+    throw new HttpError('Downloaded transcript attachment is empty.', 502, { transcriptFileUrl });
+  }
+
+  return {
+    fileName: attachmentFileNameFromUrl(transcriptFileUrl),
+    content,
+  };
 }
 
 interface SmtpClient {
@@ -578,12 +220,9 @@ async function createSmtpClient(hostname: string, port: number): Promise<SmtpCli
 
   const startTls = async (): Promise<void> => {
     await sendCommand('STARTTLS', [220]);
-
     reader.releaseLock();
     writer.releaseLock();
-
     const secureSocket = socket.startTls();
-
     socket = secureSocket;
     reader = socket.readable.getReader();
     writer = socket.writable.getWriter();
@@ -619,7 +258,8 @@ async function createSmtpClient(hostname: string, port: number): Promise<SmtpCli
 }
 
 async function sendSmtpMessage(config: MailConfig, message: string): Promise<void> {
-  const recipients = uniqueRecipients([...config.to, ...config.cc, ...config.bcc]);
+  const recipients = [...new Set([...config.to, ...config.cc, ...config.bcc].map((value) => value.toLowerCase()))];
+  const originalByLower = new Map([...config.to, ...config.cc, ...config.bcc].map((value) => [value.toLowerCase(), value]));
   const smtp = await createSmtpClient(config.smtpHost, config.smtpPort);
   await smtp.readGreeting();
   await smtp.sendCommand('EHLO meeting-memo.worker', [250]);
@@ -629,8 +269,8 @@ async function sendSmtpMessage(config: MailConfig, message: string): Promise<voi
   await smtp.sendCommand(toBase64(config.from), [334]);
   await smtp.sendCommand(toBase64(config.password), [235]);
   await smtp.sendCommand(`MAIL FROM:<${config.from}>`, [250]);
-  for (const recipient of recipients) {
-    await smtp.sendCommand(`RCPT TO:<${recipient}>`, [250, 251]);
+  for (const recipientKey of recipients) {
+    await smtp.sendCommand(`RCPT TO:<${originalByLower.get(recipientKey) ?? recipientKey}>`, [250, 251]);
   }
   await smtp.sendCommand('DATA', [354]);
   await smtp.sendData(message);
@@ -641,36 +281,35 @@ export async function sendCompletionEmail(
   env: Env,
   input: CompletionEmailInput & { subject: string },
 ): Promise<void> {
-  if (!shouldSendCompletionEmail(env)) {
+  if (!base.shouldSendCompletionEmail(env)) {
     return;
   }
 
-  const config = getCompletionEmailConfig(env);
+  let transcriptAttachment = input.transcriptAttachment;
+  if (!transcriptAttachment && input.transcriptFileUrl) {
+    try {
+      transcriptAttachment = await downloadTranscriptAttachment(input.transcriptFileUrl);
+      logEvent('info', 'completion_email_transcript_attachment_downloaded', {
+        transcriptFileUrl: input.transcriptFileUrl,
+        attachmentFileName: transcriptAttachment.fileName,
+        attachmentChars: transcriptAttachment.content.length,
+      });
+    } catch (error) {
+      logEvent('warn', 'completion_email_transcript_attachment_failed', {
+        transcriptFileUrl: input.transcriptFileUrl,
+        details: error instanceof HttpError ? error.details : error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  const config = base.getCompletionEmailConfig(env);
   const message = buildCompletionEmailMessage({
     ...input,
+    transcriptAttachment,
     from: config.from,
     to: config.to,
     cc: config.cc,
-    subject: buildCompletionEmailSubject(input.subject),
-  });
-
-  await sendSmtpMessage(config, message);
-}
-
-export async function sendFailureEmail(
-  env: Env,
-  input: FailureEmailInput & { subject: string },
-): Promise<void> {
-  if (!shouldSendFailureEmail(env)) {
-    return;
-  }
-
-  const config = getCompletionEmailConfig(env);
-  const message = buildFailureEmailMessage({
-    ...input,
-    from: config.from,
-    to: config.to,
-    cc: config.cc,
+    subject: base.buildCompletionEmailSubject(input.subject),
   });
 
   await sendSmtpMessage(config, message);
