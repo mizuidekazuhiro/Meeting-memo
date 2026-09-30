@@ -911,3 +911,59 @@ test('finalize recovery regenerates missing snapshots before forced email resend
   );
   assert.ok(summaryPatch, 'final memo should be restored to the Notion Summary property before email resend');
 });
+
+
+test('finalize records email failure without rolling back completed memo and preserves interview date', async () => {
+  const { jobsMod, processingMod, gmailMod } = await loadDeps();
+  const { createRecordingJob, upsertRecordingJob, getRecordingJob } = jobsMod;
+  const { persistTranscriptionCallback, finalizeInterviewJob } = processingMod;
+
+  const kv = new MockKv();
+  const env = makeEnv(kv, {
+    GMAIL_NOTIFY_ENABLED: 'true',
+    MAIL_TO: 'to@example.com',
+    MAIL_FROM: 'from@example.com',
+    MAIL_PASSWORD: 'invalid-password',
+    INTERVIEW_REVIEW_ENABLED: 'true',
+  });
+  const job = createRecordingJob({
+    request: {
+      fileName: 'email-fail.m4a',
+      recordedAt: '2026-09-29T06:46:00.000Z',
+    },
+    dropboxFileId: 'id:email-fail',
+    dropboxPathLower: '/apps/meetingmemo/inbox/email-fail.m4a',
+    fileName: 'email-fail.m4a',
+    clientModified: '2026-09-29T06:46:00.000Z',
+  });
+  await upsertRecordingJob(env, job);
+  await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
+
+  const fetchMock = installFinalizeFetchMock();
+  const originalSendEmail = gmailMod.sendCompletionEmail;
+  gmailMod.sendCompletionEmail = (async () => {
+    throw new Error('SMTP command failed: 535 BadCredentials');
+  }) as any;
+
+  let result;
+  try {
+    result = await finalizeInterviewJob(env, job.recordingId);
+  } finally {
+    gmailMod.sendCompletionEmail = originalSendEmail;
+    fetchMock.restore();
+  }
+
+  const updated = await getRecordingJob(env, { recordingId: job.recordingId });
+  assert.deepEqual(result, { ok: false, status: 'completed_email_failed' });
+  assert.equal(updated?.status, 'completed');
+  assert.equal(updated?.finalizeStatus, 'completed');
+  assert.ok(updated?.finalizeCompletedAt);
+  assert.equal(updated?.emailSentAt, undefined);
+  assert.ok(updated?.emailFailedAt);
+  assert.match(updated?.emailLastError ?? '', /535 BadCredentials/);
+
+  const datedTitlePatch = fetchMock.stats.summaryPayloads.find((payload: any) =>
+    payload?.properties?.Name?.title?.[0]?.text?.content === 'Interview Memo 2026-09-29 - email-fail.m4a',
+  );
+  assert.ok(datedTitlePatch, 'Notion title should keep the recorded interview date when finalization is retried later');
+});
