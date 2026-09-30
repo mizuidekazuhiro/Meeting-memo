@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 
 const argv = process.argv.slice(2);
 let runTarget;
@@ -13,8 +14,23 @@ for (let i = 0; i < argv.length; i += 1) {
   passthrough.push(argv[i]);
 }
 
-const defaultTarget = '.tmp-test/test/**/*.test.js';
-let targets = [defaultTarget];
+function collectTestFiles(directory) {
+  if (!existsSync(directory)) return [];
+  const files = [];
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...collectTestFiles(path));
+      continue;
+    }
+    if (entry.isFile() && entry.name.endsWith('.test.js')) {
+      files.push(path);
+    }
+  }
+  return files.sort();
+}
+
+let targets = collectTestFiles('.tmp-test/test');
 if (runTarget) {
   const normalized = runTarget.endsWith('.ts')
     ? `.tmp-test/${runTarget.replace(/\.ts$/, '.js')}`
@@ -22,6 +38,11 @@ if (runTarget) {
   if (existsSync(normalized)) {
     targets = [normalized];
   }
+}
+
+if (targets.length === 0) {
+  process.stderr.write('No compiled test files found under .tmp-test/test.\n');
+  process.exit(1);
 }
 
 const child = spawn('node', ['--test', ...targets, ...passthrough], {

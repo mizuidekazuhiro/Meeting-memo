@@ -213,7 +213,9 @@ export interface RecordingJob {
   callbackReceivedAt?: string;
   transcriptWrittenAt?: string;
   summaryWrittenAt?: string;
+  summaryInsights?: InterviewInsights;
   reviewCompletedAt?: string;
+  reviewResult?: InterviewReviewResult;
   emailSentAt?: string;
   finalizeStatus?: 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
   lastError?: string;

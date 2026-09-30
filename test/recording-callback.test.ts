@@ -20,8 +20,9 @@ async function loadDeps() {
   const processingMod = await importFirst(['../src/lib/processing.js', '../.tmp-test/src/lib/processing.js']);
   const loggerMod = await importFirst(['../src/lib/logger.js', '../.tmp-test/src/lib/logger.js']);
   const gmailMod = await importFirst(['../src/lib/gmail.js', '../.tmp-test/src/lib/gmail.js']);
+  const gmailBaseMod = await importFirst(['../src/lib/gmail-base.js', '../.tmp-test/src/lib/gmail-base.js']);
   const notionMod = await importFirst(['../src/lib/notion.js', '../.tmp-test/src/lib/notion.js']);
-  return { workerMod, httpMod, jobsMod, processingMod, loggerMod, gmailMod, notionMod };
+  return { workerMod, httpMod, jobsMod, processingMod, loggerMod, gmailMod, gmailBaseMod, notionMod };
 }
 
 class MockKv {
@@ -259,7 +260,7 @@ test('callback persistence path stores transcript payload and remains lightweigh
 });
 
 test('failure callback persists failed state, sends one email, and never enqueues finalization', async () => {
-  const { workerMod, jobsMod, processingMod, gmailMod } = await loadDeps();
+  const { workerMod, jobsMod, processingMod, gmailBaseMod } = await loadDeps();
   const worker = workerMod.default;
   const { createRecordingJob, upsertRecordingJob, getRecordingJob } = jobsMod;
 
@@ -282,9 +283,9 @@ test('failure callback persists failed state, sends one email, and never enqueue
 
   const failureEmails: any[] = [];
   let downstreamFetchCalls = 0;
-  const originalSendFailureEmail = gmailMod.sendFailureEmail;
+  const originalSendFailureEmail = gmailBaseMod.sendFailureEmail;
   const originalFetch = global.fetch;
-  gmailMod.sendFailureEmail = (async (_env: any, input: any) => {
+  gmailBaseMod.sendFailureEmail = (async (_env: any, input: any) => {
     failureEmails.push(input);
   }) as any;
   global.fetch = (async () => {
@@ -301,7 +302,7 @@ test('failure callback persists failed state, sends one email, and never enqueue
   const secondResponse = await worker.fetch(makeRequest(), env, { waitUntil: () => undefined });
   const finalizeResult = await processingMod.finalizeInterviewJob(env, job.recordingId);
 
-  gmailMod.sendFailureEmail = originalSendFailureEmail;
+  gmailBaseMod.sendFailureEmail = originalSendFailureEmail;
   global.fetch = originalFetch;
 
   const updated = await getRecordingJob(env, { recordingId: job.recordingId });
@@ -338,7 +339,7 @@ test('failure callback persists failed state, sends one email, and never enqueue
 });
 
 test('failure email delivery error is logged without failing the callback', async () => {
-  const { workerMod, jobsMod, gmailMod } = await loadDeps();
+  const { workerMod, jobsMod, gmailBaseMod } = await loadDeps();
   const worker = workerMod.default;
   const { createRecordingJob, upsertRecordingJob, getRecordingJob } = jobsMod;
 
@@ -357,8 +358,8 @@ test('failure email delivery error is logged without failing the callback', asyn
   });
   await upsertRecordingJob(env, job);
 
-  const originalSendFailureEmail = gmailMod.sendFailureEmail;
-  gmailMod.sendFailureEmail = (async () => {
+  const originalSendFailureEmail = gmailBaseMod.sendFailureEmail;
+  gmailBaseMod.sendFailureEmail = (async () => {
     throw new Error('SMTP unavailable');
   }) as any;
   const response = await worker.fetch(new Request('https://example.com/api/interviews/transcription-callback', {
@@ -371,7 +372,7 @@ test('failure email delivery error is logged without failing the callback', asyn
       fileName: job.fileName,
     })),
   }), env, { waitUntil: () => undefined });
-  gmailMod.sendFailureEmail = originalSendFailureEmail;
+  gmailBaseMod.sendFailureEmail = originalSendFailureEmail;
 
   const updated = await getRecordingJob(env, { recordingId: job.recordingId });
   const body = await response.json();
@@ -844,4 +845,69 @@ test('queue handler marks retry on finalize failure', async () => {
 
   assert.equal(acked, 0);
   assert.equal(retried, 1);
+});
+
+
+test('finalize recovery regenerates missing snapshots before forced email resend', async () => {
+  const { jobsMod, processingMod, gmailMod } = await loadDeps();
+  const { createRecordingJob, upsertRecordingJob, getRecordingJob } = jobsMod;
+  const { persistTranscriptionCallback, finalizeInterviewJob } = processingMod;
+
+  const kv = new MockKv();
+  const env = makeEnv(kv, {
+    GMAIL_NOTIFY_ENABLED: 'true',
+    MAIL_TO: 'to@example.com',
+    MAIL_FROM: 'from@example.com',
+    MAIL_PASSWORD: 'password',
+    INTERVIEW_REVIEW_ENABLED: 'true',
+  });
+  const job = createRecordingJob({
+    request: { fileName: 'resume-missing-snapshots.m4a' },
+    dropboxFileId: 'id:resume-missing-snapshots',
+    dropboxPathLower: '/apps/meetingmemo/inbox/resume-missing-snapshots.m4a',
+    fileName: 'resume-missing-snapshots.m4a',
+  });
+  await upsertRecordingJob(env, job);
+  await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
+  await upsertRecordingJob(env, {
+    ...(await getRecordingJob(env, { recordingId: job.recordingId }))!,
+    status: 'failed',
+    finalizeStatus: 'failed',
+    transcriptWrittenAt: '2026-09-29T06:47:55.000Z',
+    summaryWrittenAt: '2026-09-29T06:49:00.000Z',
+    reviewCompletedAt: '2026-09-29T06:49:30.000Z',
+    notionPageId: 'page_existing',
+    notionPageUrl: 'https://www.notion.so/pageexisting',
+    transcriptFileUrl: 'https://dropbox.example.com/transcript-existing',
+    summaryInsights: undefined,
+    reviewResult: undefined,
+  } as any);
+
+  const fetchMock = installFinalizeFetchMock();
+  let emailCount = 0;
+  const originalSendEmail = gmailMod.sendCompletionEmail;
+  gmailMod.sendCompletionEmail = (async () => {
+    emailCount += 1;
+  }) as any;
+
+  try {
+    await finalizeInterviewJob(env, job.recordingId, { forceEmail: true });
+  } finally {
+    gmailMod.sendCompletionEmail = originalSendEmail;
+    fetchMock.restore();
+  }
+
+  const updated = await getRecordingJob(env, { recordingId: job.recordingId });
+  assert.ok(fetchMock.stats.summaryCalls >= 1);
+  assert.ok(fetchMock.stats.reviewCalls >= 1);
+  assert.equal(emailCount, 1);
+  assert.equal(updated?.status, 'completed');
+  assert.equal(updated?.finalizeStatus, 'completed');
+  assert.equal(updated?.summaryInsights?.summary, '要約です');
+  assert.equal(updated?.reviewResult?.finalMemoMarkdown, 'final memo');
+
+  const summaryPatch = fetchMock.stats.summaryPayloads.find((payload: any) =>
+    payload?.properties?.Summary?.rich_text?.some?.((item: any) => item?.text?.content?.includes('final memo')),
+  );
+  assert.ok(summaryPatch, 'final memo should be restored to the Notion Summary property before email resend');
 });

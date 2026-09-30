@@ -4,6 +4,9 @@ import { logEvent } from './logger';
 
 const NOTION_API = 'https://api.notion.com/v1';
 const NOTION_VERSION = '2022-06-28';
+const NOTION_RETRY_MAX_ATTEMPTS = 4;
+const NOTION_RETRY_BASE_DELAY_MS = 250;
+const NOTION_RETRY_MAX_DELAY_MS = 4000;
 const NOTION_TEXT_LIMIT = 1900;
 const TRANSCRIPT_BLOCK_TEXT_LIMIT = 1700;
 const TRANSCRIPT_HEADING = 'Transcript';
@@ -79,21 +82,69 @@ type NotionBlockInput =
       };
     };
 
-async function notionFetch<T>(env: Env, path: string, init: RequestInit): Promise<T> {
-  const response = await fetch(`${NOTION_API}${path}`, {
-    ...init,
-    headers: {
-      authorization: `Bearer ${env.NOTION_TOKEN}`,
-      'content-type': 'application/json',
-      'notion-version': NOTION_VERSION,
-      ...(init.headers ?? {}),
-    },
-  });
-
-  if (!response.ok) {
-    throw new HttpError(`Notion API call failed for ${path}.`, 502, await response.text());
+function parseRetryAfterMs(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(NOTION_RETRY_MAX_DELAY_MS, Math.round(seconds * 1000));
   }
-  return (await response.json()) as T;
+  const retryAt = Date.parse(value);
+  if (!Number.isNaN(retryAt)) {
+    return Math.min(NOTION_RETRY_MAX_DELAY_MS, Math.max(0, retryAt - Date.now()));
+  }
+  return undefined;
+}
+
+function fallbackRetryDelayMs(attempt: number): number {
+  return Math.min(NOTION_RETRY_MAX_DELAY_MS, NOTION_RETRY_BASE_DELAY_MS * (2 ** Math.max(0, attempt - 1)));
+}
+
+async function notionFetch<T>(env: Env, path: string, init: RequestInit): Promise<T> {
+  for (let attempt = 1; attempt <= NOTION_RETRY_MAX_ATTEMPTS; attempt += 1) {
+    const response = await fetch(`${NOTION_API}${path}`, {
+      ...init,
+      headers: {
+        authorization: `Bearer ${env.NOTION_TOKEN}`,
+        'content-type': 'application/json',
+        'notion-version': NOTION_VERSION,
+        ...(init.headers ?? {}),
+      },
+    });
+
+    if (response.ok) {
+      return (await response.json()) as T;
+    }
+
+    const responseBody = await response.text();
+    const retryable = response.status === 429 || response.status === 529;
+    if (retryable && attempt < NOTION_RETRY_MAX_ATTEMPTS) {
+      const retryAfter = response.headers.get('retry-after');
+      const delayMs = parseRetryAfterMs(retryAfter) ?? fallbackRetryDelayMs(attempt);
+      logEvent('warn', 'notion_api_retry_scheduled', {
+        path,
+        status: response.status,
+        attempt,
+        maxAttempts: NOTION_RETRY_MAX_ATTEMPTS,
+        delayMs,
+        retryAfter,
+      });
+      if (delayMs > 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+      }
+      continue;
+    }
+
+    throw new HttpError(`Notion API call failed for ${path}.`, 502, {
+      status: response.status,
+      responseBody,
+      attempts: attempt,
+      retryable,
+    });
+  }
+
+  throw new HttpError(`Notion API call failed for ${path}.`, 502, {
+    attempts: NOTION_RETRY_MAX_ATTEMPTS,
+  });
 }
 
 async function findPageByDedupKey(env: Env, dedupKey: string): Promise<NotionPageMatch | null> {

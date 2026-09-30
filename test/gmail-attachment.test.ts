@@ -32,7 +32,9 @@ test('completion email attaches UTF-8 transcript as base64 text file', () => {
 
   const attachmentPart = message.split('Content-Transfer-Encoding: base64\r\n')[1];
   assert.ok(attachmentPart);
-  const encoded = attachmentPart.split('\r\n--')[0].replace(/\r\n/g, '');
+  const encodedBody = attachmentPart.split('\r\n\r\n')[1];
+  assert.ok(encodedBody);
+  const encoded = encodedBody.split('\r\n--')[0].replace(/\r\n/g, '');
   assert.equal(Buffer.from(encoded, 'base64').toString('utf8'), transcriptText);
 });
 
