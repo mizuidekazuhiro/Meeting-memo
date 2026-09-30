@@ -217,6 +217,8 @@ export interface RecordingJob {
   reviewCompletedAt?: string;
   reviewResult?: InterviewReviewResult;
   emailSentAt?: string;
+  emailFailedAt?: string;
+  emailLastError?: string;
   finalizeStatus?: 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
   lastError?: string;
   finalizeQueuedAt?: string;

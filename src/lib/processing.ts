@@ -861,9 +861,16 @@ export async function persistTranscriptionFailureCallback(
   }
 }
 
+function resolveInterviewDateForTitle(job: RecordingJob): string {
+  const candidate = job.request.recordedAt ?? job.clientModified ?? job.serverModified ?? job.createdAt;
+  const parsed = new Date(candidate);
+  return Number.isNaN(parsed.valueOf()) ? new Date().toISOString().slice(0, 10) : parsed.toISOString().slice(0, 10);
+}
+
 function ensureInterviewRecord(job: RecordingJob, transcript: TranscriptResult, insights?: InterviewInsights) {
+  const interviewDate = resolveInterviewDateForTitle(job);
   return {
-    title: job.fileName ? `Interview Memo ${new Date().toISOString().slice(0, 10)} - ${job.fileName}` : 'Interview Memo',
+    title: job.fileName ? `Interview Memo ${interviewDate} - ${job.fileName}` : 'Interview Memo',
     dedupKey: job.dropboxFileId ? `dropbox:id:${job.dropboxFileId}` : `fallback:${job.fileName}`,
     metadata: {
       id: job.dropboxFileId,
@@ -1160,26 +1167,46 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
         normalizedTasks: imported.normalizedTasks,
       });
 
+      let completionEmailError: string | undefined;
       if (shouldSendCompletionEmail(env) && (!mutable.emailSentAt || force || forceEmail)) {
         const emailTasks = imported.importedTaskItems;
-        await sendCompletionEmail(env, {
-          subject: env.MAIL_SUBJECT_PREFIX ?? 'Interview Memo 完了通知',
-          notionPageUrl: mutable.notionPageUrl ?? buildNotionPageUrl(pageId),
-          transcriptFileUrl,
-          finalMemo: finalMemoSelected.finalMemo,
-          sourceUrls,
-          myTasks: emailTasks,
-        });
-        logEvent('info', 'completion_email_rendered', {
-          recordingId,
-          finalMemoIncluded: true,
-          transcriptExcerptIncluded: false,
-          transcriptBodyIncluded: false,
-          duplicatedSummaryIncluded: false,
-          sourceUrlCount: sourceUrls.length,
-          myTaskCount: emailTasks.length,
-        });
-        await updateRecordingJobStatus(env, { recordingId }, 'transcribed', { emailSentAt: new Date().toISOString() });
+        try {
+          await sendCompletionEmail(env, {
+            subject: env.MAIL_SUBJECT_PREFIX ?? 'Interview Memo 完了通知',
+            notionPageUrl: mutable.notionPageUrl ?? buildNotionPageUrl(pageId),
+            transcriptFileUrl,
+            finalMemo: finalMemoSelected.finalMemo,
+            sourceUrls,
+            myTasks: emailTasks,
+          });
+          logEvent('info', 'completion_email_rendered', {
+            recordingId,
+            finalMemoIncluded: true,
+            transcriptExcerptIncluded: false,
+            transcriptBodyIncluded: false,
+            duplicatedSummaryIncluded: false,
+            sourceUrlCount: sourceUrls.length,
+            myTaskCount: emailTasks.length,
+          });
+          await updateRecordingJobStatus(env, { recordingId }, 'transcribed', {
+            emailSentAt: new Date().toISOString(),
+            emailFailedAt: undefined,
+            emailLastError: undefined,
+          });
+        } catch (error) {
+          completionEmailError = error instanceof Error ? error.message : String(error);
+          const emailFailedAt = new Date().toISOString();
+          await updateRecordingJobStatus(env, { recordingId }, 'transcribed', {
+            emailFailedAt,
+            emailLastError: completionEmailError,
+          });
+          logEvent('warn', 'completion_email_failed', {
+            recordingId,
+            emailFailedAt,
+            message: completionEmailError,
+            details: error instanceof HttpError ? error.details : undefined,
+          });
+        }
       }
 
       const elapsedSeconds = Math.max(0, Math.round((Date.now() - new Date(finalizeStartedAt).getTime()) / 1000));
@@ -1201,7 +1228,9 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
         myTaskSkippedDuplicates: imported.skippedDuplicates,
         elapsedSeconds,
       });
-      return { ok: true, status: 'completed' };
+      return completionEmailError
+        ? { ok: false, status: 'completed_email_failed' }
+        : { ok: true, status: 'completed' };
     }
     throw new HttpError('Notion page was not created.', 500, { recordingId });
   } catch (error) {
@@ -1230,6 +1259,8 @@ export async function getInterviewJobStatus(env: Env, recordingId: string): Prom
     reviewCompletedAt: job.reviewCompletedAt,
     reviewSnapshotPresent: Boolean(job.reviewResult),
     emailSentAt: job.emailSentAt,
+    emailFailedAt: job.emailFailedAt,
+    emailLastError: job.emailLastError,
     finalizeStatus: job.finalizeStatus,
     finalizeQueuedAt: job.finalizeQueuedAt,
     finalizeStartedAt: job.finalizeStartedAt,
