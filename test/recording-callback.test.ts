@@ -20,8 +20,9 @@ async function loadDeps() {
   const processingMod = await importFirst(['../src/lib/processing.js', '../.tmp-test/src/lib/processing.js']);
   const loggerMod = await importFirst(['../src/lib/logger.js', '../.tmp-test/src/lib/logger.js']);
   const gmailMod = await importFirst(['../src/lib/gmail.js', '../.tmp-test/src/lib/gmail.js']);
+  const gmailBaseMod = await importFirst(['../src/lib/gmail-base.js', '../.tmp-test/src/lib/gmail-base.js']);
   const notionMod = await importFirst(['../src/lib/notion.js', '../.tmp-test/src/lib/notion.js']);
-  return { workerMod, httpMod, jobsMod, processingMod, loggerMod, gmailMod, notionMod };
+  return { workerMod, httpMod, jobsMod, processingMod, loggerMod, gmailMod, gmailBaseMod, notionMod };
 }
 
 class MockKv {
@@ -259,7 +260,7 @@ test('callback persistence path stores transcript payload and remains lightweigh
 });
 
 test('failure callback persists failed state, sends one email, and never enqueues finalization', async () => {
-  const { workerMod, jobsMod, processingMod, gmailMod } = await loadDeps();
+  const { workerMod, jobsMod, processingMod, gmailBaseMod } = await loadDeps();
   const worker = workerMod.default;
   const { createRecordingJob, upsertRecordingJob, getRecordingJob } = jobsMod;
 
@@ -282,9 +283,9 @@ test('failure callback persists failed state, sends one email, and never enqueue
 
   const failureEmails: any[] = [];
   let downstreamFetchCalls = 0;
-  const originalSendFailureEmail = gmailMod.sendFailureEmail;
+  const originalSendFailureEmail = gmailBaseMod.sendFailureEmail;
   const originalFetch = global.fetch;
-  gmailMod.sendFailureEmail = (async (_env: any, input: any) => {
+  gmailBaseMod.sendFailureEmail = (async (_env: any, input: any) => {
     failureEmails.push(input);
   }) as any;
   global.fetch = (async () => {
@@ -301,7 +302,7 @@ test('failure callback persists failed state, sends one email, and never enqueue
   const secondResponse = await worker.fetch(makeRequest(), env, { waitUntil: () => undefined });
   const finalizeResult = await processingMod.finalizeInterviewJob(env, job.recordingId);
 
-  gmailMod.sendFailureEmail = originalSendFailureEmail;
+  gmailBaseMod.sendFailureEmail = originalSendFailureEmail;
   global.fetch = originalFetch;
 
   const updated = await getRecordingJob(env, { recordingId: job.recordingId });
@@ -338,7 +339,7 @@ test('failure callback persists failed state, sends one email, and never enqueue
 });
 
 test('failure email delivery error is logged without failing the callback', async () => {
-  const { workerMod, jobsMod, gmailMod } = await loadDeps();
+  const { workerMod, jobsMod, gmailBaseMod } = await loadDeps();
   const worker = workerMod.default;
   const { createRecordingJob, upsertRecordingJob, getRecordingJob } = jobsMod;
 
@@ -357,8 +358,8 @@ test('failure email delivery error is logged without failing the callback', asyn
   });
   await upsertRecordingJob(env, job);
 
-  const originalSendFailureEmail = gmailMod.sendFailureEmail;
-  gmailMod.sendFailureEmail = (async () => {
+  const originalSendFailureEmail = gmailBaseMod.sendFailureEmail;
+  gmailBaseMod.sendFailureEmail = (async () => {
     throw new Error('SMTP unavailable');
   }) as any;
   const response = await worker.fetch(new Request('https://example.com/api/interviews/transcription-callback', {
@@ -371,7 +372,7 @@ test('failure email delivery error is logged without failing the callback', asyn
       fileName: job.fileName,
     })),
   }), env, { waitUntil: () => undefined });
-  gmailMod.sendFailureEmail = originalSendFailureEmail;
+  gmailBaseMod.sendFailureEmail = originalSendFailureEmail;
 
   const updated = await getRecordingJob(env, { recordingId: job.recordingId });
   const body = await response.json();
