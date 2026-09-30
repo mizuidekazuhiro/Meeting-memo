@@ -975,10 +975,17 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
       transcriptFileUrl = mutable.transcriptFileUrl;
     }
 
-    let insights: InterviewInsights | undefined;
-    let reviewResult: InterviewReviewResult | undefined;
-    let sourceUrls: string[] = [];
-    if (!mutable.summaryWrittenAt || force) {
+    let insights: InterviewInsights | undefined = mutable.summaryInsights;
+    let reviewResult: InterviewReviewResult | undefined = mutable.reviewResult;
+    let sourceUrls: string[] = reviewResult?.sourceUrls ?? [];
+
+    if (mutable.summaryWrittenAt && insights && !force) {
+      logEvent('info', 'summary_snapshot_recovered', {
+        recordingId,
+        summaryWrittenAt: mutable.summaryWrittenAt,
+      });
+    }
+    if (!mutable.summaryWrittenAt || force || !insights) {
       try {
         logEvent('info', 'summary_generation_started', { recordingId });
         const resolved = resolveTranscriptionLanguage(mutable.request.languageHint, env.TRANSCRIBE_LANGUAGE);
@@ -994,9 +1001,16 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
           const record = ensureInterviewRecord(mutable, mutable.transcript!, insights);
           await updateInterviewRecordProperties(env, pageId, record);
         }
-        await updateRecordingJobStatus(env, { recordingId }, 'transcribed', { summaryWrittenAt: new Date().toISOString() });
-        logEvent('info', 'summary_generation_completed', { recordingId });
+        await updateRecordingJobStatus(env, { recordingId }, 'transcribed', {
+          summaryWrittenAt: new Date().toISOString(),
+          summaryInsights: { ...insights, raw: undefined },
+        });
+        logEvent('info', 'summary_generation_completed', {
+          recordingId,
+          recoveryRegenerated: Boolean(mutable.summaryWrittenAt && !mutable.summaryInsights),
+        });
         mutable = (await getRecordingJob(env, { recordingId }))!;
+        insights = mutable.summaryInsights ?? insights;
       } catch (error) {
         logEvent('error', 'summary_generation_failed', { recordingId, message: error instanceof Error ? error.message : String(error) });
         throw error;
@@ -1005,11 +1019,19 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
       logEvent('info', 'summary_generation_completed', {
         recordingId,
         skipped: true,
+        snapshotRecovered: Boolean(insights),
         summaryWrittenAt: mutable.summaryWrittenAt ?? null,
       });
     }
 
-    if (shouldRunInterviewReview(env) && (!mutable.reviewCompletedAt || force)) {
+    if (mutable.reviewCompletedAt && reviewResult && !force) {
+      logEvent('info', 'review_snapshot_recovered', {
+        recordingId,
+        reviewCompletedAt: mutable.reviewCompletedAt,
+      });
+    }
+
+    if (shouldRunInterviewReview(env) && (!mutable.reviewCompletedAt || force || !reviewResult)) {
       logEvent('info', 'review_started', { recordingId });
       try {
         const resolved = resolveTranscriptionLanguage(mutable.request.languageHint, env.TRANSCRIBE_LANGUAGE);
@@ -1023,9 +1045,17 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
         const review = await reviewInterviewWithWebSearch(env, { transcript: sanitizedTranscript.transcript, insights, title: mutable.fileName, fileName: mutable.fileName, notionPageUrl: pageId ? buildNotionPageUrl(pageId) : undefined });
         reviewResult = review;
         sourceUrls = review.sourceUrls;
-        await updateRecordingJobStatus(env, { recordingId }, 'transcribed', { reviewCompletedAt: new Date().toISOString() });
+        await updateRecordingJobStatus(env, { recordingId }, 'transcribed', {
+          reviewCompletedAt: new Date().toISOString(),
+          reviewResult: { ...review, raw: undefined },
+        });
         mutable = (await getRecordingJob(env, { recordingId }))!;
-        logEvent('info', 'review_completed', { recordingId });
+        reviewResult = mutable.reviewResult ?? reviewResult;
+        sourceUrls = reviewResult?.sourceUrls ?? sourceUrls;
+        logEvent('info', 'review_completed', {
+          recordingId,
+          recoveryRegenerated: Boolean(job.reviewCompletedAt && !job.reviewResult),
+        });
       } catch (error) {
         logEvent('warn', 'review_failed', {
           recordingId,
@@ -1196,7 +1226,9 @@ export async function getInterviewJobStatus(env: Env, recordingId: string): Prom
     callbackReceivedAt: job.callbackReceivedAt,
     transcriptWrittenAt: job.transcriptWrittenAt,
     summaryWrittenAt: job.summaryWrittenAt,
+    summarySnapshotPresent: Boolean(job.summaryInsights),
     reviewCompletedAt: job.reviewCompletedAt,
+    reviewSnapshotPresent: Boolean(job.reviewResult),
     emailSentAt: job.emailSentAt,
     finalizeStatus: job.finalizeStatus,
     finalizeQueuedAt: job.finalizeQueuedAt,
