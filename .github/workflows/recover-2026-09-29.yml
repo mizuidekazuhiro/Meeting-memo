@@ -1,0 +1,21 @@
+name: Recover 2026-09-29 meeting memo
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/recover-2026-09-29.yml"
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resend completion email
+        shell: bash
+        env:
+          INTERVIEW_WEBHOOK_SECRET: ${{ secrets.INTERVIEW_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+          curl --fail-with-body --silent --show-error             --max-time 300             -X POST             "https://meeting-memo.kazuhiro-mizuide.workers.dev/api/interviews/resend-email"             -H "content-type: application/json"             -H "x-webhook-secret: ${INTERVIEW_WEBHOOK_SECRET}"             --data '{"recordingId":"id:jb_wTME9uNwAAAAAAAAAsg:2026-09-29-15_12_44.m4a","force":true}'
