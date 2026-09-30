@@ -845,3 +845,68 @@ test('queue handler marks retry on finalize failure', async () => {
   assert.equal(acked, 0);
   assert.equal(retried, 1);
 });
+
+
+test('finalize recovery regenerates missing snapshots before forced email resend', async () => {
+  const { jobsMod, processingMod, gmailMod } = await loadDeps();
+  const { createRecordingJob, upsertRecordingJob, getRecordingJob } = jobsMod;
+  const { persistTranscriptionCallback, finalizeInterviewJob } = processingMod;
+
+  const kv = new MockKv();
+  const env = makeEnv(kv, {
+    GMAIL_NOTIFY_ENABLED: 'true',
+    MAIL_TO: 'to@example.com',
+    MAIL_FROM: 'from@example.com',
+    MAIL_PASSWORD: 'password',
+    INTERVIEW_REVIEW_ENABLED: 'true',
+  });
+  const job = createRecordingJob({
+    request: { fileName: 'resume-missing-snapshots.m4a' },
+    dropboxFileId: 'id:resume-missing-snapshots',
+    dropboxPathLower: '/apps/meetingmemo/inbox/resume-missing-snapshots.m4a',
+    fileName: 'resume-missing-snapshots.m4a',
+  });
+  await upsertRecordingJob(env, job);
+  await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
+  await upsertRecordingJob(env, {
+    ...(await getRecordingJob(env, { recordingId: job.recordingId }))!,
+    status: 'failed',
+    finalizeStatus: 'failed',
+    transcriptWrittenAt: '2026-09-29T06:47:55.000Z',
+    summaryWrittenAt: '2026-09-29T06:49:00.000Z',
+    reviewCompletedAt: '2026-09-29T06:49:30.000Z',
+    notionPageId: 'page_existing',
+    notionPageUrl: 'https://www.notion.so/pageexisting',
+    transcriptFileUrl: 'https://dropbox.example.com/transcript-existing',
+    summaryInsights: undefined,
+    reviewResult: undefined,
+  } as any);
+
+  const fetchMock = installFinalizeFetchMock();
+  let emailCount = 0;
+  const originalSendEmail = gmailMod.sendCompletionEmail;
+  gmailMod.sendCompletionEmail = (async () => {
+    emailCount += 1;
+  }) as any;
+
+  try {
+    await finalizeInterviewJob(env, job.recordingId, { forceEmail: true });
+  } finally {
+    gmailMod.sendCompletionEmail = originalSendEmail;
+    fetchMock.restore();
+  }
+
+  const updated = await getRecordingJob(env, { recordingId: job.recordingId });
+  assert.ok(fetchMock.stats.summaryCalls >= 1);
+  assert.ok(fetchMock.stats.reviewCalls >= 1);
+  assert.equal(emailCount, 1);
+  assert.equal(updated?.status, 'completed');
+  assert.equal(updated?.finalizeStatus, 'completed');
+  assert.equal(updated?.summaryInsights?.summary, '要約です');
+  assert.equal(updated?.reviewResult?.finalMemoMarkdown, 'final memo');
+
+  const summaryPatch = fetchMock.stats.summaryPayloads.find((payload: any) =>
+    payload?.properties?.Summary?.rich_text?.some?.((item: any) => item?.text?.content?.includes('final memo')),
+  );
+  assert.ok(summaryPatch, 'final memo should be restored to the Notion Summary property before email resend');
+});
