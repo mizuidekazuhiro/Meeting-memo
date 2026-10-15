@@ -118,3 +118,26 @@ jobs:
     needs: deploy-worker
     uses: ./.github/workflows/sync-worker-secrets.yml
     secrets: inherit
+
+  recover-20261015:
+    needs: [deploy-worker, sync-secrets]
+    if: github.event_name == 'push' && contains(github.event.head_commit.message, '[recover-20261015]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Compile the verified Notion writer
+        run: |
+          npm install --no-save typescript@5.9.3
+          npm run check
+          npm test
+      - name: Repair the two finished recording destinations without reprocessing or sending mail
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          INBOX_DB_ID: ${{ secrets.INBOX_DB_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          RECOVERY_VERIFY_WRITER: 'true'
+        run: node scripts/recover-20261015-identity.mjs

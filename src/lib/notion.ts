@@ -24,6 +24,8 @@ type NotionBlock = {
   type: string;
   has_children?: boolean;
   archived?: boolean;
+  heading_1?: { rich_text?: Array<{ plain_text?: string; text?: { content: string } }> };
+  callout?: { rich_text?: Array<{ plain_text?: string; text?: { content: string } }> };
   heading_2?: {
     rich_text?: Array<{ plain_text?: string }>;
   };
@@ -148,17 +150,44 @@ async function notionFetch<T>(env: Env, path: string, init: RequestInit): Promis
 }
 
 async function findPageByDedupKey(env: Env, dedupKey: string): Promise<NotionPageMatch | null> {
-  const response = await notionFetch<{ results: Array<{ id: string; properties: Record<string, unknown> }> }>(env, `/databases/${env.INBOX_DB_ID}/query`, {
-    method: 'POST',
-    body: JSON.stringify({
-      filter: {
-        property: 'Dedup Key',
-        rich_text: { equals: dedupKey },
-      },
-      page_size: 1,
-    }),
-  });
-  return response.results[0] ?? null;
+  const matches: NotionPageMatch[] = [];
+  let cursor: string | undefined;
+  do {
+    const response = await notionFetch<{ results: NotionPageMatch[]; has_more?: boolean; next_cursor?: string | null }>(env, `/databases/${env.INBOX_DB_ID}/query`, {
+      method: 'POST',
+      body: JSON.stringify({
+        filter: {
+          property: 'Dedup Key',
+          rich_text: { equals: dedupKey },
+        },
+        page_size: 100,
+        ...(cursor ? { start_cursor: cursor } : {}),
+      }),
+    });
+    for (const page of response.results) {
+      if (propertyText(page.properties['Dedup Key']) === dedupKey) matches.push(page);
+    }
+    cursor = response.has_more ? response.next_cursor ?? undefined : undefined;
+    if (response.has_more && !cursor) throw new HttpError('Notion dedup query returned an incomplete cursor.', 502);
+  } while (cursor);
+  if (matches.length > 1) throw new HttpError('Multiple Notion pages have the same exact dedup key; refusing to overwrite.', 409);
+  return matches[0] ?? null;
+}
+
+function propertyText(value: unknown): string {
+  const richTexts = (value as { rich_text?: Array<{ plain_text?: string; text?: { content?: string } }> } | undefined)?.rich_text;
+  return richTexts?.map((item) => item.plain_text ?? item.text?.content ?? '').join('') ?? '';
+}
+
+export async function assertInterviewPageIdentity(env: Env, pageId: string, dropboxFileId: string): Promise<void> {
+  const page = await notionFetch<NotionPageMatch>(env, `/pages/${pageId}`, { method: 'GET' });
+  assertMatchingFileId(page, dropboxFileId);
+}
+
+function assertMatchingFileId(page: NotionPageMatch, dropboxFileId: string): void {
+  if (!dropboxFileId || propertyText(page.properties?.['Dropbox File Id']) !== dropboxFileId) {
+    throw new HttpError('Notion page Dropbox file ID does not exactly match this recording; refusing to overwrite.', 409, { pageId: page.id });
+  }
 }
 
 export async function findExistingInterview(env: Env, dedupCandidates: string[]): Promise<NotionPageMatch | null> {
@@ -620,51 +649,61 @@ export async function appendTranscriptBlocks(env: Env, pageId: string, record: I
 export async function replaceTranscriptBlocks(env: Env, pageId: string, record: InterviewRecord, transcriptFileUrl?: string): Promise<void> {
   const children = await listBlockChildren(env, pageId);
   const managedBlockIds = collectManagedTranscriptBlockIds(children);
-  for (const blockId of managedBlockIds) {
+  await appendTranscriptBlocks(env, pageId, record, transcriptFileUrl);
+  for (const blockId of [...managedBlockIds].reverse()) {
     await deleteBlock(env, blockId);
   }
-  await appendTranscriptBlocks(env, pageId, record, transcriptFileUrl);
 }
 
 function collectManagedReviewBlockIds(children: NotionBlock[]): string[] {
   const ids: string[] = [];
+  const memoTitles = new Set([FINAL_MEMO_HEADING, '完成版 面談メモ', '面談メモ（二次レビュー）']);
+  let inLegacyMemo = false;
   for (let index = 0; index < children.length; index += 1) {
     const block = children[index];
-    if (block.type !== 'heading_1' && block.type !== 'heading_2') continue;
+    if (block.type === 'callout' && block.callout?.rich_text?.map((item) => item.plain_text ?? item.text?.content ?? '').join('').trim() === FINAL_MEMO_HEADING) {
+      ids.push(block.id);
+      inLegacyMemo = false;
+      continue;
+    }
     const text = block.type === 'heading_2'
       ? headingText(block)
-      : ((block as unknown as { heading_1?: { rich_text?: Array<{ plain_text?: string }> } }).heading_1?.rich_text?.map((item) => item.plain_text ?? '').join('').trim() ?? '');
-    if (text !== FINAL_MEMO_HEADING && text !== '参考リンク') continue;
-    ids.push(block.id);
-    for (let cursor = index + 1; cursor < children.length; cursor += 1) {
-      const next = children[cursor];
-      if (next.type === 'heading_1' || next.type === 'heading_2') break;
-      ids.push(next.id);
-    }
+      : (block.heading_1?.rich_text?.map((item) => item.plain_text ?? item.text?.content ?? '').join('').trim() ?? '');
+    if (isTranscriptHeadingBlock(block) || text === 'レビュー情報' || (block.type === 'heading_1' && !memoTitles.has(text))) inLegacyMemo = false;
+    if ((block.type === 'heading_1' || block.type === 'heading_2') && (memoTitles.has(text) || text === '参考リンク')) inLegacyMemo = true;
+    // Child pages and databases are never removed by a memo rewrite.
+    if (block.type === 'child_page' || block.type === 'child_database') inLegacyMemo = false;
+    if (inLegacyMemo) ids.push(block.id);
   }
   return ids;
 }
 
 export async function appendReviewedMemoToNotionPage(env: Env, pageId: string, reviewResult: InterviewReviewResult): Promise<void> {
-  const children = await listBlockChildren(env, pageId);
-  const managedIds = collectManagedReviewBlockIds(children);
-  for (const blockId of managedIds) {
-    await deleteBlock(env, blockId);
-  }
-  const blocks = [...buildFinalMemoBlocks(reviewResult.finalMemoMarkdown, reviewResult.sourceUrls)];
-  if (blocks.length) {
-    await appendBlockChildren(env, pageId, blocks);
-  }
+  await writeFinalMemoToNotionPage(env, pageId, reviewResult.finalMemoMarkdown, reviewResult.sourceUrls);
 }
 
 export async function writeFinalMemoToNotionPage(env: Env, pageId: string, finalMemo: string, sourceUrls: string[]): Promise<void> {
   const children = await listBlockChildren(env, pageId);
   const managedIds = collectManagedReviewBlockIds(children);
-  for (const blockId of managedIds) {
-    await deleteBlock(env, blockId);
+  if (!finalMemo.trim()) throw new HttpError('Final memo is empty; refusing to remove the existing memo.', 400);
+  const blocks = buildFinalMemoBlocks(finalMemo, sourceUrls).slice(1);
+  const staged = await notionFetch<{ results: Array<{ id: string }> }>(env, `/blocks/${pageId}/children`, {
+    method: 'PATCH',
+    body: JSON.stringify({ children: [{ object: 'block', type: 'callout', callout: { rich_text: titleText(FINAL_MEMO_HEADING) } }] }),
+  });
+  const containerId = staged.results?.[0]?.id;
+  if (!containerId) throw new HttpError('Notion did not return the new memo container ID.', 502);
+  try {
+    await appendBlockChildren(env, containerId, blocks);
+    const saved = await listBlockChildren(env, containerId);
+    if (saved.length !== blocks.length) throw new HttpError('New Notion memo did not pass the block count check.', 502);
+  } catch (error) {
+    // Keep the previous memo if staging fails; cleanup is best effort.
+    try { await deleteBlock(env, containerId); } catch { /* next retry removes the incomplete container */ }
+    throw error;
   }
-  const blocks = buildFinalMemoBlocks(finalMemo, sourceUrls);
-  if (blocks.length) await appendBlockChildren(env, pageId, blocks);
+  // Delete legacy ranges from the end so a retry can still find their heading.
+  for (const blockId of [...managedIds].reverse()) await deleteBlock(env, blockId);
 }
 
 export async function appendInterviewReviewFailureToNotionPage(
@@ -672,12 +711,7 @@ export async function appendInterviewReviewFailureToNotionPage(
   pageId: string,
   input: { message: string; error?: unknown },
 ): Promise<void> {
-  const children = await listBlockChildren(env, pageId);
-  const managedIds = collectManagedReviewBlockIds(children);
-  for (const blockId of managedIds) {
-    await deleteBlock(env, blockId);
-  }
-
+  // A failed review must not erase a previously saved final memo.
   const details = input.error instanceof Error ? input.error.message : input.error ? String(input.error) : '';
   const body = details ? `${input.message}\n${details}` : input.message;
   const blocks: NotionBlockInput[] = [
@@ -690,6 +724,7 @@ export async function appendInterviewReviewFailureToNotionPage(
 export async function upsertInterviewPage(env: Env, record: InterviewRecord, existing: NotionPageMatch | null): Promise<{ pageId: string; created: boolean }> {
   const properties = cleanProperties(buildProperties(record));
   if (existing) {
+    assertMatchingFileId(existing, record.metadata.id ?? '');
     await notionFetch(env, `/pages/${existing.id}`, {
       method: 'PATCH',
       body: JSON.stringify({ properties }),

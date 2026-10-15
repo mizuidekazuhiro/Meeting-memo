@@ -1,5 +1,6 @@
 // @ts-nocheck
 import { test } from 'node:test';
+import { withNotionBlockStorage } from './notion-block-mock';
 import * as assert from 'node:assert/strict';
 
 async function importFirst(candidates: string[]) {
@@ -87,7 +88,7 @@ function failurePayload(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function installFinalizeFetchMock() {
+function installFinalizeFetchMock(dropboxFileId: string) {
   const originalFetch = global.fetch;
   const stats = {
     notionTranscriptAppendCalls: 0,
@@ -103,7 +104,7 @@ function installFinalizeFetchMock() {
   const inboxPagesByDedupKey = new Map<string, string>();
   let nextInboxPageId = 1;
 
-  global.fetch = (async (input: string, init?: RequestInit) => {
+  global.fetch = withNotionBlockStorage((async (input: string, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();
     if (url.includes('/v1/responses')) {
       const parsedBody = typeof init?.body === 'string' ? JSON.parse(init.body) : {};
@@ -168,7 +169,7 @@ function installFinalizeFetchMock() {
         ? parsedBody?.filter?.rich_text?.equals
         : parsedBody?.filter?.and?.find?.((item: any) => item?.property === 'Dedup Key')?.rich_text?.equals;
       if (typeof dedupKey === 'string' && inboxPagesByDedupKey.has(dedupKey)) {
-        return new Response(JSON.stringify({ results: [{ id: inboxPagesByDedupKey.get(dedupKey) }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+        return new Response(JSON.stringify({ results: [{ id: inboxPagesByDedupKey.get(dedupKey), properties: { 'Dedup Key': { rich_text: [{ plain_text: dedupKey }] } } }] }), { status: 200, headers: { 'content-type': 'application/json' } });
       }
       return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
@@ -192,7 +193,7 @@ function installFinalizeFetchMock() {
       return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     if (url.includes('/pages/') && init?.method === 'GET') {
-      return new Response(JSON.stringify({ properties: { 'Transcript Link': { type: 'url' } } }), { status: 200, headers: { 'content-type': 'application/json' } });
+      return new Response(JSON.stringify({ properties: { 'Transcript Link': { type: 'url' }, 'Dropbox File Id': { rich_text: [{ plain_text: dropboxFileId }] } } }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') {
       stats.notionTranscriptAppendCalls += 1;
@@ -200,7 +201,7 @@ function installFinalizeFetchMock() {
     }
     if (url.includes('/children?')) return new Response(JSON.stringify({ results: [], has_more: false, next_cursor: null }), { status: 200, headers: { 'content-type': 'application/json' } });
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as any;
+  }) as any);
 
   return { stats, restore: () => { global.fetch = originalFetch; } };
 }
@@ -288,10 +289,10 @@ test('failure callback persists failed state, sends one email, and never enqueue
   gmailBaseMod.sendFailureEmail = (async (_env: any, input: any) => {
     failureEmails.push(input);
   }) as any;
-  global.fetch = (async () => {
+  global.fetch = withNotionBlockStorage((async () => {
     downstreamFetchCalls += 1;
     throw new Error('downstream fetch must not run for failure callbacks');
-  }) as any;
+  }) as any);
 
   const makeRequest = () => new Request('https://example.com/api/interviews/transcription-callback', {
     method: 'POST',
@@ -467,7 +468,7 @@ test('finalizeInterviewJob executes transcript -> summary -> email and marks com
   await upsertRecordingJob(env, job);
   await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
 
-  const fetchMock = installFinalizeFetchMock();
+  const fetchMock = installFinalizeFetchMock(job.dropboxFileId);
   const emailCalls: any[] = [];
   const originalSendEmail = gmailMod.sendCompletionEmail;
   gmailMod.sendCompletionEmail = (async (_env: any, payload: any) => emailCalls.push(payload)) as any;
@@ -513,7 +514,7 @@ test('diarization OFF stores Dropbox transcript without speaker labels', async (
 
   const originalFetch = global.fetch;
   let uploadedText = '';
-  global.fetch = (async (input: string, init?: RequestInit) => {
+  global.fetch = withNotionBlockStorage((async (input: string, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();
     if (url.includes('/2/files/upload')) {
       uploadedText = typeof init?.body === 'string' ? init.body : '';
@@ -530,7 +531,7 @@ test('diarization OFF stores Dropbox transcript without speaker labels', async (
     if (url.includes('/databases/') && url.endsWith('/query')) return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
     if (url.includes('/databases/db') && init?.method === 'GET') return new Response(JSON.stringify({ properties: {} }), { status: 200, headers: { 'content-type': 'application/json' } });
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as any;
+  }) as any);
 
   const originalSend = gmailMod.sendCompletionEmail;
   gmailMod.sendCompletionEmail = (async () => undefined) as any;
@@ -560,7 +561,7 @@ test('finalize resumes from partial state and skips transcript append when trans
     notionPageUrl: 'https://www.notion.so/pageexisting',
   } as any);
 
-  const fetchMock = installFinalizeFetchMock();
+  const fetchMock = installFinalizeFetchMock(job.dropboxFileId);
   let emailCount = 0;
   const originalSendEmail = gmailMod.sendCompletionEmail;
   gmailMod.sendCompletionEmail = (async () => {
@@ -591,7 +592,7 @@ test('finalize idempotency skips duplicate heavy work unless force=true', async 
   await upsertRecordingJob(env, job);
   await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
 
-  const fetchMock = installFinalizeFetchMock();
+  const fetchMock = installFinalizeFetchMock(job.dropboxFileId);
   let emailCount = 0;
   const originalSendEmail = gmailMod.sendCompletionEmail;
   gmailMod.sendCompletionEmail = (async () => {
@@ -630,7 +631,7 @@ test('finalizeInterviewJob uses review.nextActionsMarkdown when review.myTasks i
 
   const originalFetch = global.fetch;
   const createdInboxTaskTitles: string[] = [];
-  global.fetch = (async (input: string, init?: RequestInit) => {
+  global.fetch = withNotionBlockStorage((async (input: string, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();
     if (url.includes('/v1/responses')) {
       const body = typeof init?.body === 'string' ? JSON.parse(init.body) : {};
@@ -673,7 +674,7 @@ test('finalizeInterviewJob uses review.nextActionsMarkdown when review.myTasks i
     if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
     if (url.includes('/children?')) return new Response(JSON.stringify({ results: [], has_more: false, next_cursor: null }), { status: 200, headers: { 'content-type': 'application/json' } });
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as any;
+  }) as any);
 
   const originalSendEmail = gmailMod.sendCompletionEmail;
   gmailMod.sendCompletionEmail = (async () => undefined) as any;
@@ -695,15 +696,15 @@ test('finalizeInterviewJob continues when final my task import fails', async () 
   await upsertRecordingJob(env, job);
   await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
 
-  const fetchMock = installFinalizeFetchMock();
+  const fetchMock = installFinalizeFetchMock(job.dropboxFileId);
   const originalFetch = global.fetch;
-  global.fetch = (async (input: string, init?: RequestInit) => {
+  global.fetch = withNotionBlockStorage((async (input: string, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();
     if (url.includes('/databases/db') && init?.method === 'GET') {
       return new Response(JSON.stringify({ message: 'simulated failure' }), { status: 500, headers: { 'content-type': 'application/json' } });
     }
     return originalFetch(input as any, init);
-  }) as any;
+  }) as any);
   const originalSendEmail = gmailMod.sendCompletionEmail;
   gmailMod.sendCompletionEmail = (async () => undefined) as any;
 
@@ -730,7 +731,7 @@ test('finalizeInterviewJob marks failed when summary generation fails', async ()
   await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
 
   const originalFetch = global.fetch;
-  global.fetch = (async (input: string, init?: RequestInit) => {
+  global.fetch = withNotionBlockStorage((async (input: string, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();
     if (url.includes('/v1/responses')) {
       return new Response(JSON.stringify({ error: { message: 'summary crashed' } }), { status: 500, headers: { 'content-type': 'application/json' } });
@@ -738,7 +739,7 @@ test('finalizeInterviewJob marks failed when summary generation fails', async ()
     if (url.endsWith('/pages') && init?.method === 'POST') return new Response(JSON.stringify({ id: 'page_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
     if (url.includes('/blocks/') && url.endsWith('/children') && init?.method === 'PATCH') return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as any;
+  }) as any);
 
   await assert.rejects(() => finalizeInterviewJob(env, job.recordingId));
   global.fetch = originalFetch;
@@ -761,13 +762,13 @@ test('finalizeInterviewJob marks failed when transcript link cannot be created',
   await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
 
   const originalFetch = global.fetch;
-  global.fetch = (async (input: string, init?: RequestInit) => {
+  global.fetch = withNotionBlockStorage((async (input: string, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();
     if (url.includes('/2/files/upload')) return new Response(JSON.stringify({ id: 'id:transcript' }), { status: 200, headers: { 'content-type': 'application/json' } });
     if (url.includes('/2/sharing/list_shared_links')) return new Response(JSON.stringify({ links: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
     if (url.includes('/2/sharing/create_shared_link_with_settings')) return new Response(JSON.stringify({ error: 'fail' }), { status: 500, headers: { 'content-type': 'application/json' } });
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as any;
+  }) as any);
 
   await assert.rejects(() => finalizeInterviewJob(env, job.recordingId));
   global.fetch = originalFetch;
@@ -883,7 +884,7 @@ test('finalize recovery regenerates missing snapshots before forced email resend
     reviewResult: undefined,
   } as any);
 
-  const fetchMock = installFinalizeFetchMock();
+  const fetchMock = installFinalizeFetchMock(job.dropboxFileId);
   let emailCount = 0;
   const originalSendEmail = gmailMod.sendCompletionEmail;
   gmailMod.sendCompletionEmail = (async () => {
@@ -939,7 +940,7 @@ test('finalize records email failure without rolling back completed memo and pre
   await upsertRecordingJob(env, job);
   await persistTranscriptionCallback(env, transcriptPayload({ recordingId: job.recordingId }));
 
-  const fetchMock = installFinalizeFetchMock();
+  const fetchMock = installFinalizeFetchMock(job.dropboxFileId);
   const originalSendEmail = gmailMod.sendCompletionEmail;
   gmailMod.sendCompletionEmail = (async () => {
     throw new Error('SMTP command failed: 535 BadCredentials');
