@@ -22,7 +22,7 @@ import {
 import { HttpError } from './http';
 import { findRecordingJobWithSource, getRecordingJob, getRecordingJobStorageMeta, markJobFailed, normalizeDropboxPath, shouldSkipProcessingForExistingJob, updateRecordingJobStatus } from './jobs';
 import { logEvent } from './logger';
-import { appendInterviewReviewFailureToNotionPage, extractTasksFromFinalMemoMarkdown, extractTasksFromNextActionsMarkdown, importMyTasksToInbox, saveTranscriptLinkToNotion, updateInterviewRecordProperties, upsertInterviewFromTranscript, writeFinalMemoToNotionPage } from './notion';
+import { appendInterviewReviewFailureToNotionPage, assertInterviewPageIdentity, extractTasksFromFinalMemoMarkdown, extractTasksFromNextActionsMarkdown, importMyTasksToInbox, saveTranscriptLinkToNotion, updateInterviewRecordProperties, upsertInterviewFromTranscript, writeFinalMemoToNotionPage } from './notion';
 import { inspectAudioSource, MAX_TRANSCRIBE_DURATION_SEC, resolveTranscriptionLanguage, reviewInterviewWithWebSearch, summarizeInterview, transcribeWithDiarization } from './openai';
 import type { InterviewReviewResult } from '../types';
 
@@ -942,6 +942,8 @@ export async function finalizeInterviewJob(env: Env, recordingId: string, option
     let mutable = current;
     let pageId = mutable.notionPageId;
     let transcriptFileUrl = mutable.transcriptFileUrl;
+
+    if (pageId) await assertInterviewPageIdentity(env, pageId, mutable.dropboxFileId);
 
     if (!mutable.transcriptWrittenAt || force) {
       logEvent('info', 'notion_transcript_append_started', { recordingId, fileName: mutable.fileName });

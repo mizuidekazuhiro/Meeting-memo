@@ -1,5 +1,6 @@
 // @ts-nocheck
 import { test } from 'node:test';
+import { withNotionBlockStorage } from './notion-block-mock';
 import * as assert from 'node:assert/strict';
 
 import { appendReviewedMemoToNotionPage, buildTranscriptBlocks, extractTasksFromFinalMemoMarkdown, extractTasksFromNextActionsMarkdown, importMyTasksToInbox, saveTranscriptLinkToNotion, upsertInterviewFromTranscript } from '../src/lib/notion';
@@ -7,7 +8,7 @@ import { appendReviewedMemoToNotionPage, buildTranscriptBlocks, extractTasksFrom
 test('upsertInterviewFromTranscript stores insights fields and transcript raw JSON', async () => {
   const originalFetch = global.fetch;
   const pagesPayloads: any[] = [];
-  global.fetch = (async (input: string, init?: RequestInit) => {
+  global.fetch = withNotionBlockStorage((async (input: string, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();
     if (url.includes('/databases/') && url.endsWith('/query')) {
       return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
@@ -20,7 +21,7 @@ test('upsertInterviewFromTranscript stores insights fields and transcript raw JS
       return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as any;
+  }) as any);
 
   const env = { NOTION_TOKEN: 'token', INBOX_DB_ID: 'db' } as any;
   await upsertInterviewFromTranscript(
@@ -50,7 +51,7 @@ test('importMyTasksToInbox creates only My Tasks and deduplicates same recording
   const pageBodies: any[] = [];
   const dedupKeyHits = new Set<string>();
 
-  global.fetch = (async (input: string, init?: RequestInit) => {
+  global.fetch = withNotionBlockStorage((async (input: string, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();
     if (url.endsWith('/databases/db') && (init?.method ?? 'GET') === 'GET') {
       return new Response(
@@ -74,7 +75,7 @@ test('importMyTasksToInbox creates only My Tasks and deduplicates same recording
       queryBodies.push(body);
       const dedupKey = body?.filter?.rich_text?.equals;
       const exists = typeof dedupKey === 'string' && dedupKeyHits.has(dedupKey);
-      return new Response(JSON.stringify({ results: exists ? [{ id: 'existing-task' }] : [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+      return new Response(JSON.stringify({ results: exists ? [{ id: 'existing-task', properties: { 'Dedup Key': { rich_text: [{ plain_text: dedupKey }] } } }] : [] }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     if (url.endsWith('/pages')) {
       if (typeof init?.body === 'string') {
@@ -86,7 +87,7 @@ test('importMyTasksToInbox creates only My Tasks and deduplicates same recording
       return new Response(JSON.stringify({ id: `task_${pageBodies.length}` }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as any;
+  }) as any);
 
   const env = { NOTION_TOKEN: 'token', INBOX_DB_ID: 'db' } as any;
   const first = await importMyTasksToInbox(env, {
@@ -125,7 +126,7 @@ test('importMyTasksToInbox omits optional source properties that are not in DB s
   const originalFetch = global.fetch;
   const pageBodies: any[] = [];
 
-  global.fetch = (async (input: string, init?: RequestInit) => {
+  global.fetch = withNotionBlockStorage((async (input: string, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();
     if (url.endsWith('/databases/db') && (init?.method ?? 'GET') === 'GET') {
       return new Response(
@@ -149,7 +150,7 @@ test('importMyTasksToInbox omits optional source properties that are not in DB s
       return new Response(JSON.stringify({ id: `task_${pageBodies.length}` }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as any;
+  }) as any);
 
   const env = { NOTION_TOKEN: 'token', INBOX_DB_ID: 'db', INBOX_TRIAGE_BASE_URL: 'https://triage.example.com', INBOX_TRIAGE_ACTION_SECRET: 'secret-1' } as any;
   const result = await importMyTasksToInbox(env, {
@@ -174,7 +175,7 @@ test('importMyTasksToInbox omits optional source properties that are not in DB s
 
 test('importMyTasksToInbox does not create chooseUrl when INBOX_TRIAGE_BASE_URL is missing', async () => {
   const originalFetch = global.fetch;
-  global.fetch = (async (input: string, init?: RequestInit) => {
+  global.fetch = withNotionBlockStorage((async (input: string, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();
     if (url.endsWith('/databases/db') && (init?.method ?? 'GET') === 'GET') {
       return new Response(JSON.stringify({ properties: { Name: {}, Source: {}, 'Record Type': {}, 'Imported At': {}, 'Dedup Key': {} } }), { status: 200, headers: { 'content-type': 'application/json' } });
@@ -186,7 +187,7 @@ test('importMyTasksToInbox does not create chooseUrl when INBOX_TRIAGE_BASE_URL 
       return new Response(JSON.stringify({ id: 'task_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as any;
+  }) as any);
   const result = await importMyTasksToInbox({ NOTION_TOKEN: 'token', INBOX_DB_ID: 'db', INBOX_TRIAGE_ACTION_SECRET: 'secret-1' } as any, {
     recordingId: 'rec-1',
     sourceInterviewPageId: 'interview-page-id',
@@ -198,7 +199,7 @@ test('importMyTasksToInbox does not create chooseUrl when INBOX_TRIAGE_BASE_URL 
 
 test('importMyTasksToInbox does not create chooseUrl when INBOX_TRIAGE_ACTION_SECRET is missing', async () => {
   const originalFetch = global.fetch;
-  global.fetch = (async (input: string, init?: RequestInit) => {
+  global.fetch = withNotionBlockStorage((async (input: string, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();
     if (url.endsWith('/databases/db') && (init?.method ?? 'GET') === 'GET') {
       return new Response(JSON.stringify({ properties: { Name: {}, Source: {}, 'Record Type': {}, 'Imported At': {}, 'Dedup Key': {} } }), { status: 200, headers: { 'content-type': 'application/json' } });
@@ -210,7 +211,7 @@ test('importMyTasksToInbox does not create chooseUrl when INBOX_TRIAGE_ACTION_SE
       return new Response(JSON.stringify({ id: 'task_1' }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as any;
+  }) as any);
   const result = await importMyTasksToInbox({ NOTION_TOKEN: 'token', INBOX_DB_ID: 'db', INBOX_TRIAGE_BASE_URL: 'https://triage.example.com' } as any, {
     recordingId: 'rec-1',
     sourceInterviewPageId: 'interview-page-id',
@@ -223,7 +224,7 @@ test('importMyTasksToInbox does not create chooseUrl when INBOX_TRIAGE_ACTION_SE
 test('appendReviewedMemoToNotionPage writes final memo + source urls and does not re-append Transcript', async () => {
   const originalFetch = global.fetch;
   const appendedChildren: any[] = [];
-  global.fetch = (async (input: string, init?: RequestInit) => {
+  global.fetch = withNotionBlockStorage((async (input: string, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();
     if (url.includes('/blocks/page_1/children?')) {
       return new Response(JSON.stringify({
@@ -238,12 +239,12 @@ test('appendReviewedMemoToNotionPage writes final memo + source urls and does no
     if (url.includes('/blocks/') && init?.method === 'DELETE') {
       return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
-    if (url.includes('/blocks/page_1/children') && init?.method === 'PATCH') {
+    if (url.includes('/blocks/') && init?.method === 'PATCH') {
       if (typeof init.body === 'string') appendedChildren.push(JSON.parse(init.body));
       return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as any;
+  }) as any);
 
   await appendReviewedMemoToNotionPage(
     { NOTION_TOKEN: 'token', INBOX_DB_ID: 'db' } as any,
@@ -273,7 +274,7 @@ test('appendReviewedMemoToNotionPage writes final memo + source urls and does no
   global.fetch = originalFetch;
 
   const allChildren = appendedChildren.flatMap((payload) => payload.children);
-  const heading1 = allChildren.filter((block) => block.type === 'heading_1').map((block) => block.heading_1.rich_text[0].text.content);
+  const heading1 = allChildren.filter((block) => block.type === 'callout').map((block) => block.callout.rich_text[0].text.content);
   const heading2 = allChildren.filter((block) => block.type === 'heading_2').map((block) => block.heading_2.rich_text[0].text.content);
   assert.ok(heading1.includes('面談メモ（完成版）'));
   assert.ok(heading2.includes('参考リンク'));
@@ -338,17 +339,17 @@ test('buildTranscriptBlocks does not expand full transcript into many notion blo
 test('saveTranscriptLinkToNotion falls back to body when Transcript Link property is missing', async () => {
   const originalFetch = global.fetch;
   const patchBodies: any[] = [];
-  global.fetch = (async (input: string, init?: RequestInit) => {
+  global.fetch = withNotionBlockStorage((async (input: string, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();
     if (url.includes('/pages/page_1') && init?.method === 'GET') {
       return new Response(JSON.stringify({ properties: { Name: { type: 'title' } } }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
-    if (url.includes('/blocks/page_1/children') && init?.method === 'PATCH') {
+    if (url.includes('/blocks/') && init?.method === 'PATCH') {
       if (typeof init.body === 'string') patchBodies.push(JSON.parse(init.body));
       return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as any;
+  }) as any);
 
   const result = await saveTranscriptLinkToNotion({ NOTION_TOKEN: 'token', INBOX_DB_ID: 'db' } as any, 'page_1', 'https://dropbox.example.com/txt');
   global.fetch = originalFetch;
