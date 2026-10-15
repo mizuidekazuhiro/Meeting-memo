@@ -38,9 +38,9 @@ const key = id => `dropbox:id:${id}`;
 const jobKey = id => `recordingJob:recordingId:${id}`;
 const idOnly = id => id.replaceAll('-', '');
 
-const [original, giken, backup, job, oldJob, receipt] = await Promise.all([
+const [original, giken, backup, job, oldJob, receipt, before] = await Promise.all([
   notion(`/pages/${originalPage}`), notion(`/pages/${gikenPage}`), notion(`/pages/${backupPage}`),
-  kv(jobKey(newRecording)), kv(jobKey(oldRecording)), kv(receiptKey),
+  kv(jobKey(newRecording)), kv(jobKey(oldRecording)), kv(receiptKey), kv('recordingJob:recovery:20261015-identity:before'),
 ]);
 assert.equal(text(giken.properties['Dropbox File Id']), newId);
 assert.equal(text(backup.properties['Dedup Key']), '');
@@ -62,7 +62,7 @@ if (!receipt) {
   });
   console.log(JSON.stringify({ probe: 'case-sensitive-file-id', returnedCount: probe.results.length,
     returnedCaseDifferentKey: probe.results.some(p => text(p.properties['Dedup Key']) !== key(oldId)) }));
-  await kv('recordingJob:recovery:20261015-identity:before', {
+  if (!before) await kv('recordingJob:recovery:20261015-identity:before', {
     capturedAt: new Date().toISOString(), job, oldJob, originalProperties: original.properties, gikenProperties: giken.properties,
   });
 }
@@ -76,7 +76,8 @@ const gikenProps = { 'Dedup Key': rt(key(newId)) };
 if (!receipt && text(original.properties['Dropbox File Id']) === newId) {
   for (const name of ['Summary', 'My Tasks', 'Other Tasks', 'Raw JSON', 'Speaker Separation']) {
     const prop = original.properties[name];
-    if (prop?.type && prop[prop.type] !== undefined) gikenProps[name] = { [prop.type]: prop[prop.type] };
+    if (prop?.type === 'rich_text') gikenProps[name] = rt(text(prop));
+    else if (prop?.type === 'select' && prop.select) gikenProps[name] = { select: { name: prop.select.name } };
   }
 }
 await notion(`/pages/${gikenPage}`, 'PATCH', { properties: gikenProps });
